@@ -44,6 +44,6 @@ def get_loc_save_tracks():
     track_artist = input("Enter the artist name: ")
     track_data = wavdir_tracklist(wavdir,track_album,track_artist)
 
-    return track_data
+    return track_data, flacdir
 
 
