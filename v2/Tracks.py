@@ -6,6 +6,7 @@ class Tracks:
         self.track_artist = track_artist
         self.track_wav_loc = track_wav_loc
 
+    #default response is the track number, track title, and a .flac appended.
     def __str__(self):
         if int(self.track_num) < 10:
             return f"[0{self.track_num}] - {self.track_name}.flac"
