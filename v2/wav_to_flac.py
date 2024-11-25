@@ -4,7 +4,7 @@
 #provide both track_data and flacdir for this to work.
 
 from pydub import AudioSegment
-
+import os
 
 def wav_to_flac(track_data, flacdir):
     track_num = 1
@@ -24,3 +24,4 @@ def add_flac_meta(track_data, flacdir):
                     tags={'artist': track.track_artist, 'album': track.track_album,
                           'title': track.track_name, 'track': track_num})
         track_num += 1
+        os.remove(track.track_wav_loc)
