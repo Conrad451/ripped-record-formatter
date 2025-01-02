@@ -1,6 +1,6 @@
 from import_tracks import *
 from wav_to_flac import *
-
+from soundtrack_mode import *
 welcome_text = r"""
 ==============================================================================================================
     ____ ____ ____ ____ ____ ___    ____ ____ ____ ____ ____ ___    ____ ____ ____ _    ___  ____ ____ ____ ____ 
@@ -29,6 +29,14 @@ def add_meta():
     print(message)
     return message
 
+def soundtrack_mode():
+
+    print("Processing WAVs from a Soundtrack")
+    track_data, flacdir = get_loc_save_tracks_soundtrack()
+    print("Processing conversion...")
+    message = wav_to_flac(track_data, flacdir)
+    print(message)
+    return message
 
 
 def main():
@@ -40,6 +48,7 @@ def main():
         print("-----------------------")
         print("1. Convert WAVs into FLACs, adding Metadata.")
         print("2. Add or change metadata on existing FLACs.")
+        print("3. Soundtrack Mode - Specify artist for each track.")
         print("3. Exit Program.")
         print("-----------------------")
         user_choice = input("Choose a number to make a selection: ")
@@ -47,6 +56,8 @@ def main():
             conversion()
         elif user_choice == "2":
             add_meta()
+        elif user_choice == "3":
+            soundtrack_mode()
         elif user_choice == "3":
             print("Ending Program.")
             break
