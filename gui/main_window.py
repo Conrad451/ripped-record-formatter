@@ -61,6 +61,7 @@ class BatchPanel(QWidget):
         self.kind = kind
         self.settings = settings
         self._file_glob = "*.wav" if kind == "convert" else "*.flac"
+        self._cover = None   # set from a selected MusicBrainz release
 
         cfg = settings.config
         layout = QVBoxLayout(self)
@@ -209,9 +210,26 @@ class BatchPanel(QWidget):
             return None
 
         if self.kind == "convert":
-            return converter.convert_wavs_to_flacs, tracks, Path(output), {}
+            kwargs = {}
+            if self._cover is not None:
+                kwargs["cover"] = self._cover
+            return converter.convert_wavs_to_flacs, tracks, Path(output), kwargs
         delete = bool(self.delete_check and self.delete_check.isChecked())
-        return converter.retag_flacs, tracks, Path(output), {"delete_source": delete}
+        kwargs = {"delete_source": delete}
+        if self._cover is not None:
+            kwargs["cover"] = self._cover
+        return converter.retag_flacs, tracks, Path(output), kwargs
+
+    def apply_release(self, detail) -> None:
+        """Fill artist/album, replace track titles by order, stash cover art."""
+        self.artist_edit.setText(detail.artist)
+        self.settings.set(last_artist=detail.artist)
+        self.album_edit.setText(detail.title)
+        self.settings.set(last_album=detail.title)
+        titles = [t.title for t in detail.tracks]
+        if titles and self.model.rowCount():
+            self.model.paste_titles(0, titles)
+        self._cover = detail.cover
 
     def set_running(self, running: bool) -> None:
         self.run_button.setEnabled(not running)
@@ -222,7 +240,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Ripped Record Formatter")
-        self.resize(760, 620)
+        self.resize(920, 760)
         self.setAcceptDrops(True)
 
         self.settings = Settings()
@@ -231,16 +249,30 @@ class MainWindow(QMainWindow):
         central = QWidget()
         root = QVBoxLayout(central)
 
+        from gui.full_rip import FullRipTab
+        from gui.metadata_panel import MetadataPanel
+        from gui.settings_panel import SettingsPanel
+
         self.tabs = QTabWidget()
         self.convert_panel = BatchPanel("convert", self.settings)
         self.retag_panel = BatchPanel("retag", self.settings)
+        self.full_rip = FullRipTab(self.settings)
+        self.metadata_panel = MetadataPanel()
+        self.settings_panel = SettingsPanel(self.settings)
+        self.tabs.addTab(self.full_rip, "Full Rip")
         self.tabs.addTab(self.convert_panel, "Convert")
         self.tabs.addTab(self.retag_panel, "Re-tag")
+        self.tabs.addTab(self.metadata_panel, "Metadata")
+        self.tabs.addTab(self.settings_panel, "Settings")
         root.addWidget(self.tabs, 1)
 
         for panel in (self.convert_panel, self.retag_panel):
             panel.logMessage.connect(self._log)
             panel.runRequested.connect(lambda p=panel: self._start_job(p))
+
+        self.full_rip.logMessage.connect(self._log)
+        self.metadata_panel.statusMessage.connect(self._log)
+        self.metadata_panel.releaseSelected.connect(self._on_release_selected)
 
         self._last_output_dir: Path | None = None
         progress_row = QHBoxLayout()
@@ -259,7 +291,20 @@ class MainWindow(QMainWindow):
         root.addWidget(self.log, 1)
 
         self.setCentralWidget(central)
-        self._log("Ready. Load files, edit the table, then Convert or Re-tag.")
+        self._log("Ready. Full Rip a side, or Convert/Re-tag folders. "
+                  "Use Metadata to pull tracklists + cover art.")
+
+    # --- metadata wiring ---------------------------------------------------
+    def _on_release_selected(self, detail) -> None:
+        self._log(f"Release selected: {detail.artist} - {detail.title} "
+                  f"({detail.track_count} track(s), cover={'yes' if detail.cover else 'no'}).")
+        for panel in (self.convert_panel, self.retag_panel):
+            panel.apply_release(detail)
+        self.full_rip.set_release(detail)
+
+    def closeEvent(self, event) -> None:
+        self.full_rip.cleanup()
+        super().closeEvent(event)
 
     # --- job orchestration -------------------------------------------------
     def _start_job(self, panel: BatchPanel) -> None:
