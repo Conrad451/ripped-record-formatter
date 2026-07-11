@@ -1,0 +1,300 @@
+"""Synthetic sanity tests for the restoration pipeline.
+
+These are engineering sanity checks (does the hum notch bite, does the floor
+drop, does staging clean up), not audiophile validation. Signals use fixed
+random seeds so the measured numbers are reproducible.
+"""
+
+from __future__ import annotations
+
+import tempfile
+from pathlib import Path
+
+import numpy as np
+import soundfile as sf
+
+from core import restoration as R
+
+SR = 44100
+
+
+def _mag_at(x: np.ndarray, freq: float) -> float:
+    x = np.asarray(x).reshape(-1)
+    spectrum = np.abs(np.fft.rfft(x * np.hanning(len(x))))
+    freqs = np.fft.rfftfreq(len(x), 1 / SR)
+    return float(spectrum[np.argmin(np.abs(freqs - freq))])
+
+
+def _db(a: float, b: float) -> float:
+    return 20 * np.log10(a / b)
+
+
+def _staging_dirs() -> set[str]:
+    return {str(p) for p in Path(tempfile.gettempdir()).glob("rrf_restore_*")}
+
+
+def test_hum_removal_attenuates_mains_preserves_reference(tmp_path):
+    t = np.arange(int(SR * 4)) / SR
+    tone = 0.3 * np.sin(2 * np.pi * 1000 * t)
+    hum = (0.25 * np.sin(2 * np.pi * 60 * t)
+           + 0.12 * np.sin(2 * np.pi * 120 * t)
+           + 0.06 * np.sin(2 * np.pi * 180 * t))
+    noise = 0.005 * np.random.default_rng(1).standard_normal(t.size)
+    sig = (tone + hum + noise).astype(np.float32)
+
+    src, dst = tmp_path / "in.wav", tmp_path / "out.wav"
+    sf.write(str(src), sig, SR, subtype="PCM_16")
+    R.HumRemoval(base_freq=60, harmonics=4).apply(src, dst)
+    out, _ = sf.read(str(dst))
+
+    drop_60 = _db(_mag_at(sig, 60), _mag_at(out, 60))
+    change_1k = abs(_db(_mag_at(out, 1000), _mag_at(sig, 1000)))
+    print(f"\n[hum] 60Hz drop = {drop_60:.1f} dB, 1kHz change = {change_1k:.4f} dB")
+
+    assert drop_60 >= 40.0, drop_60          # measured ~59.6 dB
+    assert change_1k <= 0.2, change_1k       # measured ~0.001 dB (bass untouched)
+
+
+def test_noise_reduction_lowers_floor_preserves_tone(tmp_path):
+    rng = np.random.default_rng(2)
+    lead = 0.02 * rng.standard_normal(int(SR * 2))               # silent lead-in
+    body = (0.3 * np.sin(2 * np.pi * 1000 * (np.arange(int(SR * 2)) / SR))
+            + 0.02 * rng.standard_normal(int(SR * 2)))
+    sig = np.concatenate([lead, body]).astype(np.float32)
+
+    src, dst = tmp_path / "in.wav", tmp_path / "out.wav"
+    sf.write(str(src), sig, SR, subtype="PCM_16")
+    R.NoiseReduction(strength=0.5, profile_start=0.0, profile_duration=2.0).apply(src, dst)
+    out, _ = sf.read(str(dst))
+
+    lead_n = int(SR * 2)
+    rms_before = float(np.sqrt(np.mean(sig[:lead_n] ** 2)))
+    rms_after = float(np.sqrt(np.mean(out[:lead_n] ** 2)))
+    floor_drop = _db(rms_before, rms_after)
+    tone_change = abs(_db(_mag_at(out[lead_n:], 1000), _mag_at(body, 1000)))
+    print(f"\n[noise] floor RMS {rms_before:.5f} -> {rms_after:.5f} "
+          f"({floor_drop:.1f} dB), 1kHz change = {tone_change:.2f} dB")
+
+    assert rms_after < rms_before
+    assert floor_drop >= 3.0, floor_drop     # measured ~5.8 dB
+    assert tone_change <= 3.0, tone_change   # measured ~1.16 dB (tone preserved)
+
+
+def test_declick_removes_clicks_preserves_format(tmp_path):
+    t = np.arange(int(SR * 3)) / SR
+    sig = 0.2 * np.sin(2 * np.pi * 1000 * t)
+    rng = np.random.default_rng(3)
+    idx = rng.choice(t.size, size=200, replace=False)
+    sig[idx] += rng.choice([-1, 1], 200) * 0.9
+    sig = np.clip(sig, -1, 1).astype(np.float32)
+
+    src, dst = tmp_path / "in.wav", tmp_path / "out.wav"
+    sf.write(str(src), sig, SR, subtype="PCM_16")
+    R.Declick().apply(src, dst)
+    out, _ = sf.read(str(dst))
+
+    before = int((np.abs(sig) > 0.6).sum())
+    after = int((np.abs(out) > 0.6).sum())
+    print(f"\n[declick] samples>|0.6|: {before} -> {after}")
+
+    assert after <= before * 0.1              # measured 200 -> 0
+    assert sf.info(str(dst)).samplerate == SR
+    # Every stage now emits a float intermediate; restore() does the final
+    # bit-depth conversion. Standalone, Declick therefore writes FLOAT.
+    assert sf.info(str(dst)).subtype == "FLOAT"
+
+
+def test_restore_pipeline_and_staging_cleanup_success(tmp_path):
+    t = np.arange(int(SR * 3)) / SR
+    sig = (0.3 * np.sin(2 * np.pi * 1000 * t)
+           + 0.2 * np.sin(2 * np.pi * 60 * t)
+           + 0.01 * np.random.default_rng(4).standard_normal(t.size)).astype(np.float32)
+    src, dst = tmp_path / "in.wav", tmp_path / "out.wav"
+    sf.write(str(src), sig, SR, subtype="PCM_16")
+
+    before = _staging_dirs()
+    progress: list[tuple[str, int, int]] = []
+    result = R.restore(
+        src, dst,
+        [R.HumRemoval(), R.NoiseReduction(), R.Declick()],
+        on_progress=lambda name, i, total: progress.append((name, i, total)),
+    )
+
+    assert dst.exists()
+    assert result.stages_applied == ["Hum removal", "Noise reduction", "Declick"]
+    assert progress == [("Hum removal", 1, 3), ("Noise reduction", 2, 3), ("Declick", 3, 3)]
+    assert result.samplerate == SR and result.subtype == "PCM_16"
+    # no staging dir leaked
+    assert not (_staging_dirs() - before)
+
+
+def test_staging_cleanup_on_induced_failure(tmp_path):
+    class ExplodingStage(R.Stage):
+        name = "Boom"
+
+        def apply(self, in_path, out_path):
+            raise RuntimeError("induced failure")
+
+    t = np.arange(int(SR)) / SR
+    sig = (0.3 * np.sin(2 * np.pi * 1000 * t)).astype(np.float32)
+    src, dst = tmp_path / "in.wav", tmp_path / "out.wav"
+    sf.write(str(src), sig, SR, subtype="PCM_16")
+
+    before = _staging_dirs()
+    import pytest
+
+    with pytest.raises(RuntimeError, match="induced failure"):
+        R.restore(src, dst, [R.HumRemoval(), ExplodingStage()])
+
+    assert not dst.exists()                    # never produced
+    assert not (_staging_dirs() - before)      # staging still cleaned up
+
+
+# --------------------------------------------------------------------------- #
+# Headroom-safe chain (float intermediates + final-write policy)
+# --------------------------------------------------------------------------- #
+
+
+def _clipped_source(seconds: float = 3.0) -> np.ndarray:
+    """A flat-topped, full-scale (over-gained) rip: harmonic-rich, clips easily."""
+    t = np.arange(int(SR * seconds)) / SR
+    raw = 1.4 * np.sin(2 * np.pi * 1000 * t) + 0.5 * np.sin(2 * np.pi * 60 * t)
+    return np.clip(raw, -1.0, 1.0).astype(np.float32)
+
+
+def test_float_intermediates_do_not_quantize_clip(tmp_path):
+    """Zero-phase hum removal on a clipped source overshoots past +/-1.0; the
+    intermediate must preserve that (FLOAT), not pin it to full scale, and the
+    final PCM output must contain no full-scale-pinned samples."""
+    sig = _clipped_source()
+    src = tmp_path / "in.wav"
+    sf.write(str(src), sig, SR, subtype="PCM_16")
+
+    # Stage boundary is float-transparent: overshoot survives, subtype is FLOAT.
+    mid = tmp_path / "mid.wav"
+    R.HumRemoval(base_freq=60, harmonics=4).apply(src, mid)
+    mid_data, _ = sf.read(str(mid))
+    mid_peak = float(np.max(np.abs(mid_data)))
+    print(f"\n[headroom] hum intermediate peak = {mid_peak:.3f} (subtype "
+          f"{sf.info(str(mid)).subtype})")
+    assert sf.info(str(mid)).subtype == "FLOAT"
+    assert mid_peak > 1.0                       # overshoot preserved, not clipped
+
+    # Full chain to PCM_16: no sample may be pinned at 16-bit full scale.
+    dst = tmp_path / "out.wav"
+    result = R.restore(src, dst, [R.HumRemoval(), R.NoiseReduction()])
+    out = sf.read(str(dst), dtype="int16")[0]
+    pinned = int((np.abs(out.astype(np.int32)) >= 32767).sum())
+    print(f"[headroom] final PCM samples pinned at full scale = {pinned}")
+    assert pinned == 0
+    # The clipped source is diagnosed, so a UI can blame the rip, not the pipeline.
+    assert result.source_clip_runs > 0
+    assert any("clipped" in w for w in result.warnings)
+
+
+def test_overshoot_triggers_uniform_gain(tmp_path):
+    """A processed signal that overshoots full scale is scaled down by one gain
+    to -0.1 dBFS; peak_gain_db reports it and a warning is emitted."""
+
+    class _Overshoot(R.Stage):
+        name = "Overshoot"
+
+        def __init__(self, peak: float) -> None:
+            self.peak = peak
+
+        def apply(self, in_path, out_path):
+            data, sr, _ = R._read(in_path)
+            data = data / np.max(np.abs(data)) * self.peak
+            R._write(out_path, data.astype(np.float32), sr, "FLOAT")
+
+    t = np.arange(int(SR)) / SR
+    sig = (0.5 * np.sin(2 * np.pi * 1000 * t)).astype(np.float32)
+    src, dst = tmp_path / "in.wav", tmp_path / "out.wav"
+    sf.write(str(src), sig, SR, subtype="PCM_16")
+
+    result = R.restore(src, dst, [_Overshoot(1.5)])
+
+    target = 10.0 ** (-0.1 / 20.0)              # -0.1 dBFS default
+    expected_gain_db = 20.0 * np.log10(target / 1.5)
+    out_peak = float(np.max(np.abs(sf.read(str(dst))[0])))
+    print(f"\n[headroom] peak 1.5 -> gain {result.peak_gain_db:.2f} dB, "
+          f"output peak {out_peak:.4f}")
+
+    assert result.peak_gain_db < 0.0
+    assert abs(result.peak_gain_db - expected_gain_db) < 0.1
+    assert abs(out_peak - target) < 0.01        # brought to ~-0.1 dBFS
+    assert out_peak < 1.0                        # and definitely not clipping
+    assert any("attenuated" in w for w in result.warnings)
+
+
+def test_pcm16_in_pcm16_out_no_gain_when_within_range(tmp_path):
+    """A well-behaved source round-trips subtype and is left untouched: no gain,
+    no warnings, no false clip diagnosis."""
+    t = np.arange(int(SR * 2)) / SR
+    sig = (0.4 * np.sin(2 * np.pi * 1000 * t)
+           + 0.1 * np.sin(2 * np.pi * 60 * t)).astype(np.float32)
+    src, dst = tmp_path / "in.wav", tmp_path / "out.wav"
+    sf.write(str(src), sig, SR, subtype="PCM_16")
+
+    result = R.restore(src, dst, [R.HumRemoval(), R.NoiseReduction()])
+
+    assert sf.info(str(dst)).subtype == "PCM_16"
+    assert result.subtype == "PCM_16"
+    assert result.peak_gain_db == 0.0
+    assert result.source_clip_runs == 0
+    assert result.warnings == []
+
+
+# --------------------------------------------------------------------------- #
+# Rumble filter
+# --------------------------------------------------------------------------- #
+
+
+def test_rumble_filter_kills_subsonic_preserves_music(tmp_path):
+    """A 12 Hz rumble + 100 Hz musical tone: rumble is heavily attenuated while
+    the 100 Hz tone passes essentially untouched."""
+    t = np.arange(int(SR * 4)) / SR
+    rumble = 0.4 * np.sin(2 * np.pi * 12 * t)
+    music = 0.3 * np.sin(2 * np.pi * 100 * t)
+    sig = (rumble + music).astype(np.float32)
+
+    src, dst = tmp_path / "in.wav", tmp_path / "out.wav"
+    sf.write(str(src), sig, SR, subtype="FLOAT")  # keep headroom; sum peaks ~0.7
+    R.RumbleFilter(cutoff_hz=25.0, order=4).apply(src, dst)
+    out, _ = sf.read(str(dst))
+
+    drop_12 = _db(_mag_at(sig, 12), _mag_at(out, 12))
+    change_100 = abs(_db(_mag_at(out, 100), _mag_at(sig, 100)))
+    print(f"\n[rumble] 12Hz drop = {drop_12:.1f} dB, 100Hz change = {change_100:.3f} dB")
+
+    assert drop_12 >= 30.0, drop_12            # measured ~50 dB
+    assert change_100 <= 0.5, change_100       # 100Hz preserved
+
+
+def test_rumble_filter_is_zero_phase(tmp_path):
+    """Zero-phase => a transient's peak sample position is unchanged by the filter."""
+    n = int(SR * 2)
+    t = np.arange(n) / SR
+    sig = (0.1 * np.sin(2 * np.pi * 100 * t)).astype(np.float32)
+    peak_idx = n // 2
+    sig[peak_idx] += 0.8                        # a dominant, symmetric transient
+
+    src, dst = tmp_path / "in.wav", tmp_path / "out.wav"
+    sf.write(str(src), sig, SR, subtype="FLOAT")
+    R.RumbleFilter().apply(src, dst)
+    out, _ = sf.read(str(dst))
+
+    out_peak_idx = int(np.argmax(np.abs(out)))
+    print(f"\n[rumble] transient at {peak_idx} -> peak at {out_peak_idx} "
+          f"(shift {out_peak_idx - peak_idx} samples)")
+    assert abs(out_peak_idx - peak_idx) <= 1    # no group-delay shift
+
+
+def test_rumble_filter_rejects_cutoff_above_nyquist(tmp_path):
+    """A cutoff at or above Nyquist is a config error, surfaced clearly."""
+    src, dst = tmp_path / "in.wav", tmp_path / "out.wav"
+    sf.write(str(src), np.zeros(SR, dtype=np.float32), SR, subtype="FLOAT")
+    import pytest
+
+    with pytest.raises(ValueError, match="cutoff_hz"):
+        R.RumbleFilter(cutoff_hz=SR).apply(src, dst)

@@ -10,7 +10,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThreadPool, Signal
+from PySide6.QtCore import Qt, QThreadPool, QUrl, Signal
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
@@ -132,6 +133,10 @@ class BatchPanel(QWidget):
         self.table = TrackTableView()
         self.table.setModel(self.model)
         self.table.pasted.connect(self._on_pasted)
+        self.table.rowsDeleted.connect(
+            lambda n: self.logMessage.emit(f"Removed {n} row(s).")
+        )
+        self.table.setSelectionBehavior(self.table.SelectionBehavior.SelectRows)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.table, 1)
@@ -237,9 +242,16 @@ class MainWindow(QMainWindow):
             panel.logMessage.connect(self._log)
             panel.runRequested.connect(lambda p=panel: self._start_job(p))
 
+        self._last_output_dir: Path | None = None
+        progress_row = QHBoxLayout()
         self.progress = QProgressBar()
         self.progress.setTextVisible(True)
-        root.addWidget(self.progress)
+        progress_row.addWidget(self.progress, 1)
+        self.open_output_button = QPushButton("Open output folder")
+        self.open_output_button.setEnabled(False)
+        self.open_output_button.clicked.connect(self._open_output_folder)
+        progress_row.addWidget(self.open_output_button)
+        root.addLayout(progress_row)
 
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
@@ -256,6 +268,8 @@ class MainWindow(QMainWindow):
             return
         operation, tracks, output_dir, kwargs = job
 
+        self._last_output_dir = output_dir
+        self.open_output_button.setEnabled(False)
         self.convert_panel.set_running(True)
         self.retag_panel.set_running(True)
         self.progress.setMaximum(len(tracks))
@@ -279,7 +293,15 @@ class MainWindow(QMainWindow):
         self._log(result.summary())
         for warning in result.warnings:
             self._log(f"  ! {warning}")
+        if self._last_output_dir is not None and Path(self._last_output_dir).is_dir():
+            self.open_output_button.setEnabled(True)
         self._jobs_done()
+
+    def _open_output_folder(self) -> None:
+        if self._last_output_dir is not None:
+            QDesktopServices.openUrl(
+                QUrl.fromLocalFile(str(self._last_output_dir))
+            )
 
     def _on_error(self, message: str) -> None:
         self._log(f"ERROR: {message}")

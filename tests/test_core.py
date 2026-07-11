@@ -23,6 +23,19 @@ def test_filename_zero_padding():
     assert str(Tracks(3, "Three", "Al", "Ar", "x.wav")) == "[03] - Three.flac"
 
 
+def test_filename_sanitizes_invalid_characters():
+    # Every Windows-forbidden character, plus trailing junk.
+    nasty = Tracks(4, 'A/B\\C:D*E?F"G<H>I|J  . ', "Al", "Ar", "x.wav")
+    result = nasty.filename()
+    assert result == "[04] - A B C D E F G H I J.flac", result
+    # No forbidden character leaks into the filename component.
+    assert not any(c in result[len("[04] - "):] for c in '\\/:*?"<>|')
+    # tags keep the original, unsanitized title.
+    assert nasty.tags()["title"] == 'A/B\\C:D*E?F"G<H>I|J  . '
+    # A title made entirely of junk falls back to Track NN.
+    assert Tracks(7, "??::", "Al", "Ar", "x.wav").filename() == "[07] - Track 07.flac"
+
+
 def test_config_round_trip(tmp_path):
     path = tmp_path / "settings.json"
     # Missing file -> defaults, no crash.
