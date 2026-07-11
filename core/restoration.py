@@ -57,14 +57,33 @@ def _write(path: Path, data: np.ndarray, samplerate: int, subtype: str) -> None:
     sf.write(str(path), data, samplerate, subtype=subtype)
 
 
-_SUBTYPE_TO_PCM_CODEC = {
-    "PCM_16": "pcm_s16le",
-    "PCM_24": "pcm_s24le",
-    "PCM_32": "pcm_s32le",
-    "PCM_U8": "pcm_u8",
-    "FLOAT": "pcm_f32le",
-    "DOUBLE": "pcm_f64le",
-}
+# Every stage-boundary WAV in the staging dir uses this subtype, regardless of
+# the source's. Float is transparent: zero-phase filters and spectral gating can
+# push samples past +/-1.0, and quantising that overshoot to integer PCM at each
+# stage boundary would hard-clip it and compound damage across stages. Only the
+# final write (in `restore`) quantises back to the source subtype. Declick, the
+# one stage that leaves numpy, uses the matching float PCM codec (pcm_f32le).
+_INTERMEDIATE_SUBTYPE = "FLOAT"
+_INTERMEDIATE_FFMPEG_CODEC = "pcm_f32le"
+
+
+def _count_clip_runs(data: np.ndarray, level: float, run_len: int) -> int:
+    """Count runs of >= ``run_len`` consecutive frames pinned at full scale.
+
+    A cheap "was this clipped at rip time?" detector. A frame counts as clipped
+    when *any* channel reaches ``level``; a genuine over-gained rip leaves long
+    flat-topped runs, whereas isolated peaks (one or two samples) are ignored.
+    """
+    if data.size == 0:
+        return 0
+    clipped = np.any(np.abs(data) >= level, axis=1)
+    if not clipped.any():
+        return 0
+    padded = np.concatenate(([False], clipped, [False]))
+    edges = np.diff(padded.astype(np.int8))
+    starts = np.flatnonzero(edges == 1)
+    ends = np.flatnonzero(edges == -1)
+    return int(np.count_nonzero((ends - starts) >= run_len))
 
 
 # --------------------------------------------------------------------------- #
@@ -97,7 +116,7 @@ class HumRemoval(Stage):
     name: str = field(default="Hum removal", init=False)
 
     def apply(self, in_path: Path, out_path: Path) -> None:
-        data, samplerate, subtype = _read(in_path)
+        data, samplerate, _subtype = _read(in_path)
         nyquist = samplerate / 2.0
         out = data
         for harmonic in range(1, self.harmonics + 1):
@@ -106,7 +125,7 @@ class HumRemoval(Stage):
                 break
             b, a = iirnotch(freq, self.quality, samplerate)
             out = filtfilt(b, a, out, axis=0)
-        _write(out_path, out.astype(np.float32, copy=False), samplerate, subtype)
+        _write(out_path, out.astype(np.float32, copy=False), samplerate, _INTERMEDIATE_SUBTYPE)
 
 
 @dataclass
@@ -130,7 +149,7 @@ class NoiseReduction(Stage):
     name: str = field(default="Noise reduction", init=False)
 
     def apply(self, in_path: Path, out_path: Path) -> None:
-        data, samplerate, subtype = _read(in_path)
+        data, samplerate, _subtype = _read(in_path)
         frames = data.shape[0]
         start = max(0, int(self.profile_start * samplerate))
         end = min(frames, start + int(self.profile_duration * samplerate))
@@ -148,7 +167,7 @@ class NoiseReduction(Stage):
                 stationary=True,
                 prop_decrease=float(self.strength),
             )
-        _write(out_path, out.astype(np.float32, copy=False), samplerate, subtype)
+        _write(out_path, out.astype(np.float32, copy=False), samplerate, _INTERMEDIATE_SUBTYPE)
 
 
 @dataclass
@@ -157,22 +176,21 @@ class Declick(Stage):
 
     This is the one stage that leaves the numpy world: it hands the working WAV
     to ffmpeg (resolved through :mod:`core.ffmpeg_locator`) and reads back a new
-    WAV in the same staging dir. The output PCM codec is chosen from the source
-    subtype so bit depth is preserved rather than defaulting to 16-bit.
+    WAV in the same staging dir. Like every other stage it emits a float
+    intermediate (``pcm_f32le``), so adeclick's output can overshoot without
+    being quantise-clipped; ``restore`` handles the final bit-depth conversion.
     """
 
     name: str = field(default="Declick", init=False)
 
     def apply(self, in_path: Path, out_path: Path) -> None:
         ffmpeg_path, _ = ensure_ffmpeg()
-        subtype = sf.info(str(in_path)).subtype
-        codec = _SUBTYPE_TO_PCM_CODEC.get(subtype, "pcm_s16le")
         result = subprocess.run(
             [
                 str(ffmpeg_path), "-hide_banner", "-nostdin", "-y",
                 "-i", str(in_path),
                 "-af", "adeclick",
-                "-c:a", codec,
+                "-c:a", _INTERMEDIATE_FFMPEG_CODEC,
                 str(out_path),
             ],
             capture_output=True,
@@ -187,6 +205,28 @@ class Declick(Stage):
 # --------------------------------------------------------------------------- #
 # Orchestrator
 # --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class OutputPolicy:
+    """Final-write headroom + source-clip diagnostic tunables.
+
+    The whole settings contract for the final quantisation step, so a GUI can
+    expose each field. Nothing here limits or compresses -- an overshoot is
+    corrected by a single uniform gain, preserving dynamics.
+    """
+
+    headroom_target_dbfs: float = -0.1
+    """When the processed peak exceeds full scale, scale it down to this peak."""
+
+    clip_ceiling: float = 1.0
+    """Processed peak above this (float full scale) triggers the attenuation."""
+
+    source_clip_level: float = 0.999
+    """|sample| at or above this counts as full scale for the source-clip check."""
+
+    source_clip_run_len: int = 3
+    """This many consecutive full-scale samples make one source clip run."""
+
+
 @dataclass
 class RestorationResult:
     output_path: Path
@@ -194,6 +234,11 @@ class RestorationResult:
     channels: int
     subtype: str
     stages_applied: list[str] = field(default_factory=list)
+    peak_gain_db: float = 0.0
+    """Gain applied at the final write to tame an overshoot (<= 0 dB; 0 if none)."""
+    source_clip_runs: int = 0
+    """Full-scale runs found in the *source* -- a "clipped at rip" indicator."""
+    warnings: list[str] = field(default_factory=list)
 
 
 def restore(
@@ -201,16 +246,32 @@ def restore(
     output_path: str | Path,
     stages: list[Stage],
     on_progress: ProgressCallback | None = None,
+    policy: OutputPolicy | None = None,
 ) -> RestorationResult:
     """Run ``stages`` in order over ``input_path``, writing ``output_path``.
 
     The source is copied into a local temp staging dir first; every stage reads
-    and writes there; the final working file is copied to ``output_path``. The
+    and writes float intermediates *there*. The final write -- the only place we
+    quantise back to the source subtype -- measures the processed peak and, if it
+    overshot full scale, applies one uniform gain bringing it to
+    ``policy.headroom_target_dbfs`` (recorded in :attr:`RestorationResult.peak_gain_db`
+    with a warning). The untouched source is also scanned for full-scale runs so
+    a caller can tell "clipped at rip" apart from "clipped by the pipeline". The
     staging dir is removed in a ``finally`` block, so it never leaks -- including
     on stage failure or ``KeyboardInterrupt``.
     """
+    policy = policy or OutputPolicy()
     input_path = Path(input_path)
     output_path = Path(output_path)
+    source_subtype = sf.info(str(input_path)).subtype
+
+    # Cheap clipped-at-rip detector, on the untouched source.
+    src_data, _sr, _st = _read(input_path)
+    source_clip_runs = _count_clip_runs(
+        src_data, policy.source_clip_level, policy.source_clip_run_len
+    )
+    del src_data
+
     staging = Path(tempfile.mkdtemp(prefix="rrf_restore_"))
     try:
         current = staging / f"source{input_path.suffix or '.wav'}"
@@ -226,8 +287,28 @@ def restore(
             current = nxt
             applied.append(stage.name)
 
+        # Final write: read the (float) working file, apply the headroom policy,
+        # and quantise to the source subtype -- the only quantisation in the run.
+        data, samplerate, _st = _read(current)
+        peak = float(np.max(np.abs(data))) if data.size else 0.0
+        warnings: list[str] = []
+        peak_gain_db = 0.0
+        if peak > policy.clip_ceiling:
+            target = 10.0 ** (policy.headroom_target_dbfs / 20.0)
+            gain = target / peak
+            data = data * gain
+            peak_gain_db = 20.0 * np.log10(gain)
+            warnings.append(
+                f"output attenuated {abs(peak_gain_db):.1f} dB to prevent clipping"
+            )
+        if source_clip_runs:
+            warnings.append(
+                f"source appears clipped ({source_clip_runs} full-scale run(s)); "
+                "re-rip with lower gain"
+            )
+
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(current, output_path)
+        _write(output_path, data.astype(np.float32, copy=False), samplerate, source_subtype)
 
         info = sf.info(str(output_path))
         return RestorationResult(
@@ -236,6 +317,9 @@ def restore(
             channels=info.channels,
             subtype=info.subtype,
             stages_applied=applied,
+            peak_gain_db=peak_gain_db,
+            source_clip_runs=source_clip_runs,
+            warnings=warnings,
         )
     finally:
         shutil.rmtree(staging, ignore_errors=True)

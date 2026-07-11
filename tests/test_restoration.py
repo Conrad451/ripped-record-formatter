@@ -99,7 +99,9 @@ def test_declick_removes_clicks_preserves_format(tmp_path):
 
     assert after <= before * 0.1              # measured 200 -> 0
     assert sf.info(str(dst)).samplerate == SR
-    assert sf.info(str(dst)).subtype == "PCM_16"   # bit depth preserved
+    # Every stage now emits a float intermediate; restore() does the final
+    # bit-depth conversion. Standalone, Declick therefore writes FLOAT.
+    assert sf.info(str(dst)).subtype == "FLOAT"
 
 
 def test_restore_pipeline_and_staging_cleanup_success(tmp_path):
@@ -146,3 +148,98 @@ def test_staging_cleanup_on_induced_failure(tmp_path):
 
     assert not dst.exists()                    # never produced
     assert not (_staging_dirs() - before)      # staging still cleaned up
+
+
+# --------------------------------------------------------------------------- #
+# Headroom-safe chain (float intermediates + final-write policy)
+# --------------------------------------------------------------------------- #
+
+
+def _clipped_source(seconds: float = 3.0) -> np.ndarray:
+    """A flat-topped, full-scale (over-gained) rip: harmonic-rich, clips easily."""
+    t = np.arange(int(SR * seconds)) / SR
+    raw = 1.4 * np.sin(2 * np.pi * 1000 * t) + 0.5 * np.sin(2 * np.pi * 60 * t)
+    return np.clip(raw, -1.0, 1.0).astype(np.float32)
+
+
+def test_float_intermediates_do_not_quantize_clip(tmp_path):
+    """Zero-phase hum removal on a clipped source overshoots past +/-1.0; the
+    intermediate must preserve that (FLOAT), not pin it to full scale, and the
+    final PCM output must contain no full-scale-pinned samples."""
+    sig = _clipped_source()
+    src = tmp_path / "in.wav"
+    sf.write(str(src), sig, SR, subtype="PCM_16")
+
+    # Stage boundary is float-transparent: overshoot survives, subtype is FLOAT.
+    mid = tmp_path / "mid.wav"
+    R.HumRemoval(base_freq=60, harmonics=4).apply(src, mid)
+    mid_data, _ = sf.read(str(mid))
+    mid_peak = float(np.max(np.abs(mid_data)))
+    print(f"\n[headroom] hum intermediate peak = {mid_peak:.3f} (subtype "
+          f"{sf.info(str(mid)).subtype})")
+    assert sf.info(str(mid)).subtype == "FLOAT"
+    assert mid_peak > 1.0                       # overshoot preserved, not clipped
+
+    # Full chain to PCM_16: no sample may be pinned at 16-bit full scale.
+    dst = tmp_path / "out.wav"
+    result = R.restore(src, dst, [R.HumRemoval(), R.NoiseReduction()])
+    out = sf.read(str(dst), dtype="int16")[0]
+    pinned = int((np.abs(out.astype(np.int32)) >= 32767).sum())
+    print(f"[headroom] final PCM samples pinned at full scale = {pinned}")
+    assert pinned == 0
+    # The clipped source is diagnosed, so a UI can blame the rip, not the pipeline.
+    assert result.source_clip_runs > 0
+    assert any("clipped" in w for w in result.warnings)
+
+
+def test_overshoot_triggers_uniform_gain(tmp_path):
+    """A processed signal that overshoots full scale is scaled down by one gain
+    to -0.1 dBFS; peak_gain_db reports it and a warning is emitted."""
+
+    class _Overshoot(R.Stage):
+        name = "Overshoot"
+
+        def __init__(self, peak: float) -> None:
+            self.peak = peak
+
+        def apply(self, in_path, out_path):
+            data, sr, _ = R._read(in_path)
+            data = data / np.max(np.abs(data)) * self.peak
+            R._write(out_path, data.astype(np.float32), sr, "FLOAT")
+
+    t = np.arange(int(SR)) / SR
+    sig = (0.5 * np.sin(2 * np.pi * 1000 * t)).astype(np.float32)
+    src, dst = tmp_path / "in.wav", tmp_path / "out.wav"
+    sf.write(str(src), sig, SR, subtype="PCM_16")
+
+    result = R.restore(src, dst, [_Overshoot(1.5)])
+
+    target = 10.0 ** (-0.1 / 20.0)              # -0.1 dBFS default
+    expected_gain_db = 20.0 * np.log10(target / 1.5)
+    out_peak = float(np.max(np.abs(sf.read(str(dst))[0])))
+    print(f"\n[headroom] peak 1.5 -> gain {result.peak_gain_db:.2f} dB, "
+          f"output peak {out_peak:.4f}")
+
+    assert result.peak_gain_db < 0.0
+    assert abs(result.peak_gain_db - expected_gain_db) < 0.1
+    assert abs(out_peak - target) < 0.01        # brought to ~-0.1 dBFS
+    assert out_peak < 1.0                        # and definitely not clipping
+    assert any("attenuated" in w for w in result.warnings)
+
+
+def test_pcm16_in_pcm16_out_no_gain_when_within_range(tmp_path):
+    """A well-behaved source round-trips subtype and is left untouched: no gain,
+    no warnings, no false clip diagnosis."""
+    t = np.arange(int(SR * 2)) / SR
+    sig = (0.4 * np.sin(2 * np.pi * 1000 * t)
+           + 0.1 * np.sin(2 * np.pi * 60 * t)).astype(np.float32)
+    src, dst = tmp_path / "in.wav", tmp_path / "out.wav"
+    sf.write(str(src), sig, SR, subtype="PCM_16")
+
+    result = R.restore(src, dst, [R.HumRemoval(), R.NoiseReduction()])
+
+    assert sf.info(str(dst)).subtype == "PCM_16"
+    assert result.subtype == "PCM_16"
+    assert result.peak_gain_db == 0.0
+    assert result.source_clip_runs == 0
+    assert result.warnings == []
