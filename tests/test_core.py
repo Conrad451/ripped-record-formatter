@@ -41,8 +41,9 @@ def test_retag_same_path_guard(tmp_path):
     AudioSegment.silent(duration=100).export(str(flac), format="flac")
 
     # filename() resolves to the same name in the same dir -> source == dest.
+    # Opt into deletion so the guard is actually exercised (default is now False).
     track = Tracks(1, "Keep", "Al", "Ar", flac)
-    result = converter.retag_flacs([track], tmp_path, configure=False)
+    result = converter.retag_flacs([track], tmp_path, delete_source=True, configure=False)
 
     assert flac.exists(), "guard should have kept the file"
     assert result.outcomes[0].source_deleted is False

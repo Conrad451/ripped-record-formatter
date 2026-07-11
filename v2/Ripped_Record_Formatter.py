@@ -37,14 +37,16 @@ def _ensure_ffmpeg():
     configure_pydub()
 
 
-def _run_with_bar(operation, track_data, flacdir):
+def _run_with_bar(operation, track_data, flacdir, **kwargs):
     """Drive a core batch operation, ticking an alive_bar after each track."""
     track_data = list(track_data)
     with alive_bar(len(track_data)) as bar:
         def on_progress(current, total, track_name):
             bar()
 
-        return operation(track_data, flacdir, on_progress=on_progress, configure=False)
+        return operation(
+            track_data, flacdir, on_progress=on_progress, configure=False, **kwargs
+        )
 
 
 def _report(result):
@@ -68,7 +70,9 @@ def add_meta():
     track_data, flacdir = get_flac_meta()
     _ensure_ffmpeg()
     print("Processing meta data...")
-    result = _run_with_bar(converter.retag_flacs, track_data, flacdir)
+    # Legacy CLI behavior deletes the source FLAC after re-tagging; core now
+    # defaults to keeping it, so request deletion explicitly here.
+    result = _run_with_bar(converter.retag_flacs, track_data, flacdir, delete_source=True)
     _report(result)
     return result
 

@@ -104,12 +104,13 @@ def retag_flacs(
     output_dir: str | Path,
     on_progress: ProgressCallback | None = None,
     *,
-    delete_source: bool = True,
+    delete_source: bool = False,
     configure: bool = True,
 ) -> BatchResult:
     """Re-export each source FLAC into ``output_dir`` with fresh tags.
 
-    When ``delete_source`` is true the original file is removed after a
+    ``delete_source`` defaults to ``False`` -- deleting the user's originals is
+    opt-in. When it is true the original file is removed after a
     successful write -- *except* when the source and destination resolve to the
     same path, in which case deletion is skipped and a warning is recorded so we
     never destroy the file we just produced.
