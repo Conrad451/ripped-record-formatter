@@ -13,8 +13,25 @@ fixed here:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
+
+# Characters Windows forbids in a filename component.
+_INVALID_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|]')
+
+
+def sanitize_filename_component(name: str) -> str:
+    """Make ``name`` safe as a Windows filename component.
+
+    Replaces the forbidden characters ``\\ / : * ? " < > |`` with a space,
+    collapses runs of whitespace, and strips leading/trailing spaces and dots
+    (Windows also disallows trailing dots/spaces). May return ``""`` -- callers
+    must decide on a fallback.
+    """
+    cleaned = _INVALID_FILENAME_CHARS.sub(" ", name)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned.strip(" .")
 
 
 @dataclass
@@ -36,8 +53,17 @@ class Tracks:
         self.track_wav_loc = Path(self.track_wav_loc)
 
     def filename(self) -> str:
-        """Output filename: ``[NN] - name.flac`` with 2-digit zero padding."""
-        return f"[{self.track_num:02d}] - {self.track_name}.flac"
+        """Output filename: ``[NN] - name.flac`` with 2-digit zero padding.
+
+        The title is sanitized for the filesystem (so a pasted title like
+        ``"Intro / Outro"`` cannot produce an invalid path); the *tags* keep the
+        original, unsanitized title. Falls back to ``Track NN`` if sanitizing
+        leaves nothing.
+        """
+        name = sanitize_filename_component(self.track_name)
+        if not name:
+            name = f"Track {self.track_num:02d}"
+        return f"[{self.track_num:02d}] - {name}.flac"
 
     def tags(self) -> dict[str, str]:
         """Metadata tags for the encoder.
