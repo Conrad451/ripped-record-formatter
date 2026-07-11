@@ -18,13 +18,37 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable
 
 from core.tracks import Tracks
+
+if TYPE_CHECKING:
+    from core.metadata_lookup import CoverArt
 
 # on_progress(current, total, track_name) -- current is 1-based and counts
 # tracks that have *completed*.
 ProgressCallback = Callable[[int, int, str], None]
+
+
+def _embed_cover(flac_path: Path, cover: "CoverArt") -> None:
+    """Embed ``cover`` as the FLAC's front-cover picture (idempotent).
+
+    Existing pictures are cleared first so re-tagging replaces rather than
+    accumulates art. Raises on failure; callers turn that into a warning so
+    cover art never fails a whole batch.
+    """
+    from mutagen.flac import FLAC, Picture
+
+    picture = Picture()
+    picture.type = 3            # ID3 APIC type 3 = front cover
+    picture.desc = "front cover"
+    picture.mime = cover.mime
+    picture.data = cover.data
+
+    flac = FLAC(str(flac_path))
+    flac.clear_pictures()
+    flac.add_picture(picture)
+    flac.save()
 
 
 @dataclass
@@ -71,12 +95,15 @@ def convert_wavs_to_flacs(
     on_progress: ProgressCallback | None = None,
     *,
     configure: bool = True,
+    cover: "CoverArt | None" = None,
 ) -> BatchResult:
     """Convert each track's source WAV to a tagged FLAC in ``output_dir``.
 
     Source files are left in place. ``on_progress`` fires once per track after
     it has been written. Set ``configure=False`` to skip ffmpeg setup when the
-    caller has already configured pydub.
+    caller has already configured pydub. If ``cover`` is given it is embedded as
+    the front cover of every track; a failure to embed becomes a per-track
+    warning and never fails the batch.
     """
     if configure:
         from core.ffmpeg_locator import configure_pydub
@@ -92,7 +119,13 @@ def convert_wavs_to_flacs(
         dest = out_dir / track.filename()
         audio = AudioSegment.from_wav(str(track.track_wav_loc))
         audio.export(str(dest), format="flac", tags=track.tags())
-        result.outcomes.append(TrackOutcome(track=track, output_path=dest))
+        outcome = TrackOutcome(track=track, output_path=dest)
+        if cover is not None:
+            try:
+                _embed_cover(dest, cover)
+            except Exception as exc:  # art never fails a batch
+                outcome.warnings.append(f"Could not embed cover art: {exc}")
+        result.outcomes.append(outcome)
         if on_progress is not None:
             on_progress(index, len(tracks), track.track_name)
 
@@ -106,6 +139,7 @@ def retag_flacs(
     *,
     delete_source: bool = False,
     configure: bool = True,
+    cover: "CoverArt | None" = None,
 ) -> BatchResult:
     """Re-export each source FLAC into ``output_dir`` with fresh tags.
 
@@ -113,7 +147,9 @@ def retag_flacs(
     opt-in. When it is true the original file is removed after a
     successful write -- *except* when the source and destination resolve to the
     same path, in which case deletion is skipped and a warning is recorded so we
-    never destroy the file we just produced.
+    never destroy the file we just produced. If ``cover`` is given it is embedded
+    as the front cover; embed failures become per-track warnings, never batch
+    failures.
     """
     if configure:
         from core.ffmpeg_locator import configure_pydub
@@ -133,6 +169,11 @@ def retag_flacs(
         audio.export(str(dest), format="flac", tags=track.tags())
 
         outcome = TrackOutcome(track=track, output_path=dest)
+        if cover is not None:
+            try:
+                _embed_cover(dest, cover)
+            except Exception as exc:  # art never fails a batch
+                outcome.warnings.append(f"Could not embed cover art: {exc}")
 
         same_file = source.resolve() == dest.resolve()
         if delete_source and same_file:

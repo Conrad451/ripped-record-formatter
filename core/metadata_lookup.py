@@ -285,7 +285,7 @@ class MusicBrainzProvider(MetadataProvider):
         self,
         app_name: str = "RippedRecordFormatter",
         app_version: str = "2.0",
-        contact: str = "https://github.com/ripped-record-formatter",
+        contact: str = "https://github.com/Conrad451/ripped-record-formatter",
         *,
         timeout: float = 15.0,
         rate_limiter: RateLimiter | None = None,
