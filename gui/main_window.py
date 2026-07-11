@@ -209,13 +209,14 @@ class BatchPanel(QWidget):
             self.logMessage.emit("No tracks to process -- load files first.")
             return None
 
+        max_workers = self.settings.config.encode_workers
         if self.kind == "convert":
-            kwargs = {}
+            kwargs = {"max_workers": max_workers}
             if self._cover is not None:
                 kwargs["cover"] = self._cover
             return converter.convert_wavs_to_flacs, tracks, Path(output), kwargs
         delete = bool(self.delete_check and self.delete_check.isChecked())
-        kwargs = {"delete_source": delete}
+        kwargs = {"delete_source": delete, "max_workers": max_workers}
         if self._cover is not None:
             kwargs["cover"] = self._cover
         return converter.retag_flacs, tracks, Path(output), kwargs

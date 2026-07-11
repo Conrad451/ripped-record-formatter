@@ -103,6 +103,8 @@ class SettingsPanel(QWidget):
         # Headroom
         basic.addRow("Output headroom (dBFS):",
                      self._dspin("headroom_target_dbfs", cfg.headroom_target_dbfs, -6.0, 0.0, 0.1, 2))
+        basic.addRow("Parallel encode jobs:",
+                     self._ispin("encode_workers", cfg.encode_workers, 1, 16))
         root.addWidget(basic_box)
 
         # ---------------- Advanced ----------------

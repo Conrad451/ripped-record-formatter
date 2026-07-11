@@ -17,7 +17,8 @@ so tests can round-trip without touching the real user config.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, fields
+import os
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 from platformdirs import user_config_dir
@@ -84,6 +85,10 @@ class Config:
     # --- anchored-search windows ---
     window_s: float = 15.0
     speed_tolerance: float = 0.02
+
+    # --- encoding ---
+    encode_workers: int = field(default_factory=lambda: min(4, os.cpu_count() or 1))
+    """How many tracks to encode in parallel (each is an independent ffmpeg run)."""
 
 
 def config_path() -> Path:
