@@ -27,13 +27,25 @@ gets a confidence from how far below threshold it dips and how long it lasts, so
 a true inter-track gap (deep, long) outranks a quiet passage inside a track
 (shallow, short).
 
-Two selection modes:
+Three selection modes, the caller's choice (anchored > count > threshold):
 
-* **Track-count-constrained** (primary) -- given expected track count ``N``,
-  return the ``N-1`` highest-confidence gaps. This is what survives the trap
-  where a quiet passage inside a track would fool a raw threshold.
+* **Duration-anchored** (best, :func:`propose_splits_anchored`) -- given expected
+  per-track durations (e.g. from MusicBrainz), predict roughly where each gap
+  falls, search a window around each prediction for the true gap, and re-anchor
+  the next prediction on the confirmed position so error never compounds.
+* **Track-count-constrained** (:func:`propose_splits`, ``track_count=N``) --
+  return the ``N-1`` highest-confidence gaps. Survives the trap where a quiet
+  passage inside a track would fool a raw threshold.
 * **Raw threshold** (fallback, ``track_count=None``) -- return every gap that
   clears the tunables. Honest but eager: it will split the trap.
+
+Why anchored is worth the extra input: durations only *approximately* locate
+gaps. Three errors stack -- unknown inter-track deadspace, CD-sourced durations
+that don't match the pressing, and turntable speed error (+/-1-2%, cumulative).
+So durations define *search windows*, energy analysis finds the true gap inside
+each, and re-anchoring on every confirmed gap keeps the +/-1% speed drift from
+compounding across a side. A window with no qualifying dip (a genuine crossfade)
+becomes an explicit :class:`UnresolvedGap` marker instead of aborting the search.
 """
 
 from __future__ import annotations
@@ -96,18 +108,45 @@ class SplitPoint:
     """``round(timestamp * samplerate)`` -- the sample-accurate cut index."""
 
 
+@dataclass(frozen=True)
+class UnresolvedGap:
+    """A predicted gap the energy pass could not confirm inside its window.
+
+    Emitted only by anchored mode. Carries enough for a UI to zoom to the
+    window and ask the user to place the cut by hand; the search does not stop
+    on one of these -- the next prediction re-anchors on the expected position.
+    """
+
+    track_index: int
+    """Which gap this is: the boundary after track ``track_index``."""
+
+    expected_ts: float
+    """Predicted gap location (seconds) the window was centered on."""
+
+    window_start: float
+    window_end: float
+    """The searched span (seconds), clamped to the file."""
+
+
 @dataclass
 class SplitProposal:
-    """Result of :func:`propose_splits`. Carries no file handles or audio."""
+    """Result of any proposal call. Carries no file handles or audio."""
 
     split_points: list[SplitPoint] = field(default_factory=list)
     samplerate: int = 0
     duration: float = 0.0
     mode: str = "threshold"
-    """``"count"`` (N-constrained) or ``"threshold"`` (raw fallback)."""
+    """``"anchored"``, ``"count"`` (N-constrained), or ``"threshold"`` (fallback)."""
+
+    unresolved: list[UnresolvedGap] = field(default_factory=list)
+    """Predicted gaps anchored mode could not confirm; empty for other modes."""
 
     def timestamps(self) -> list[float]:
-        """Just the cut times, in order -- ready to hand to :func:`execute_split`."""
+        """Just the confirmed cut times, in order -- ready for :func:`execute_split`.
+
+        In anchored mode this excludes any :class:`UnresolvedGap`; the caller is
+        expected to resolve those first if it wants a complete cut list.
+        """
         return [p.timestamp for p in self.split_points]
 
 
@@ -277,6 +316,115 @@ def propose_splits(
         samplerate=samplerate,
         duration=duration,
         mode=mode,
+    )
+
+
+def _anchored_confidence(
+    gap: _Gap, pred_start: float, half: float, params: SilenceParams
+) -> float:
+    """Blend gap quality (depth + duration) with agreement to the prediction.
+
+    Quality says "this is a real inter-track gap"; proximity says "and it landed
+    where the durations said it would". A deep, long gap right on the predicted
+    boundary scores near 1; a shallow one at the window's edge scores low.
+    """
+    depth = max(0.0, params.silence_threshold_db - gap.min_db)
+    depth_conf = min(1.0, depth / _DEPTH_REF_DB)
+    dur_conf = min(1.0, max(0.0, gap.duration - params.min_silence) / _DUR_REF_S)
+    quality = 0.6 * depth_conf + 0.4 * dur_conf
+    prox_conf = max(0.0, 1.0 - abs(gap.start - pred_start) / half) if half > 0 else 1.0
+    return 0.5 * quality + 0.5 * prox_conf
+
+
+# Confidence multiplier for the first gap confirmed after a miss: its prediction
+# was built on an unconfirmed anchor, so trust it a little less.
+_POST_MISS_PENALTY = 0.8
+
+
+def propose_splits_anchored(
+    wav_path: str | Path,
+    expected_durations_ms: list[int],
+    *,
+    params: SilenceParams | None = None,
+    window_s: float = 15.0,
+    speed_tolerance: float = 0.02,
+) -> SplitProposal:
+    """Propose cuts using expected per-track durations to steer the search.
+
+    ``expected_durations_ms`` is one duration per track (e.g. from MusicBrainz);
+    ``N`` tracks imply ``N-1`` internal gaps. For each gap in order, predict its
+    position from the *previous confirmed gap* plus this track's duration, search
+    a window around that prediction (base ``window_s``, widened by
+    ``speed_tolerance`` x the elapsed track time to cover turntable speed drift),
+    and take the deepest qualifying silence run found there.
+
+    Re-anchoring on each confirmed gap is the whole point: speed error and
+    deadspace are measured fresh from the last real gap every step, so they never
+    accumulate down the side. A window with no qualifying dip yields an
+    :class:`UnresolvedGap` (with its bounds) and the search continues, re-anchored
+    on the predicted position; the next confirmed gap is flagged with reduced
+    confidence. Reads the file; writes nothing.
+    """
+    params = params or SilenceParams()
+    mono, samplerate = _load_mono(wav_path)
+    duration = mono.shape[0] / samplerate if samplerate else 0.0
+
+    # Same envelope + gap machinery as the other modes -- computed once.
+    times, rms_db, _hop_s = _frame_rms_db(mono, samplerate, params)
+    gaps = _detect_gaps(times, rms_db, params)
+
+    durations_s = [d / 1000.0 for d in expected_durations_ms]
+    n_gaps = max(0, len(durations_s) - 1)
+
+    found: list[SplitPoint] = []
+    unresolved: list[UnresolvedGap] = []
+    anchor = 0.0  # position of the last confirmed gap (0 = start of side)
+    post_miss = False
+
+    for k in range(n_gaps):
+        elapsed = durations_s[k]  # nominal length of the track ending at gap k
+        pred_start = anchor + elapsed
+        half = window_s + speed_tolerance * elapsed
+        w_start = max(anchor, pred_start - half)
+        w_end = min(duration, pred_start + half)
+
+        # Candidate = a detected gap that begins inside the window.
+        cands = [g for g in gaps if w_start <= g.start <= w_end]
+        if not cands:
+            unresolved.append(
+                UnresolvedGap(
+                    track_index=k,
+                    expected_ts=pred_start,
+                    window_start=w_start,
+                    window_end=w_end,
+                )
+            )
+            anchor = pred_start  # re-anchor on the prediction; do NOT abort
+            post_miss = True
+            continue
+
+        # Deepest dip wins; ties break toward the prediction.
+        best = min(cands, key=lambda g: (g.min_db, abs(g.start - pred_start)))
+        conf = _anchored_confidence(best, pred_start, half, params)
+        if post_miss:
+            conf *= _POST_MISS_PENALTY
+            post_miss = False
+
+        found.append(
+            SplitPoint(
+                timestamp=best.center,
+                confidence=round(conf, 4),
+                sample=int(round(best.center * samplerate)),
+            )
+        )
+        anchor = best.end  # confirmed: next track starts at this gap's end
+
+    return SplitProposal(
+        split_points=found,
+        samplerate=samplerate,
+        duration=duration,
+        mode="anchored",
+        unresolved=unresolved,
     )
 
 
