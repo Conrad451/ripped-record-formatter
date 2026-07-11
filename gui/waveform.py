@@ -14,12 +14,22 @@ from __future__ import annotations
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
+
+from core.timefmt import format_timestamp
 
 _WAVE_PEN = pg.mkPen("#3b6ea5")
 _MARKER_PEN = pg.mkPen("#c0392b", width=2)
 _MARKER_HOVER = pg.mkPen("#e74c3c", width=3)
+_MARKER_WARN = pg.mkPen("#e67e22", width=3, style=Qt.PenStyle.DashLine)
 _REGION_BRUSH = pg.mkBrush(255, 196, 0, 60)
+
+
+class _TimeAxis(pg.AxisItem):
+    """Bottom axis that prints tick values (seconds) as m:ss / h:mm:ss."""
+
+    def tickStrings(self, values, scale, spacing):
+        return [format_timestamp(v) for v in values]
 
 
 class WaveformView(pg.PlotWidget):
@@ -28,12 +38,12 @@ class WaveformView(pg.PlotWidget):
     markersChanged = Signal()   # any add / move / delete
 
     def __init__(self, parent=None):
-        super().__init__(parent)
+        super().__init__(parent, axisItems={"bottom": _TimeAxis(orientation="bottom")})
         self.setBackground("w")
         self.showGrid(x=True, y=False, alpha=0.2)
         self.setMenuEnabled(False)
         self.setMouseEnabled(x=True, y=False)
-        self.setLabel("bottom", "Time", units="s")
+        self.setLabel("bottom", "Time")
         self.setYRange(-1.0, 1.0)
         self.getPlotItem().hideButtons()
 
@@ -42,8 +52,13 @@ class WaveformView(pg.PlotWidget):
         self._markers: list[pg.InfiniteLine] = []
         self._region: pg.LinearRegionItem | None = None
         self._env = None
+        self._place_mode = False
 
         self.scene().sigMouseClicked.connect(self._on_scene_clicked)
+
+    def set_place_mode(self, enabled: bool) -> None:
+        """When on, a left-click on the plot drops a new marker there."""
+        self._place_mode = enabled
 
     # -- envelope -----------------------------------------------------------
     def set_envelope(self, env) -> None:
@@ -68,20 +83,37 @@ class WaveformView(pg.PlotWidget):
         return self._env.duration if self._env is not None else 0.0
 
     # -- markers ------------------------------------------------------------
+    def _marker_tooltip(self, line: pg.InfiniteLine) -> str:
+        text = f"split at {format_timestamp(line.value())}"
+        conf = getattr(line, "_confidence", None)
+        if conf is not None:
+            text += (f"\nconfidence {conf:.2f} "
+                     "(within-rip ranking, not an absolute quality grade)")
+        return text
+
     def _add_marker_line(self, time: float, confidence: float | None) -> pg.InfiniteLine:
         line = pg.InfiniteLine(
             pos=float(time), angle=90, movable=True,
             pen=_MARKER_PEN, hoverPen=_MARKER_HOVER,
         )
-        if confidence is not None:
-            line.setToolTip(
-                f"confidence {confidence:.2f}\n"
-                "(within-rip ranking, not an absolute quality grade)"
-            )
+        line._confidence = confidence
+        line.setToolTip(self._marker_tooltip(line))
+        # Keep the tooltip's timestamp live while dragging.
+        line.sigPositionChanged.connect(lambda ln=line: ln.setToolTip(self._marker_tooltip(ln)))
         line.sigPositionChangeFinished.connect(lambda *_: self.markersChanged.emit())
         self.addItem(line)
         self._markers.append(line)
         return line
+
+    def highlight_markers(self, sorted_indices) -> None:
+        """Recolour markers at these positions (by ascending time) as deviating.
+
+        Highlight reverts automatically the next time it is called with the
+        marker no longer in the set (e.g. after the user corrects a length).
+        """
+        wanted = set(sorted_indices)
+        for i, line in enumerate(sorted(self._markers, key=lambda ln: ln.value())):
+            line.setPen(_MARKER_WARN if i in wanted else _MARKER_PEN)
 
     def add_marker(self, time: float, confidence: float | None = None) -> pg.InfiniteLine:
         line = self._add_marker_line(time, confidence)
@@ -146,12 +178,18 @@ class WaveformView(pg.PlotWidget):
         return (x1 - x0) / width * pixels
 
     def _on_scene_clicked(self, event) -> None:
-        if not event.double() or not self._markers:
-            return
         vb = self.getPlotItem().getViewBox()
         x = vb.mapSceneToView(event.scenePos()).x()
-        nearest = min(self._markers, key=lambda line: abs(line.value() - x))
-        if abs(nearest.value() - x) <= self._x_tolerance(8):
-            self._remove_marker(nearest)
-            self.markersChanged.emit()
+        if event.double():
+            if not self._markers:
+                return
+            nearest = min(self._markers, key=lambda line: abs(line.value() - x))
+            if abs(nearest.value() - x) <= self._x_tolerance(8):
+                self._remove_marker(nearest)
+                self.markersChanged.emit()
+                event.accept()
+            return
+        # Single left-click in place mode drops a marker where the user clicked.
+        if self._place_mode and event.button() == Qt.MouseButton.LeftButton:
+            self.add_marker(x)
             event.accept()
