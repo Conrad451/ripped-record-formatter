@@ -32,6 +32,10 @@ htmlcov/
 # Claude Code local session files
 .claude/
 
+# IDE / editor
+.idea/
+.vscode/
+
 # OS cruft
 Thumbs.db
 desktop.ini

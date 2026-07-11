@@ -1,6 +1,7 @@
-from import_tracks import wavdir_flacdir
-from Tracks import Tracks
 import os
+
+from core.tracks import Tracks
+from import_tracks import wavdir_flacdir
 
 # Soundtrack mode functions
 def get_loc_save_tracks_soundtrack():
