@@ -274,6 +274,8 @@ class MainWindow(QMainWindow):
         self.full_rip.logMessage.connect(self._log)
         self.metadata_panel.statusMessage.connect(self._log)
         self.metadata_panel.releaseSelected.connect(self._on_release_selected)
+        self._last_batch_panel = self.convert_panel
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
         self._last_output_dir: Path | None = None
         progress_row = QHBoxLayout()
@@ -296,12 +298,20 @@ class MainWindow(QMainWindow):
                   "Use Metadata to pull tracklists + cover art.")
 
     # --- metadata wiring ---------------------------------------------------
+    def _on_tab_changed(self, index: int) -> None:
+        widget = self.tabs.widget(index)
+        if widget in (self.convert_panel, self.retag_panel):
+            self._last_batch_panel = widget
+
     def _on_release_selected(self, detail) -> None:
+        # The standalone Metadata tab feeds the last-used batch panel only;
+        # Full Rip has its own embedded lookup (scoped to itself).
+        panel = getattr(self, "_last_batch_panel", self.convert_panel)
+        panel.apply_release(detail)
+        which = "Convert" if panel is self.convert_panel else "Re-tag"
         self._log(f"Release selected: {detail.artist} - {detail.title} "
-                  f"({detail.track_count} track(s), cover={'yes' if detail.cover else 'no'}).")
-        for panel in (self.convert_panel, self.retag_panel):
-            panel.apply_release(detail)
-        self.full_rip.set_release(detail)
+                  f"({detail.track_count} track(s), cover={'yes' if detail.cover else 'no'}) "
+                  f"-> applied to the {which} panel.")
 
     def closeEvent(self, event) -> None:
         self.full_rip.cleanup()

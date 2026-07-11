@@ -43,6 +43,14 @@ from core.ffmpeg_locator import ensure_ffmpeg
 ProgressCallback = Callable[[str, int, int], None]
 
 
+class Cancelled(RuntimeError):
+    """Raised out of :func:`restore` when ``should_cancel`` asks it to stop.
+
+    The staging dir is still removed by ``restore``'s ``finally``, so a cancelled
+    run leaves nothing behind.
+    """
+
+
 # --------------------------------------------------------------------------- #
 # soundfile helpers -- keep sample rate + bit depth stable across numpy stages
 # --------------------------------------------------------------------------- #
@@ -286,6 +294,7 @@ def restore(
     stages: list[Stage],
     on_progress: ProgressCallback | None = None,
     policy: OutputPolicy | None = None,
+    should_cancel=None,
 ) -> RestorationResult:
     """Run ``stages`` in order over ``input_path``, writing ``output_path``.
 
@@ -319,6 +328,8 @@ def restore(
         total = len(stages)
         applied: list[str] = []
         for index, stage in enumerate(stages, start=1):
+            if should_cancel is not None and should_cancel():
+                raise Cancelled("restoration cancelled")
             if on_progress is not None:
                 on_progress(stage.name, index, total)
             nxt = staging / f"stage_{index:02d}.wav"
