@@ -2,7 +2,7 @@
 
 
 
-from Tracks import Tracks
+from core.tracks import Tracks
 import tkinter as tk
 from tkinter import filedialog
 import os
