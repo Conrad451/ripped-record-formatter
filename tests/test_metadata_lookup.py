@@ -212,6 +212,38 @@ def test_search_passes_both_fields_to_client():
     assert fields == {"artist": "Miles Davis", "release": "Kind of Blue"}
 
 
+def _ranking_payload():
+    def rel(rid, title, fmt, tc, secondary=None):
+        rg = {"type": "Album"}
+        if secondary:
+            rg["secondary-type-list"] = secondary
+        return {
+            "id": rid, "title": title, "artist-credit-phrase": "Nirvana",
+            "medium-list": [{"format": fmt, "track-count": tc}],
+            "release-group": rg,
+        }
+    return {"release-list": [
+        rel("studio-cd", "In Utero", "CD", 12),
+        rel("comp-vinyl", "Nirvana", "Vinyl", 14, ["Compilation"]),
+        rel("studio-vinyl", "In Utero", "Vinyl", 12),
+        rel("comp-cd", "Nirvana", "CD", 14, ["Compilation"]),
+    ], "release-count": 4}
+
+
+def test_search_ranks_studio_and_vinyl_first():
+    mb = FakeMusicBrainz(search=_ranking_payload())
+    results = make_provider(mb).search_releases("Nirvana", "In Utero")
+    # Studio albums before compilations; vinyl before CD within the same type.
+    assert [r.release_id for r in results] == [
+        "studio-vinyl", "studio-cd", "comp-vinyl", "comp-cd",
+    ]
+    # ...and both search terms still constrained the query.
+    _, fields, _ = mb.calls[0]
+    assert fields == {"artist": "Nirvana", "release": "In Utero"}
+    assert results[0].is_vinyl and not results[0].is_compilation
+    assert results[2].is_compilation
+
+
 def test_search_with_no_query_short_circuits_without_network():
     mb = FakeMusicBrainz()
     results = make_provider(mb).search_releases("  ", "")

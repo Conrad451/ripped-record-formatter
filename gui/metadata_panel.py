@@ -194,7 +194,8 @@ class MetadataPanel(QWidget):
             self._set_status("Type an artist or album to search.")
             return
         self._set_busy(True)
-        self._set_status(f"Searching for {album or artist!r}...")
+        query = " - ".join(part for part in (artist, album) if part)
+        self._set_status(f"Searching for {query!r}...")
         try:
             provider = self._get_provider()
         except Exception as exc:  # provider construction failed (e.g. missing dep)

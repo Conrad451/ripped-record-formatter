@@ -90,6 +90,16 @@ class ReleaseResult:
     formats: str = ""       # e.g. "Vinyl", "2xVinyl", "CD"
     track_count: int = 0
     disambiguation: str = ""  # MusicBrainz free-text note, if any
+    primary_type: str = ""    # release-group primary type ("Album", "Single", ...)
+    secondary_types: tuple[str, ...] = ()  # e.g. ("Compilation", "Live")
+
+    @property
+    def is_vinyl(self) -> bool:
+        return "vinyl" in self.formats.lower()
+
+    @property
+    def is_compilation(self) -> bool:
+        return any(t.lower() == "compilation" for t in self.secondary_types)
 
     def label(self) -> str:
         """A one-line human summary for a results row / log line."""
@@ -341,7 +351,13 @@ class MusicBrainzProvider(MetadataProvider):
             fields["release"] = album
         data = self._call(self._mb.search_releases, limit=limit, **fields)
         releases = data.get("release-list", []) if isinstance(data, dict) else []
-        return [_parse_search_release(r) for r in releases]
+        results = [_parse_search_release(r) for r in releases]
+        # This is a vinyl tool: surface the pressing the user actually wants.
+        # Studio albums outrank compilations (the reported failure mode), and
+        # vinyl outranks CD within the same album type. sorted() is stable, so
+        # MusicBrainz's own relevance order breaks any remaining ties.
+        results.sort(key=_rank_key)
+        return results
 
     def get_release(self, release_id: str, *, with_cover: bool = True) -> ReleaseDetail:
         if not release_id:
@@ -413,6 +429,16 @@ def _formats_from_media(media: Sequence[dict]) -> str:
     return " + ".join(pieces)
 
 
+def _rank_key(r: ReleaseResult) -> tuple[int, int]:
+    """Sort key: studio albums before compilations, then vinyl before CD.
+
+    Album type dominates (picking the right *release* matters most -- a
+    compilation ranking first was the reported bug); format is the tiebreak so a
+    vinyl pressing of the wanted album beats its CD.
+    """
+    return (1 if r.is_compilation else 0, 0 if r.is_vinyl else 1)
+
+
 def _parse_search_release(r: dict) -> ReleaseResult:
     media = r.get("medium-list", []) or []
     track_count = 0
@@ -424,6 +450,9 @@ def _parse_search_release(r: dict) -> ReleaseResult:
             except (TypeError, ValueError):
                 pass
     date = r.get("date", "") or ""
+    group = r.get("release-group", {}) or {}
+    primary_type = group.get("type") or group.get("primary-type") or ""
+    secondary_types = tuple(group.get("secondary-type-list", []) or ())
     return ReleaseResult(
         release_id=r.get("id", ""),
         title=r.get("title", "") or "",
@@ -433,6 +462,8 @@ def _parse_search_release(r: dict) -> ReleaseResult:
         formats=_formats_from_media(media),
         track_count=track_count,
         disambiguation=r.get("disambiguation", "") or "",
+        primary_type=primary_type,
+        secondary_types=secondary_types,
     )
 
 
