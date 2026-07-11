@@ -35,7 +35,7 @@ from typing import Callable
 import numpy as np
 import soundfile as sf
 from noisereduce import reduce_noise
-from scipy.signal import filtfilt, iirnotch
+from scipy.signal import butter, filtfilt, iirnotch, sosfiltfilt
 
 from core.ffmpeg_locator import ensure_ffmpeg
 
@@ -97,6 +97,45 @@ class Stage(ABC):
     @abstractmethod
     def apply(self, in_path: Path, out_path: Path) -> None:  # pragma: no cover
         ...
+
+
+@dataclass
+class RumbleFilter(Stage):
+    """Zero-phase high-pass that drains turntable rumble.
+
+    Rumble is broadband *mechanical* low-frequency noise -- bearing and motor
+    vibration coupled through the platter -- living below the musical band,
+    typically under ~30 Hz. It is distinct from mains hum (:class:`HumRemoval`),
+    which is a set of narrow tones at the mains frequency and its harmonics; a
+    notch will not touch rumble and a high-pass will not touch hum.
+
+    Recommended chain position is **first**, before hum/noise stages. Subsonic
+    energy is often the loudest thing on the record yet carries no music: it eats
+    headroom (worsening the overshoot Part B guards against) and inflates the
+    noise-reduction profile with content that isn't really the noise floor.
+    Draining it first makes every downstream stage better-behaved. Ordering is
+    not enforced here -- it stays the caller's choice.
+
+    Implemented as a Butterworth high-pass in second-order-section form
+    (``output='sos'``) for numerical stability at these low cutoffs, applied with
+    :func:`scipy.signal.sosfiltfilt` so it is zero-phase -- no group-delay smear
+    that would blunt transients (drum hits, plucks).
+    """
+
+    cutoff_hz: float = 25.0
+    order: int = 4
+    name: str = field(default="Rumble filter", init=False)
+
+    def apply(self, in_path: Path, out_path: Path) -> None:
+        data, samplerate, _subtype = _read(in_path)
+        nyquist = samplerate / 2.0
+        if not 0.0 < self.cutoff_hz < nyquist:
+            raise ValueError(
+                f"cutoff_hz must be in (0, {nyquist}); got {self.cutoff_hz}"
+            )
+        sos = butter(self.order, self.cutoff_hz / nyquist, btype="highpass", output="sos")
+        out = sosfiltfilt(sos, data, axis=0)
+        _write(out_path, out.astype(np.float32, copy=False), samplerate, _INTERMEDIATE_SUBTYPE)
 
 
 @dataclass

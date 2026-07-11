@@ -243,3 +243,58 @@ def test_pcm16_in_pcm16_out_no_gain_when_within_range(tmp_path):
     assert result.peak_gain_db == 0.0
     assert result.source_clip_runs == 0
     assert result.warnings == []
+
+
+# --------------------------------------------------------------------------- #
+# Rumble filter
+# --------------------------------------------------------------------------- #
+
+
+def test_rumble_filter_kills_subsonic_preserves_music(tmp_path):
+    """A 12 Hz rumble + 100 Hz musical tone: rumble is heavily attenuated while
+    the 100 Hz tone passes essentially untouched."""
+    t = np.arange(int(SR * 4)) / SR
+    rumble = 0.4 * np.sin(2 * np.pi * 12 * t)
+    music = 0.3 * np.sin(2 * np.pi * 100 * t)
+    sig = (rumble + music).astype(np.float32)
+
+    src, dst = tmp_path / "in.wav", tmp_path / "out.wav"
+    sf.write(str(src), sig, SR, subtype="FLOAT")  # keep headroom; sum peaks ~0.7
+    R.RumbleFilter(cutoff_hz=25.0, order=4).apply(src, dst)
+    out, _ = sf.read(str(dst))
+
+    drop_12 = _db(_mag_at(sig, 12), _mag_at(out, 12))
+    change_100 = abs(_db(_mag_at(out, 100), _mag_at(sig, 100)))
+    print(f"\n[rumble] 12Hz drop = {drop_12:.1f} dB, 100Hz change = {change_100:.3f} dB")
+
+    assert drop_12 >= 30.0, drop_12            # measured ~50 dB
+    assert change_100 <= 0.5, change_100       # 100Hz preserved
+
+
+def test_rumble_filter_is_zero_phase(tmp_path):
+    """Zero-phase => a transient's peak sample position is unchanged by the filter."""
+    n = int(SR * 2)
+    t = np.arange(n) / SR
+    sig = (0.1 * np.sin(2 * np.pi * 100 * t)).astype(np.float32)
+    peak_idx = n // 2
+    sig[peak_idx] += 0.8                        # a dominant, symmetric transient
+
+    src, dst = tmp_path / "in.wav", tmp_path / "out.wav"
+    sf.write(str(src), sig, SR, subtype="FLOAT")
+    R.RumbleFilter().apply(src, dst)
+    out, _ = sf.read(str(dst))
+
+    out_peak_idx = int(np.argmax(np.abs(out)))
+    print(f"\n[rumble] transient at {peak_idx} -> peak at {out_peak_idx} "
+          f"(shift {out_peak_idx - peak_idx} samples)")
+    assert abs(out_peak_idx - peak_idx) <= 1    # no group-delay shift
+
+
+def test_rumble_filter_rejects_cutoff_above_nyquist(tmp_path):
+    """A cutoff at or above Nyquist is a config error, surfaced clearly."""
+    src, dst = tmp_path / "in.wav", tmp_path / "out.wav"
+    sf.write(str(src), np.zeros(SR, dtype=np.float32), SR, subtype="FLOAT")
+    import pytest
+
+    with pytest.raises(ValueError, match="cutoff_hz"):
+        R.RumbleFilter(cutoff_hz=SR).apply(src, dst)
