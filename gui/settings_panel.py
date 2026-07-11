@@ -105,6 +105,8 @@ class SettingsPanel(QWidget):
                      self._dspin("headroom_target_dbfs", cfg.headroom_target_dbfs, -6.0, 0.0, 0.1, 2))
         basic.addRow("Parallel encode jobs:",
                      self._ispin("encode_workers", cfg.encode_workers, 1, 16))
+        basic.addRow("Album analysis workers:",
+                     self._ispin("album_analysis_workers", cfg.album_analysis_workers, 1, 4))
         root.addWidget(basic_box)
 
         # ---------------- Advanced ----------------
