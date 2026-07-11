@@ -120,6 +120,9 @@ class TrackInfo:
     number: str               # printed track number ("A1", "3", ...)
     title: str
     length_ms: int | None = None      # duration in milliseconds, if known
+    artist: str = ""          # per-track artist (splits/VA); "" -> use release
+    artist_id: str = ""       # per-track artist MBID
+    recording_id: str = ""    # MUSICBRAINZ_TRACKID source (recording MBID)
 
     def length_display(self) -> str:
         """``m:ss`` for the duration, or ``""`` when unknown."""
@@ -159,6 +162,7 @@ class ReleaseDetail:
     country: str = ""
     media: tuple[MediumInfo, ...] = ()
     cover: CoverArt | None = None
+    artist_id: str = ""       # MUSICBRAINZ_ARTISTID (release artist)
 
     @property
     def tracks(self) -> list[TrackInfo]:
@@ -411,6 +415,24 @@ def _artist_from_credit(entry: dict) -> str:
     return joined or "Unknown Artist"
 
 
+def _artist_id_from_credit(entry: dict) -> str:
+    """First artist's MBID from an artist-credit list, or ``""``."""
+    for credit in entry.get("artist-credit", []):
+        if isinstance(credit, dict):
+            artist = credit.get("artist", {})
+            mbid = artist.get("id")
+            if mbid:
+                return mbid
+    return ""
+
+
+def _track_artist(track: dict) -> tuple[str, str]:
+    """Per-track ``(artist, artist_id)`` -- only when the track names its own."""
+    if track.get("artist-credit") or track.get("artist-credit-phrase"):
+        return _artist_from_credit(track), _artist_id_from_credit(track)
+    return "", ""
+
+
 def _formats_from_media(media: Sequence[dict]) -> str:
     """Summarise media formats, e.g. two vinyl discs -> ``"2xVinyl"``."""
     counts: dict[str, int] = {}
@@ -488,11 +510,15 @@ def _parse_track(track: dict, index: int) -> TrackInfo:
     except (TypeError, ValueError):
         position = index
     number = str(track.get("number", position))
+    artist, artist_id = _track_artist(track)
     return TrackInfo(
         position=position,
         number=number,
         title=title,
         length_ms=_parse_length(track),
+        artist=artist,
+        artist_id=artist_id,
+        recording_id=recording.get("id", "") or "",
     )
 
 
@@ -524,4 +550,5 @@ def _parse_release_detail(release: dict, cover: CoverArt | None) -> ReleaseDetai
         country=release.get("country", "") or "",
         media=tuple(media),
         cover=cover,
+        artist_id=_artist_id_from_credit(release),
     )

@@ -51,6 +51,22 @@ def _embed_cover(flac_path: Path, cover: "CoverArt") -> None:
     flac.save()
 
 
+def _write_vorbis_tags(flac_path: Path, tags: dict) -> None:
+    """Write ``tags`` as the FLAC's Vorbis comments (authoritative, no empties).
+
+    Existing comments (e.g. whatever pydub/ffmpeg wrote on export) are cleared
+    first, so only the fields we actually have are present -- never an empty
+    string. Pictures are untouched (handled by :func:`_embed_cover`).
+    """
+    from mutagen.flac import FLAC
+
+    flac = FLAC(str(flac_path))
+    flac.delete()
+    for key, value in tags.items():
+        flac[key] = value
+    flac.save()
+
+
 @dataclass
 class TrackOutcome:
     """What happened to a single track during a batch operation."""
@@ -166,6 +182,10 @@ def convert_wavs_to_flacs(
         audio = AudioSegment.from_wav(str(track.track_wav_loc))
         audio.export(str(dest), format="flac", tags=track.tags())
         outcome = TrackOutcome(track=track, output_path=dest)
+        try:
+            _write_vorbis_tags(dest, track.vorbis_tags())
+        except Exception as exc:
+            outcome.warnings.append(f"Could not write tags: {exc}")
         if cover is not None:
             try:
                 _embed_cover(dest, cover)
@@ -212,6 +232,10 @@ def retag_flacs(
         audio = AudioSegment.from_file(str(source), "flac")
         audio.export(str(dest), format="flac", tags=track.tags())
         outcome = TrackOutcome(track=track, output_path=dest)
+        try:
+            _write_vorbis_tags(dest, track.vorbis_tags())
+        except Exception as exc:
+            outcome.warnings.append(f"Could not write tags: {exc}")
         if cover is not None:
             try:
                 _embed_cover(dest, cover)

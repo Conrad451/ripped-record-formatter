@@ -290,6 +290,26 @@ def test_get_release_requests_needed_includes():
     assert {"recordings", "media", "artist-credits"} <= set(includes)
 
 
+def test_detail_parses_mbids_and_per_track_artist():
+    detail = {"release": {
+        "id": "rel-id", "title": "Split LP", "date": "2000",
+        "artist-credit-phrase": "Various", "artist-credit": [{"artist": {"id": "va-id", "name": "Various"}}],
+        "medium-list": [{"position": "1", "format": "Vinyl", "track-list": [
+            {"position": "1", "number": "A1", "title": "T1", "length": "100000",
+             "recording": {"id": "rec-1"},
+             "artist-credit-phrase": "Band A", "artist-credit": [{"artist": {"id": "a-id", "name": "Band A"}}]},
+            {"position": "2", "number": "A2", "recording": {"id": "rec-2", "title": "T2"}},
+        ]}],
+    }}
+    d = make_provider(FakeMusicBrainz(detail=detail)).get_release("rel-id")
+    assert d.artist_id == "va-id"
+    t0, t1 = d.tracks
+    assert t0.recording_id == "rec-1"
+    assert t0.artist == "Band A" and t0.artist_id == "a-id"   # per-track credit
+    assert t1.recording_id == "rec-2"
+    assert t1.artist == "" and t1.artist_id == ""             # no per-track credit -> blank
+
+
 def test_empty_release_id_raises_response_error():
     provider = make_provider(FakeMusicBrainz())
     with pytest.raises(MetadataResponseError):
