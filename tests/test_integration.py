@@ -100,3 +100,142 @@ def test_full_rip_accept_gating_and_override(qapp):
     assert not fr.accept_button.isEnabled()          # 0 of 3, no override
     fr.override_check.setChecked(True)
     assert fr.accept_button.isEnabled()              # override wins
+
+
+class _FakeGap:
+    track_index = 0
+    expected_ts = 10.0
+    window_start = 5.0
+    window_end = 15.0
+
+
+class _FakeEnvelope:
+    num_buckets = 0
+
+
+class _FakeProposal:
+    mode = "anchored"
+    duration = 100.0
+
+    def __init__(self, split_points, unresolved):
+        self.split_points = split_points
+        self.unresolved = unresolved
+
+
+class _FakeRestoration:
+    source_clip_runs = 0
+    peak_gain_db = 0.0
+    warnings = []
+
+
+def _fake_analysis(split_points, unresolved):
+    from gui.full_rip import AnalyzeResult
+    return AnalyzeResult(_FakeRestoration(), _FakeProposal(split_points, unresolved),
+                         _FakeEnvelope(), None)
+
+
+def test_full_rip_wrong_side_guard_on_13_of_14_unresolved(qapp):
+    from gui.main_window import MainWindow
+
+    fr = MainWindow().full_rip
+    fr._expected_n = 14           # 13 boundaries
+    fr._expected_durations_s = []
+    fr._on_analyze_done(_fake_analysis([], [_FakeGap()] * 13))
+    # Diagnosis shown instead of marching through a doomed resolve queue.
+    # (isHidden reflects explicit visibility even when the top window isn't shown.)
+    assert not fr.diagnosis_box.isHidden()
+    assert fr.gap_box.isHidden()
+    # "Resolve manually anyway" opens the queue.
+    fr._resolve_anyway()
+    assert not fr.gap_box.isHidden()
+    assert fr.diagnosis_box.isHidden()
+
+
+def test_full_rip_populated_side_picker_after_release(qapp):
+    from core.metadata_lookup import MediumInfo, ReleaseDetail, TrackInfo
+    from gui.main_window import MainWindow
+
+    fr = MainWindow().full_rip
+    assert not fr.side_combo.isEnabled()             # placeholder, disabled
+    detail = ReleaseDetail("x", "Alb", "Art", media=(
+        MediumInfo(1, "Vinyl", tracks=tuple(TrackInfo(i + 1, str(i + 1), f"T{i + 1}", 180000)
+                                            for i in range(6))),))
+    fr._apply_release(detail)
+    assert fr.side_combo.isEnabled()
+    assert fr.side_combo.count() == 1
+    assert "Side A" in fr.side_combo.itemText(0)
+    assert fr._expected_n == 6
+    assert fr.define_sides_button.isEnabled()
+
+
+def test_full_rip_single_track_warns(qapp):
+    from gui.main_window import MainWindow
+
+    w = MainWindow()
+    fr = w.full_rip
+    fr._expected_n = 1
+    fr._warn_single_track()
+    assert "Single track" in w.log.toPlainText()
+
+
+def test_full_rip_two_step_encode_gate(qapp, tmp_path):
+    from gui.main_window import MainWindow
+
+    fr = MainWindow().full_rip
+    assert not fr.encode_button.isEnabled()          # nothing split yet
+    seg = tmp_path / "track_01.wav"
+    seg.write_bytes(b"x")
+    fr._expected_titles = ["First", "Second"]
+    fr._on_split_done([tmp_path / "track_01.wav", tmp_path / "track_02.wav"])
+    assert fr.encode_button.isEnabled()
+    assert fr.encode_button.text() == "Encode 2 tracks"
+    assert [r.title for r in fr.model.rows()] == ["First", "Second"]
+
+
+def test_waveform_click_to_place_lands_at_click(qapp):
+    from PySide6.QtCore import QPointF, Qt
+    from gui.waveform import WaveformView
+
+    view = WaveformView()
+
+    class _Click:
+        def double(self):
+            return False
+
+        def button(self):
+            return Qt.MouseButton.LeftButton
+
+        def scenePos(self):
+            return QPointF(0, 0)
+
+        def accept(self):
+            pass
+
+    # Pretend the user clicked at t=12.5s inside a highlighted gap window.
+    view.getPlotItem().getViewBox().mapSceneToView = lambda _p: QPointF(12.5, 0.0)
+    view.set_place_mode(True)
+    view._on_scene_clicked(_Click())
+    assert view.marker_times() == [12.5]
+
+
+def test_restore_cancel_leaves_no_staging(tmp_path):
+    import glob
+    import tempfile
+
+    import numpy as np
+    import soundfile as sf
+    import pytest
+
+    from core.restoration import Cancelled, HumRemoval, RumbleFilter, restore
+
+    src = tmp_path / "in.wav"
+    sf.write(str(src), np.zeros(44100, dtype=np.float32), 44100, subtype="PCM_16")
+    before = set(glob.glob(str(tempfile.gettempdir()) + "/rrf_restore_*"))
+
+    with pytest.raises(Cancelled):
+        restore(src, tmp_path / "out.wav", [RumbleFilter(), HumRemoval()],
+                should_cancel=lambda: True)
+
+    assert not (tmp_path / "out.wav").exists()
+    after = set(glob.glob(str(tempfile.gettempdir()) + "/rrf_restore_*"))
+    assert not (after - before)   # staging cleaned despite cancellation
