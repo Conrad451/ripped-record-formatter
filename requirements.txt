@@ -25,3 +25,4 @@ numpy==2.5.1
 scipy==1.18.0
 soundfile==0.14.0
 noisereduce==3.0.3
+musicbrainzngs==0.7.1
