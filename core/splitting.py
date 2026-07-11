@@ -63,21 +63,17 @@ import soundfile as sf
 # written, mirroring core.converter's ProgressCallback.
 ProgressCallback = Callable[[int, int, str], None]
 
-# Confidence normalization references. A gap that dips DEPTH_REF dB below the
-# threshold, or lasts DUR_REF s beyond the minimum, saturates that half of the
-# score. Chosen for typical vinyl: inter-track gaps fall tens of dB and last
-# 1-2 s, intra-track dips are shallower and briefer.
-_DEPTH_REF_DB = 20.0
-_DUR_REF_S = 2.0
-
-# Floor for the log so a truly-zero frame becomes ~-200 dBFS, not -inf.
-_DB_EPS = 1e-10
-
 
 @dataclass(frozen=True)
 class SilenceParams:
-    """Tunables for the energy/silence pass. All durations in seconds."""
+    """Every tunable for split proposal, defaults chosen for 16/44.1 vinyl.
 
+    This is the whole settings contract for the splitter -- detection *and*
+    confidence scoring -- so a GUI can expose each field directly. No behavioural
+    constant is hidden in a function body. Durations are in seconds.
+    """
+
+    # --- energy / silence detection ---
     silence_threshold_db: float = -40.0
     """Frames quieter than this (dBFS, full scale = 1.0) count as silent."""
 
@@ -92,6 +88,29 @@ class SilenceParams:
 
     hop_ms: float = 10.0
     """Stride between successive RMS windows (envelope resolution)."""
+
+    db_floor_eps: float = 1e-10
+    """Floor added before the log so a truly-zero frame reads ~-200 dBFS, not -inf."""
+
+    # --- confidence scoring (all modes) ---
+    depth_ref_db: float = 20.0
+    """Dip this far below the threshold to saturate the depth half of the score."""
+
+    duration_ref_s: float = 2.0
+    """Last this long beyond ``min_silence`` to saturate the duration half."""
+
+    quality_depth_weight: float = 0.5
+    """Weight of depth vs duration within a gap's quality score (0..1)."""
+
+    confidence_round_digits: int = 4
+    """Decimal places the reported confidence is rounded to."""
+
+    # --- anchored mode only ---
+    proximity_weight: float = 0.5
+    """Weight of proximity-to-prediction vs gap quality in anchored confidence (0..1)."""
+
+    post_miss_penalty: float = 0.8
+    """Confidence multiplier for the first gap confirmed after a missed one."""
 
 
 @dataclass(frozen=True)
@@ -182,7 +201,7 @@ def _frame_rms_db(
     if n < frame:
         # Too short to frame: treat the whole clip as a single window.
         rms = float(np.sqrt(np.mean(np.square(mono, dtype=np.float64)))) if n else 0.0
-        db = np.array([20.0 * np.log10(rms + _DB_EPS)], dtype=np.float64)
+        db = np.array([20.0 * np.log10(rms + params.db_floor_eps)], dtype=np.float64)
         times = np.array([n / (2.0 * samplerate)], dtype=np.float64)
         return times, db, hop / samplerate
 
@@ -191,7 +210,7 @@ def _frame_rms_db(
     starts = np.arange(0, n - frame + 1, hop)
     window_energy = prefix[starts + frame] - prefix[starts]
     rms = np.sqrt(window_energy / frame)
-    db = 20.0 * np.log10(rms + _DB_EPS)
+    db = 20.0 * np.log10(rms + params.db_floor_eps)
     # Time-stamp each window at its center.
     times = (starts + frame / 2.0) / samplerate
     return times, db, hop / samplerate
@@ -213,11 +232,13 @@ class _Gap:
     def duration(self) -> float:
         return self.end - self.start
 
-    def confidence(self, threshold_db: float, min_silence: float) -> float:
-        depth = max(0.0, threshold_db - self.min_db)
-        depth_conf = min(1.0, depth / _DEPTH_REF_DB)
-        dur_conf = min(1.0, max(0.0, self.duration - min_silence) / _DUR_REF_S)
-        return 0.5 * depth_conf + 0.5 * dur_conf
+    def quality(self, params: SilenceParams) -> float:
+        """Gap quality in 0..1: how deep the dip is blended with how long it lasts."""
+        depth = max(0.0, params.silence_threshold_db - self.min_db)
+        depth_conf = min(1.0, depth / params.depth_ref_db)
+        dur_conf = min(1.0, max(0.0, self.duration - params.min_silence) / params.duration_ref_s)
+        w = params.quality_depth_weight
+        return w * depth_conf + (1.0 - w) * dur_conf
 
 
 def _detect_gaps(
@@ -259,7 +280,7 @@ def _select(
     """
     ranked = sorted(
         gaps,
-        key=lambda g: (-g.confidence(params.silence_threshold_db, params.min_silence), g.center),
+        key=lambda g: (-g.quality(params), g.center),
     )
     chosen: list[_Gap] = []
     mtl = params.min_track_length
@@ -303,10 +324,12 @@ def propose_splits(
         selected = _select(gaps, duration, params, max_points=None)
         mode = "threshold"
 
+    # In count/threshold mode there is no prediction to be near, so confidence is
+    # just the gap's quality.
     points = [
         SplitPoint(
             timestamp=g.center,
-            confidence=round(g.confidence(params.silence_threshold_db, params.min_silence), 4),
+            confidence=round(g.quality(params), params.confidence_round_digits),
             sample=int(round(g.center * samplerate)),
         )
         for g in selected
@@ -328,17 +351,9 @@ def _anchored_confidence(
     where the durations said it would". A deep, long gap right on the predicted
     boundary scores near 1; a shallow one at the window's edge scores low.
     """
-    depth = max(0.0, params.silence_threshold_db - gap.min_db)
-    depth_conf = min(1.0, depth / _DEPTH_REF_DB)
-    dur_conf = min(1.0, max(0.0, gap.duration - params.min_silence) / _DUR_REF_S)
-    quality = 0.6 * depth_conf + 0.4 * dur_conf
     prox_conf = max(0.0, 1.0 - abs(gap.start - pred_start) / half) if half > 0 else 1.0
-    return 0.5 * quality + 0.5 * prox_conf
-
-
-# Confidence multiplier for the first gap confirmed after a miss: its prediction
-# was built on an unconfirmed anchor, so trust it a little less.
-_POST_MISS_PENALTY = 0.8
+    w = params.proximity_weight
+    return (1.0 - w) * gap.quality(params) + w * prox_conf
 
 
 def propose_splits_anchored(
@@ -407,13 +422,13 @@ def propose_splits_anchored(
         best = min(cands, key=lambda g: (g.min_db, abs(g.start - pred_start)))
         conf = _anchored_confidence(best, pred_start, half, params)
         if post_miss:
-            conf *= _POST_MISS_PENALTY
+            conf *= params.post_miss_penalty
             post_miss = False
 
         found.append(
             SplitPoint(
                 timestamp=best.center,
-                confidence=round(conf, 4),
+                confidence=round(conf, params.confidence_round_digits),
                 sample=int(round(best.center * samplerate)),
             )
         )
