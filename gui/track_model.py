@@ -16,7 +16,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, Signal
 from PySide6.QtGui import QGuiApplication, QKeySequence
-from PySide6.QtWidgets import QTableView
+from PySide6.QtWidgets import QMenu, QTableView
 
 from core.tracks import Tracks
 
@@ -95,6 +95,26 @@ class TrackTableModel(QAbstractTableModel):
     def clear(self) -> None:
         self.set_rows([])
 
+    def remove_rows(self, indices: list[int]) -> int:
+        """Remove the given row indices. Returns how many were removed.
+
+        Track numbers are positional, so remaining rows renumber automatically.
+        """
+        removed = 0
+        for i in sorted({i for i in indices if 0 <= i < len(self._rows)}, reverse=True):
+            self.beginRemoveRows(QModelIndex(), i, i)
+            del self._rows[i]
+            self.endRemoveRows()
+            removed += 1
+        if removed and self._rows:
+            # Numbers shown in column 0 depend on row position; refresh them.
+            self.dataChanged.emit(
+                self.index(0, COL_NUM),
+                self.index(len(self._rows) - 1, COL_NUM),
+                [Qt.ItemDataRole.DisplayRole],
+            )
+        return removed
+
     def rows(self) -> list[Row]:
         return self._rows
 
@@ -139,16 +159,40 @@ class TrackTableModel(QAbstractTableModel):
 
 
 class TrackTableView(QTableView):
-    """Table view with a clipboard-paste-into-Title (Discogs) handler."""
+    """Table view with Discogs paste-into-Title and row deletion."""
 
-    pasted = Signal(int, int)  # (filled, ignored)
+    pasted = Signal(int, int)   # (filled, ignored)
+    rowsDeleted = Signal(int)   # count removed
 
     def keyPressEvent(self, event):
         if event.matches(QKeySequence.StandardKey.Paste):
             self._paste_tracklist()
             event.accept()
             return
+        if event.key() == Qt.Key.Key_Delete:
+            self._delete_selected()
+            event.accept()
+            return
         super().keyPressEvent(event)
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        delete_action = menu.addAction("Delete selected row(s)")
+        delete_action.setEnabled(bool(self.selectionModel() and
+                                       self.selectionModel().selectedIndexes()))
+        delete_action.triggered.connect(self._delete_selected)
+        menu.exec(event.globalPos())
+
+    def _delete_selected(self) -> None:
+        model = self.model()
+        if not isinstance(model, TrackTableModel) or self.selectionModel() is None:
+            return
+        rows = sorted({idx.row() for idx in self.selectionModel().selectedIndexes()})
+        if not rows:
+            return
+        removed = model.remove_rows(rows)
+        if removed:
+            self.rowsDeleted.emit(removed)
 
     def _paste_tracklist(self) -> None:
         model = self.model()
