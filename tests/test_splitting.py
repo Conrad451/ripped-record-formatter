@@ -19,6 +19,7 @@ from core.splitting import (
     SilenceParams,
     execute_split,
     propose_splits,
+    propose_splits_anchored,
 )
 
 SR = 44100
@@ -223,3 +224,135 @@ def test_proposal_writes_nothing(tmp_path):
     propose_splits(wav, track_count=2)
     after = {p.name for p in tmp_path.iterdir()}
     assert before == after
+
+
+# --------------------------------------------------------------------------- #
+# Duration-anchored mode
+# --------------------------------------------------------------------------- #
+
+
+def test_anchored_handles_wildly_varied_gaps(tmp_path):
+    """Gaps of 1 s, 4 s, 2.5 s would wreck a fixed-deadspace predictor.
+
+    Anchored mode re-anchors on each found gap, so the varying deadspace never
+    pushes a later prediction out of its window.
+    """
+    tracks = [4.0, 4.0, 4.0, 4.0]
+    signal, truth = _build_rip(track_secs=tracks, gap_secs=[1.0, 4.0, 2.5])
+    wav = tmp_path / "varied.wav"
+    _write(wav, signal)
+
+    params = SilenceParams(silence_threshold_db=-40.0, min_silence=0.4)
+    prop = propose_splits_anchored(
+        wav, [int(t * 1000) for t in tracks], params=params, window_s=2.0
+    )
+
+    assert prop.mode == "anchored"
+    assert prop.unresolved == []
+    _assert_near(prop.timestamps(), truth, tol=0.3)
+
+    # A naive predictor that assumes zero deadspace drifts badly on the last gap;
+    # anchored stays tight. This is the whole point of the mode.
+    naive_cumsum = np.cumsum(tracks[:-1])  # [4, 8, 12]
+    naive_err_last = abs(naive_cumsum[-1] - sorted(truth)[-1])
+    anchored_err_last = abs(sorted(prop.timestamps())[-1] - sorted(truth)[-1])
+    assert anchored_err_last < 0.3 < naive_err_last
+
+
+def test_anchored_reanchoring_beats_cumulative_speed_error(tmp_path):
+    """1% turntable speed error: cumulative prediction misses late-side gaps;
+    re-anchoring keeps every gap inside its window.
+
+    The rip is built on a timeline stretched by 1% (tracks and gaps alike). We
+    pass the *nominal* durations, as if from MusicBrainz. A predictor that never
+    re-anchors accumulates the 1% until late gaps fall outside the window; the
+    anchored predictor measures each gap fresh from the last confirmed one, so
+    its per-step error stays ~one track's worth of drift.
+    """
+    speed = 1.01
+    nominal_tracks = [10.0] * 12  # long side so 1% drift becomes visible
+    actual_tracks = [t * speed for t in nominal_tracks]
+    actual_gaps = [0.7 * speed] * (len(nominal_tracks) - 1)
+    signal, truth = _build_rip(track_secs=actual_tracks, gap_secs=actual_gaps)
+    wav = tmp_path / "speed.wav"
+    _write(wav, signal)
+
+    window_s = 1.0
+    params = SilenceParams(silence_threshold_db=-40.0, min_silence=0.4)
+    prop = propose_splits_anchored(
+        wav, [int(t * 1000) for t in nominal_tracks], params=params,
+        window_s=window_s, speed_tolerance=0.02,
+    )
+
+    # Every gap resolved and landed accurately.
+    assert prop.unresolved == []
+    assert len(prop.timestamps()) == len(truth)
+    truth_sorted = sorted(truth)
+    anchored = sorted(prop.timestamps())
+    anchored_errs = [abs(a - t) for a, t in zip(anchored, truth_sorted)]
+    assert max(anchored_errs) < 0.3
+
+    # A fixed-speed predictor (knows the structure, assumes speed 1.00) predicts
+    # each real gap at truth/1.01; its error grows linearly with position.
+    speed_only_err = [t - t / speed for t in truth_sorted]
+    assert speed_only_err[0] < window_s  # early gaps still inside the window
+    assert speed_only_err[-1] > window_s  # late gaps have drifted outside it
+
+    # Re-anchoring is precisely what saves the late gaps: anchored stays inside
+    # the window across the whole side while the cumulative predictor does not.
+    assert max(anchored_errs) < window_s < speed_only_err[-1]
+
+
+def test_anchored_trap_sits_outside_every_window(tmp_path):
+    """The intra-track quiet passage is far from any predicted boundary, so no
+    window ever sees it and it is never proposed."""
+    tracks = [4.0, 5.0, 4.0]
+    signal, truth = _build_rip(
+        track_secs=tracks, gap_secs=[1.5, 1.5], traps={1: (2.0, 0.5)}
+    )
+    wav = tmp_path / "trap.wav"
+    _write(wav, signal)
+
+    params = SilenceParams(silence_threshold_db=-40.0, min_silence=0.4)
+    prop = propose_splits_anchored(
+        wav, [int(t * 1000) for t in tracks], params=params, window_s=1.5
+    )
+
+    assert prop.unresolved == []
+    _assert_near(prop.timestamps(), truth, tol=0.3)
+    # Trap is 2.0 s into track 2, which starts at 4.0 + 1.5 = 5.5 s -> ~7.5 s.
+    trap_center = 5.5 + 2.0 + 0.25
+    assert all(abs(p - trap_center) > 0.5 for p in prop.timestamps())
+
+
+def test_anchored_gapless_transition_yields_unresolved_but_recovers(tmp_path):
+    """A segue with no silence in its window becomes an UnresolvedGap (with sane
+    bounds); the search does not abort and the next real gap is still found."""
+    # track0 and track1 are butt-joined (no gap -> a crossfade/segue); the only
+    # real silence is the gap before track2.
+    t0 = _tone(4.0, 220.0, -9.0)
+    t1 = _tone(4.0, 330.0, -9.0)
+    gap = np.zeros(int(round(1.5 * SR)))
+    t2 = _tone(4.0, 440.0, -9.0)
+    signal = np.concatenate([t0, t1, gap, t2])
+    signal = signal + _noise(signal.shape[0], -55.0)
+    wav = tmp_path / "segue.wav"
+    _write(wav, signal)
+
+    duration = signal.shape[0] / SR
+    params = SilenceParams(silence_threshold_db=-40.0, min_silence=0.4)
+    prop = propose_splits_anchored(
+        wav, [4000, 4000, 4000], params=params, window_s=1.5
+    )
+
+    # Gap 0 (the segue) is unresolvable; gap 1 (before track2) is found.
+    assert len(prop.unresolved) == 1
+    ug = prop.unresolved[0]
+    assert ug.track_index == 0
+    assert 0.0 <= ug.window_start < ug.expected_ts < ug.window_end <= duration
+
+    assert len(prop.timestamps()) == 1
+    real_gap_center = 8.0 + 0.75  # butt-joined tracks end at 8.0 s, gap is 1.5 s
+    assert abs(prop.timestamps()[0] - real_gap_center) <= 0.3
+    # The gap found right after a miss is flagged with reduced confidence.
+    assert prop.split_points[0].confidence < 1.0
