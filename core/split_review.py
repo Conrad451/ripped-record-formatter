@@ -57,6 +57,26 @@ def detect_progressive_drift(
     return mostly_growing and final_large
 
 
+def wrong_side_suspected(
+    expected_tracks: int,
+    unresolved_count: int,
+    *,
+    frac: float = 0.5,
+) -> bool:
+    """True when too many boundaries went unconfirmed to trust the proposal.
+
+    An ``expected_tracks``-track side has ``expected_tracks - 1`` internal
+    boundaries. If more than ``frac`` of them come back unresolved, the side
+    almost certainly has fewer tracks than expected -- the wrong side or release
+    was selected -- and the UI should diagnose that rather than march the user
+    through a doomed resolve queue.
+    """
+    boundaries = max(0, expected_tracks - 1)
+    if boundaries == 0:
+        return False
+    return unresolved_count > frac * boundaries
+
+
 def segment_deviations(
     actual_durations: list[float],
     expected_durations: list[float],
