@@ -90,6 +90,12 @@ class Config:
     encode_workers: int = field(default_factory=lambda: min(4, os.cpu_count() or 1))
     """How many tracks to encode in parallel (each is an independent ffmpeg run)."""
 
+    # --- window layout (splitter sizes in px; 0 = use default proportion) ---
+    main_split_top: int = 0
+    main_split_bottom: int = 0
+    meta_split_top: int = 0
+    meta_split_bottom: int = 0
+
 
 def config_path() -> Path:
     """Full path to the settings file in the per-user config directory."""

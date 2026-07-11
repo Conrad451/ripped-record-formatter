@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -43,6 +44,7 @@ from core.metadata_lookup import (
     ReleaseDetail,
     ReleaseResult,
 )
+from core.timefmt import format_timestamp
 
 
 # ---------------------------------------------------------------------------
@@ -100,10 +102,12 @@ class MetadataPanel(QWidget):
     #: Emitted with human-readable progress/error text (host app can log it).
     statusMessage = Signal(str)
 
-    def __init__(self, provider: MetadataProvider | None = None, parent: QWidget | None = None):
+    def __init__(self, provider: MetadataProvider | None = None, parent: QWidget | None = None,
+                 settings=None):
         super().__init__(parent)
         self.setWindowTitle("Album metadata lookup")
         self._provider = provider
+        self._settings = settings
         self._pool = QThreadPool.globalInstance()
         self._results: list[ReleaseResult] = []
         self._busy = False
@@ -126,24 +130,28 @@ class MetadataPanel(QWidget):
         self.search_button.clicked.connect(self._start_search)
         root.addWidget(self.search_button)
 
-        # --- results table --------------------------------------------------
+        # --- results table (top of a draggable splitter) -------------------
         self.results_table = QTableWidget(0, len(_RESULT_COLUMNS))
         self.results_table.setHorizontalHeaderLabels(_RESULT_COLUMNS)
         self.results_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.results_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.results_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.results_table.verticalHeader().setVisible(False)
+        self.results_table.verticalHeader().setDefaultSectionSize(20)  # compact rows
         self.results_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.results_table.itemSelectionChanged.connect(self._update_choose_enabled)
         self.results_table.doubleClicked.connect(self._start_fetch_detail)
-        root.addWidget(self.results_table, 1)
 
+        top = QWidget()
+        top_layout = QVBoxLayout(top)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.addWidget(self.results_table, 1)
         self.choose_button = QPushButton("Use selected release")
         self.choose_button.setEnabled(False)
         self.choose_button.clicked.connect(self._start_fetch_detail)
-        root.addWidget(self.choose_button)
+        top_layout.addWidget(self.choose_button)
 
-        # --- preview: tracklist + cover ------------------------------------
+        # --- preview: tracklist + cover (bottom of the splitter) -----------
         preview = QGroupBox("Selected release")
         preview_layout = QHBoxLayout(preview)
 
@@ -151,6 +159,7 @@ class MetadataPanel(QWidget):
         self.track_table.setHorizontalHeaderLabels(_TRACK_COLUMNS)
         self.track_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.track_table.verticalHeader().setVisible(False)
+        self.track_table.verticalHeader().setDefaultSectionSize(20)  # compact rows
         self.track_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         preview_layout.addWidget(self.track_table, 1)
 
@@ -160,11 +169,34 @@ class MetadataPanel(QWidget):
         self.cover_label.setMinimumHeight(200)
         self.cover_label.setStyleSheet("QLabel { border: 1px solid palette(mid); }")
         preview_layout.addWidget(self.cover_label)
-        root.addWidget(preview, 1)
+
+        self._split = QSplitter(Qt.Orientation.Vertical)
+        self._split.addWidget(top)
+        self._split.addWidget(preview)
+        self._split.setStretchFactor(0, 1)
+        self._split.setStretchFactor(1, 1)
+        self._split.splitterMoved.connect(self._save_split)
+        root.addWidget(self._split, 1)
+        self._restore_split()
 
         # --- status ---------------------------------------------------------
         self.status_label = QLabel("Enter an artist and/or album, then Search.")
         root.addWidget(self.status_label)
+
+    # -- splitter persistence ------------------------------------------------
+    def _restore_split(self) -> None:
+        if self._settings is None:
+            return
+        cfg = self._settings.config
+        if cfg.meta_split_top > 0 and cfg.meta_split_bottom > 0:
+            self._split.setSizes([cfg.meta_split_top, cfg.meta_split_bottom])
+
+    def _save_split(self, *_args) -> None:
+        if self._settings is None:
+            return
+        sizes = self._split.sizes()
+        if len(sizes) == 2:
+            self._settings.set(meta_split_top=sizes[0], meta_split_bottom=sizes[1])
 
     # -- provider ------------------------------------------------------------
     def _get_provider(self) -> MetadataProvider:
@@ -274,8 +306,9 @@ class MetadataPanel(QWidget):
             for track in medium.tracks:
                 row = self.track_table.rowCount()
                 self.track_table.insertRow(row)
+                length = format_timestamp(track.length_ms / 1000) if track.length_ms else ""
                 for col, text in enumerate(
-                    (side, track.number, track.title, track.length_display())
+                    (side, track.number, track.title, length)
                 ):
                     self.track_table.setItem(row, col, QTableWidgetItem(text))
 

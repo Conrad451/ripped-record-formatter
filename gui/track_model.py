@@ -164,6 +164,12 @@ class TrackTableView(QTableView):
     pasted = Signal(int, int)   # (filled, ignored)
     rowsDeleted = Signal(int)   # count removed
 
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Compact rows so more tracks fit per screen.
+        self.verticalHeader().setDefaultSectionSize(20)
+        self.verticalHeader().setVisible(False)
+
     def keyPressEvent(self, event):
         if event.matches(QKeySequence.StandardKey.Paste):
             self._paste_tracklist()

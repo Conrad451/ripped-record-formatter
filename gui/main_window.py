@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSplitter,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -258,14 +259,13 @@ class MainWindow(QMainWindow):
         self.convert_panel = BatchPanel("convert", self.settings)
         self.retag_panel = BatchPanel("retag", self.settings)
         self.full_rip = FullRipTab(self.settings)
-        self.metadata_panel = MetadataPanel()
+        self.metadata_panel = MetadataPanel(settings=self.settings)
         self.settings_panel = SettingsPanel(self.settings)
         self.tabs.addTab(self.full_rip, "Full Rip")
         self.tabs.addTab(self.convert_panel, "Convert")
         self.tabs.addTab(self.retag_panel, "Re-tag")
         self.tabs.addTab(self.metadata_panel, "Metadata")
         self.tabs.addTab(self.settings_panel, "Settings")
-        root.addWidget(self.tabs, 1)
 
         for panel in (self.convert_panel, self.retag_panel):
             panel.logMessage.connect(self._log)
@@ -278,6 +278,26 @@ class MainWindow(QMainWindow):
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
         self._last_output_dir: Path | None = None
+
+        # Log pane: compact (~5 lines), collapsible, and it must never reclaim
+        # space on a new message -- a QSplitter, not stretch, controls its size.
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(1000)
+        line_h = self.log.fontMetrics().lineSpacing()
+        self.log.setMinimumHeight(line_h * 2)
+        self._default_log_height = line_h * 5 + 12
+
+        self._main_splitter = QSplitter(Qt.Orientation.Vertical)
+        self._main_splitter.addWidget(self.tabs)
+        self._main_splitter.addWidget(self.log)
+        self._main_splitter.setStretchFactor(0, 1)
+        self._main_splitter.setStretchFactor(1, 0)
+        self._main_splitter.setCollapsible(0, False)
+        self._main_splitter.setCollapsible(1, True)
+        self._main_splitter.splitterMoved.connect(self._save_main_split)
+        root.addWidget(self._main_splitter, 1)
+
         progress_row = QHBoxLayout()
         self.progress = QProgressBar()
         self.progress.setTextVisible(True)
@@ -288,11 +308,7 @@ class MainWindow(QMainWindow):
         progress_row.addWidget(self.open_output_button)
         root.addLayout(progress_row)
 
-        self.log = QPlainTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setMaximumBlockCount(1000)
-        root.addWidget(self.log, 1)
-
+        self._restore_main_split()
         self.setCentralWidget(central)
         self._log("Ready. Full Rip a side, or Convert/Re-tag folders. "
                   "Use Metadata to pull tracklists + cover art.")
@@ -369,6 +385,19 @@ class MainWindow(QMainWindow):
 
     def _log(self, message: str) -> None:
         self.log.appendPlainText(message)
+
+    # --- splitter persistence ----------------------------------------------
+    def _restore_main_split(self) -> None:
+        cfg = self.settings.config
+        if cfg.main_split_top > 0 and cfg.main_split_bottom > 0:
+            self._main_splitter.setSizes([cfg.main_split_top, cfg.main_split_bottom])
+        else:
+            self._main_splitter.setSizes([10000, self._default_log_height])
+
+    def _save_main_split(self, *_args) -> None:
+        sizes = self._main_splitter.sizes()
+        if len(sizes) == 2:
+            self.settings.set(main_split_top=sizes[0], main_split_bottom=sizes[1])
 
     # --- drag and drop -----------------------------------------------------
     def _dropped_dir(self, event) -> str | None:
