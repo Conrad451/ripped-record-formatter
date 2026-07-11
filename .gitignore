@@ -1,2 +1,38 @@
-.venv
+# Byte-compiled / optimized files
 __pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# PyInstaller build output
+# build/ and dist/ are regenerated on every build, so they stay ignored.
+# *.spec is intentionally NOT ignored: a spec file can carry hand-tuned build
+# configuration worth versioning. None exists yet; if one is added deliberately
+# it should be committed.
+build/
+dist/
+
+# Packaging / distribution
+*.egg-info/
+.eggs/
+
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment / secrets
+.env
+
+# Claude Code local session files
+.claude/
+
+# OS cruft
+Thumbs.db
+desktop.ini
+.DS_Store
