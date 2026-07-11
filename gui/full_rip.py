@@ -200,6 +200,11 @@ class FullRipTab(QWidget):
         self._segments: list[Path] = []
         self._flat_titles: list[str] = []
         self._flat_durations_ms: list[int] = []
+        self._flat_track_infos: list = []          # TrackInfo per flat track
+        self._side_track_infos: dict = {}          # side.index -> [TrackInfo]
+        self._total_sides = 0
+        self._review_track_infos: list = []
+        self._review_side_position = 1
         self._sides: list[Side] = []
         self._expected_n: int | None = None
         self._expected_titles: list[str] = []
@@ -361,6 +366,11 @@ class FullRipTab(QWidget):
         self.table.setModel(self.model)
         root.addWidget(self.table, 1)
 
+        self.meta_summary = QLabel("")
+        self.meta_summary.setWordWrap(True)
+        self.meta_summary.setStyleSheet("QLabel { color: palette(mid); }")
+        root.addWidget(self.meta_summary)
+
         encode_row = QHBoxLayout()
         encode_row.addStretch(1)
         self.encode_button = QPushButton("Encode tracks")
@@ -427,6 +437,7 @@ class FullRipTab(QWidget):
         self.album_edit.setText(detail.title)
         self._flat_titles = [t.title for t in detail.tracks]
         self._flat_durations_ms = [(t.length_ms or 0) for t in detail.tracks]
+        self._flat_track_infos = list(detail.tracks)
         # Build sides from the release's own media structure.
         sides: list[Side] = []
         start = 0
@@ -443,6 +454,12 @@ class FullRipTab(QWidget):
 
     def _set_sides(self, sides: list[Side]) -> None:
         self._sides = sides
+        self._total_sides = len(sides)
+        self._side_track_infos = {
+            s.index: [self._flat_track_infos[i] for i in s.track_indices
+                      if i < len(self._flat_track_infos)]
+            for s in sides
+        }
         self.side_combo.blockSignals(True)
         self.side_combo.clear()
         for s in sides:
@@ -475,7 +492,10 @@ class FullRipTab(QWidget):
         self._expected_n = side.track_count
         durations = [self._flat_durations_ms[i] for i in side.track_indices]
         self._expected_durations_s = [d / 1000.0 for d in durations] if all(durations) else []
+        self._review_track_infos = self._side_track_infos.get(side.index, [])
+        self._review_side_position = side.index + 1
         self._warn_single_track()
+        self._update_meta_summary()
 
     def _on_count_changed(self, value: int) -> None:
         if self._release is None:
@@ -704,11 +724,15 @@ class FullRipTab(QWidget):
         self.progress.setValue(1)
         self._set_busy(False)
         self._segments = [Path(s) for s in segments]
+        default_artist = self._release.artist if self._release else self.settings.config.last_artist
         rows = []
         for i, seg in enumerate(self._segments):
             title = self._expected_titles[i] if i < len(self._expected_titles) else f"track_{i + 1:02d}"
-            rows.append(Row(title=title, source_path=seg))
+            info = self._review_track_infos[i] if i < len(self._review_track_infos) else None
+            artist = info.artist if (info and info.artist) else default_artist
+            rows.append(Row(title=title, artist=artist, source_path=seg))
         self.model.set_rows(rows)
+        self._update_meta_summary()
         self.encode_button.setText(f"Encode {len(self._segments)} tracks")
         self.encode_button.setEnabled(True)
         self._log(f"Full Rip: {len(self._segments)} tracks cut. "
@@ -721,13 +745,14 @@ class FullRipTab(QWidget):
         if not output:
             self._log("Full Rip: choose an output folder first.")
             return
-        from core.tracks import Tracks
         artist = self._release.artist if self._release else self.settings.config.last_artist
         album = self._release.title if self._release else self.settings.config.last_album
-        tracks = []
-        for i, row in enumerate(self.model.rows()):
-            title = row.title.strip() or f"track_{i + 1:02d}"
-            tracks.append(Tracks(i + 1, title, album, artist, row.source_path))
+        rows = self.model.rows()
+        titles = [r.title for r in rows]
+        segments = [r.source_path for r in rows]
+        tracks = self._enrich_tracks(titles, segments, self._review_track_infos,
+                                     self._review_side_position, self._total_sides or 1,
+                                     artist, album)
 
         self._cancel.clear()
         self._set_busy(True)
@@ -922,6 +947,61 @@ class FullRipTab(QWidget):
         self._log(f"Album: reviewing {side.label} "
                   f"({len(analysis.proposal.split_points)} cut(s), {len(self._unresolved)} unresolved).")
 
+    def _enrich_tracks(self, titles, segments, track_infos, side_position, total_sides, artist, album):
+        """Build Tracks carrying every field we actually have from the release.
+
+        With no release selected, only the base fields are set -- the old minimal
+        tag set. Track numbering is per-side (Picard vinyl convention): TRACKNUMBER
+        resets each side, TRACKTOTAL is the side's track count, DISCNUMBER is the
+        side position, DISCTOTAL the number of sides.
+        """
+        from core.tracks import Tracks
+
+        rich = self._release is not None
+        year = self._release.year if rich else ""
+        album_mb = self._release.release_id if rich else ""
+        release_artist_id = self._release.artist_id if rich else ""
+        total = len(segments)
+        result = []
+        for i, seg in enumerate(segments):
+            info = track_infos[i] if i < len(track_infos) else None
+            if i < len(titles) and titles[i].strip():
+                title = titles[i].strip()
+            elif info is not None:
+                title = info.title
+            else:
+                title = f"track_{i + 1:02d}"
+            row_artist = info.artist if (info and info.artist) else artist
+            result.append(Tracks(
+                i + 1, title, album, row_artist, seg,
+                album_artist=(artist if rich else ""),
+                date=(year if rich else ""),
+                track_total=(total if rich else None),
+                disc_number=(side_position if rich else None),
+                disc_total=(total_sides if rich else None),
+                mb_album_id=(album_mb if rich else ""),
+                mb_artist_id=((info.artist_id if info and info.artist_id else release_artist_id) if rich else ""),
+                mb_track_id=(info.recording_id if (rich and info) else ""),
+            ))
+        return result
+
+    def _update_meta_summary(self) -> None:
+        if self._release is None:
+            self.meta_summary.setText("")
+            return
+        r = self._release
+        bits = [f"album artist: {r.artist}"]
+        if r.year:
+            bits.append(f"date: {r.year}")
+        if r.release_id:
+            bits.append("MB album id")
+        if r.artist_id:
+            bits.append("MB artist id")
+        n_rec = sum(1 for ti in self._review_track_infos if getattr(ti, "recording_id", ""))
+        if n_rec:
+            bits.append(f"{n_rec} track MBID(s)")
+        self.meta_summary.setText("Will also write: " + " | ".join(bits))
+
     def _accept_album_side(self) -> None:
         index = self._album_review_index
         side = self._album_side(index)
@@ -979,10 +1059,9 @@ class FullRipTab(QWidget):
         segments = execute_split(side.analysis.restored_path, side.timestamps, side_dir / "segments")
         artist = self._album_meta.get("artist", "")
         album = self._album_meta.get("album", "")
-        tracks = [Tracks(i + 1,
-                         side.titles[i] if i < len(side.titles) else f"track_{i + 1:02d}",
-                         album, artist, seg)
-                  for i, seg in enumerate(segments)]
+        track_infos = self._side_track_infos.get(side.index, [])
+        tracks = self._enrich_tracks(list(side.titles), segments, track_infos,
+                                     side.index + 1, self._total_sides or 1, artist, album)
         out_dir = Path(self._album_output_root) / sanitize_filename_component(side.label)
         configure_pydub()
         convert_wavs_to_flacs(tracks, out_dir, configure=False, cover=self._cover,

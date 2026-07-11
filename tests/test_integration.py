@@ -218,6 +218,32 @@ def test_waveform_click_to_place_lands_at_click(qapp):
     assert view.marker_times() == [12.5]
 
 
+def test_full_rip_fanout_enriches_and_manual_stays_minimal(qapp, tmp_path):
+    from core.metadata_lookup import MediumInfo, ReleaseDetail, TrackInfo
+    from gui.main_window import MainWindow
+
+    fr = MainWindow().full_rip
+    detail = ReleaseDetail("rel-mbid", "Album", "Artist", year="1993", artist_id="art-mbid",
+                           media=(MediumInfo(1, "Vinyl", tracks=(
+                               TrackInfo(1, "A1", "T1", 100000, recording_id="rec1"),
+                               TrackInfo(2, "A2", "T2", 100000, recording_id="rec2"))),))
+    fr._apply_release(detail)              # side 0 selected -> review context set
+    segs = [tmp_path / "1.wav", tmp_path / "2.wav"]
+
+    enriched = fr._enrich_tracks(["T1", "T2"], segs, fr._review_track_infos, 1, 1, "Artist", "Album")
+    t0 = enriched[0]
+    assert t0.album_artist == "Artist" and t0.date == "1993"
+    assert t0.track_total == 2 and t0.disc_number == 1 and t0.disc_total == 1
+    assert t0.mb_album_id == "rel-mbid" and t0.mb_artist_id == "art-mbid"
+    assert t0.mb_track_id == "rec1"
+    assert "musicbrainz_trackid" in t0.vorbis_tags()
+
+    # No release -> fan-out stays minimal (old tag set, no empties).
+    fr2 = MainWindow().full_rip
+    plain = fr2._enrich_tracks(["Song"], [tmp_path / "x.wav"], [], 1, 1, "Artist", "Album")
+    assert set(plain[0].vorbis_tags()) == {"artist", "album", "title", "tracknumber"}
+
+
 def test_restore_cancel_leaves_no_staging(tmp_path):
     import glob
     import tempfile
