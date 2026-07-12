@@ -1,0 +1,339 @@
+"""Recorder: disk streaming, clip detection, bounded queue, lock discipline.
+
+No hardware. A fake stream lets the tests push frames through the *real* callback
+path, so what is exercised is the actual realtime->queue->writer->disk chain.
+"""
+
+from __future__ import annotations
+
+import shutil
+import time
+from pathlib import Path
+
+import numpy as np
+import pytest
+import soundfile as sf
+
+from core.recorder import CLIP_LEVEL, Recorder, RecordingResult
+
+SR = 44100
+
+
+class FakeStream:
+    """Stands in for sd.InputStream. The test drives the callback by hand."""
+
+    def __init__(self, *, device, channels, samplerate, dtype, blocksize, callback):
+        self.channels = channels
+        self.samplerate = samplerate
+        self.blocksize = blocksize
+        self.callback = callback
+        self.started = False
+        self.closed = False
+        self.stop_raises: Exception | None = None
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        if self.stop_raises is not None:
+            raise self.stop_raises
+        self.started = False
+
+    def close(self):
+        self.closed = True
+
+    # -- test helpers --------------------------------------------------------
+    def push(self, block: np.ndarray, status=None):
+        """Feed one block through the real audio callback."""
+        self.callback(block, block.shape[0], None, status or _NoStatus())
+
+
+class _NoStatus:
+    input_overflow = False
+
+    def __bool__(self):
+        return False
+
+    def __str__(self):
+        return ""
+
+
+class _Overflow:
+    input_overflow = True
+
+    def __bool__(self):
+        return True
+
+    def __str__(self):
+        return "input overflow"
+
+
+def _tone(frames, channels=2, amp=0.25):
+    t = np.arange(frames) / SR
+    mono = amp * np.sin(2 * np.pi * 440 * t)
+    return np.repeat(mono[:, None], channels, axis=1).astype(np.float32)
+
+
+def _recorder(tmp_path, **kw):
+    """A recorder wired to a FakeStream, plus a way to reach the stream."""
+    made = {}
+
+    def factory(**kwargs):
+        made["stream"] = FakeStream(**kwargs)
+        return made["stream"]
+
+    rec = Recorder(stream_factory=factory, **kw)
+    return rec, made
+
+
+# --------------------------------------------------------------------------- #
+# Streaming to disk
+# --------------------------------------------------------------------------- #
+def test_streams_to_a_valid_wav_of_the_expected_length_and_subtype(tmp_path):
+    rec, made = _recorder(tmp_path)
+    dest = tmp_path / "out" / "SideA.wav"
+
+    rec.start(device=0, path=dest, samplerate=SR, channels=2, subtype="PCM_16")
+    stream = made["stream"]
+
+    for _ in range(10):                      # 10 blocks of 1024 frames
+        stream.push(_tone(1024))
+    result = rec.stop()
+
+    assert isinstance(result, RecordingResult)
+    assert dest.exists()                     # delivered to the destination
+    info = sf.info(str(dest))
+    assert info.samplerate == SR
+    assert info.channels == 2
+    assert info.subtype == "PCM_16"
+    assert info.frames == 10 * 1024
+    assert result.duration == pytest.approx(10 * 1024 / SR, abs=1e-6)
+    assert result.warnings == []             # a clean capture says nothing
+
+
+def test_24_bit_subtype_is_honoured(tmp_path):
+    rec, made = _recorder(tmp_path)
+    dest = tmp_path / "SideA.wav"
+    rec.start(device=0, path=dest, samplerate=SR, subtype="PCM_24")
+    made["stream"].push(_tone(1024))
+    rec.stop()
+    assert sf.info(str(dest)).subtype == "PCM_24"
+
+
+def test_rejects_an_unsupported_subtype(tmp_path):
+    rec, _ = _recorder(tmp_path)
+    with pytest.raises(ValueError, match="subtype"):
+        rec.start(device=0, path=tmp_path / "x.wav", samplerate=SR, subtype="FLOAT")
+
+
+# --------------------------------------------------------------------------- #
+# Clip detection -- same semantics as source_clip_runs
+# --------------------------------------------------------------------------- #
+def test_counts_injected_full_scale_runs(tmp_path):
+    rec, made = _recorder(tmp_path)
+    dest = tmp_path / "SideA.wav"
+    rec.start(device=0, path=dest, samplerate=SR, channels=2)
+    stream = made["stream"]
+
+    block = _tone(1024)
+    block[100:110] = 1.0                     # run 1: 10 frames at full scale
+    block[500:504] = -1.0                    # run 2: 4 frames
+    block[900] = 1.0                         # a LONE full-scale sample: not a clip
+    stream.push(block)
+
+    result = rec.stop()
+    assert result.clip_runs == 2             # two runs, not three, not 15
+    assert result.clipped is True
+    assert result.max_peak_dbfs == pytest.approx(0.0, abs=0.01)
+
+
+def test_a_clip_run_spanning_two_blocks_counts_once(tmp_path):
+    """The run must be carried across the block boundary, not counted twice."""
+    rec, made = _recorder(tmp_path)
+    rec.start(device=0, path=tmp_path / "a.wav", samplerate=SR, channels=2)
+    stream = made["stream"]
+
+    a = _tone(1024)
+    a[-5:] = 1.0                             # run starts at the end of block 1...
+    b = _tone(1024)
+    b[:5] = 1.0                              # ...and continues into block 2
+    stream.push(a)
+    stream.push(b)
+
+    assert rec.stop().clip_runs == 1
+
+
+def test_a_clean_capture_reports_no_clipping(tmp_path):
+    rec, made = _recorder(tmp_path)
+    rec.start(device=0, path=tmp_path / "a.wav", samplerate=SR, channels=2)
+    made["stream"].push(_tone(1024, amp=0.5))
+    result = rec.stop()
+    assert result.clip_runs == 0
+    assert result.clipped is False
+    assert result.max_peak_dbfs < -3.0
+
+
+# --------------------------------------------------------------------------- #
+# The queue is bounded, and the callback never blocks
+# --------------------------------------------------------------------------- #
+def test_queue_stays_bounded_under_a_slow_writer(tmp_path):
+    """A stalled disk must not grow memory without limit, and must not block
+    the realtime callback -- it drops, and warns."""
+    rec, made = _recorder(tmp_path, queue_blocks=8)
+    rec.start(device=0, path=tmp_path / "a.wav", samplerate=SR, channels=2)
+    stream = made["stream"]
+
+    # Stall the writer by taking the file away from it.
+    rec._stop_flag.set()
+    rec._writer.join(timeout=2.0)
+
+    block = _tone(256)
+    started = time.monotonic()
+    for _ in range(200):                     # far more than the queue can hold
+        stream.push(block)
+    elapsed = time.monotonic() - started
+
+    assert rec._queue.qsize() <= 8           # hard ceiling honoured
+    assert elapsed < 2.0                     # ...and the callback never blocked
+    assert rec._dropped_blocks > 0
+
+    result = rec.stop()
+    assert any("dropped" in w for w in result.warnings)   # and it admits it
+
+
+def test_portaudio_overflow_becomes_a_warning(tmp_path):
+    """A capture with dropouts must say so -- never ship a damaged WAV silently."""
+    rec, made = _recorder(tmp_path)
+    rec.start(device=0, path=tmp_path / "a.wav", samplerate=SR, channels=2)
+    made["stream"].push(_tone(1024), status=_Overflow())
+
+    result = rec.stop()
+    assert any("overflow" in w for w in result.warnings)
+    assert any("dropout" in w for w in result.warnings)
+
+
+# --------------------------------------------------------------------------- #
+# Windows lock discipline: handle released BEFORE the move
+# --------------------------------------------------------------------------- #
+def test_stop_releases_the_handle_and_delivers_to_the_destination(tmp_path):
+    dest_dir = tmp_path / "share"            # stands in for the network share
+    dest = dest_dir / "SideA.wav"
+    rec, made = _recorder(tmp_path)
+
+    rec.start(device=0, path=dest, samplerate=SR, channels=2)
+    staging = rec._staging_path
+    assert staging is not None and staging.exists()
+    assert staging.parent != dest_dir        # capture is LOCAL, not on the share
+
+    made["stream"].push(_tone(2048))
+    result = rec.stop()
+
+    # The move succeeded -- which on Windows is only possible with the handle shut.
+    assert dest.exists()
+    assert result.path == dest
+    assert not staging.exists()
+    assert not staging.parent.exists()       # staging dir cleaned up
+
+    # And the delivered file is fully flushed and readable.
+    assert sf.info(str(dest)).frames == 2048
+    # Nothing holds it: it can be deleted immediately.
+    dest.unlink()
+    assert not dest.exists()
+
+
+def test_staging_is_local_even_when_the_destination_is_not(tmp_path):
+    rec, made = _recorder(tmp_path)
+    dest = tmp_path / "nested" / "deep" / "SideB.wav"
+    rec.start(device=0, path=dest, samplerate=SR, channels=2)
+    staged = rec._staging_path
+    assert "rrf_record_" in str(staged.parent)      # a local temp dir
+    made["stream"].push(_tone(512))
+    rec.stop()
+    assert dest.exists()                            # destination dirs created
+    shutil.rmtree(dest.parent)
+
+
+# --------------------------------------------------------------------------- #
+# Device vanishes mid-capture (USB unplug)
+# --------------------------------------------------------------------------- #
+def test_device_vanishing_keeps_the_partial_file_and_surfaces_the_error(tmp_path):
+    """Never a crash, never a zero-byte mystery file."""
+    rec, made = _recorder(tmp_path)
+    dest = tmp_path / "SideA.wav"
+    rec.start(device=0, path=dest, samplerate=SR, channels=2)
+    stream = made["stream"]
+
+    stream.push(_tone(4096))                 # 4096 frames captured fine...
+    # ...then the USB device is yanked: PortAudio blows up on stop().
+    stream.stop_raises = OSError("PortAudioError: Device unavailable [-9985]")
+
+    result = rec.stop()                      # must not raise
+
+    assert dest.exists()
+    assert dest.stat().st_size > 0           # NOT a zero-byte mystery file
+    assert sf.info(str(dest)).frames == 4096  # everything before the failure kept
+    assert result.duration > 0
+    assert any("Device unavailable" in w for w in result.warnings)
+    assert any("kept" in w for w in result.warnings)
+
+
+def test_an_exception_inside_the_callback_does_not_escape(tmp_path):
+    """A raise on PortAudio's realtime thread would kill the stream."""
+    rec, made = _recorder(tmp_path)
+    rec.start(device=0, path=tmp_path / "a.wav", samplerate=SR, channels=2)
+
+    # A malformed block (wrong dtype/shape) must be swallowed, not propagated.
+    made["stream"].callback(object(), 0, None, _NoStatus())   # nonsense input
+
+    assert rec.device_error                  # recorded...
+    result = rec.stop()                      # ...and surfaced, without a crash
+    assert any("device failed" in w or "kept" in w for w in result.warnings)
+
+
+# --------------------------------------------------------------------------- #
+# Telemetry
+# --------------------------------------------------------------------------- #
+def test_telemetry_reports_peaks_clips_and_elapsed(tmp_path):
+    seen = []
+    rec, made = _recorder(tmp_path, telemetry_interval_s=0.0)   # emit every block
+    rec._on_telemetry = seen.append
+
+    rec.start(device=0, path=tmp_path / "a.wav", samplerate=SR, channels=2)
+    block = _tone(1024, amp=0.5)
+    block[10:20] = 1.0
+    made["stream"].push(block)
+    rec.stop()
+
+    assert seen, "no telemetry emitted"
+    t = seen[-1]
+    assert len(t.peaks_dbfs) == 2                       # per channel
+    assert t.max_peak_dbfs == pytest.approx(0.0, abs=0.01)
+    assert t.clip_runs == 1
+    assert t.elapsed_s >= 0.0
+
+
+def test_telemetry_is_throttled(tmp_path):
+    seen = []
+    rec, made = _recorder(tmp_path, telemetry_interval_s=10.0)  # effectively never
+    rec._on_telemetry = seen.append
+
+    rec.start(device=0, path=tmp_path / "a.wav", samplerate=SR, channels=2)
+    for _ in range(50):
+        made["stream"].push(_tone(256))
+    rec.stop()
+
+    # 50 callbacks, but the GUI is not asked to repaint 50 times.
+    assert len(seen) <= 1
+
+
+def test_telemetry_failure_never_breaks_the_capture(tmp_path):
+    def boom(_t):
+        raise RuntimeError("GUI exploded")
+
+    rec, made = _recorder(tmp_path, telemetry_interval_s=0.0)
+    rec._on_telemetry = boom
+    rec.start(device=0, path=tmp_path / "a.wav", samplerate=SR, channels=2)
+    made["stream"].push(_tone(1024))
+
+    result = rec.stop()
+    assert sf.info(str(result.path)).frames == 1024     # audio survived regardless

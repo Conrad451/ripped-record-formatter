@@ -27,3 +27,4 @@ soundfile==0.14.0
 noisereduce==3.0.3
 musicbrainzngs==0.7.1
 pyqtgraph==0.14.0
+sounddevice==0.5.5
