@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import re
 import threading
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
@@ -63,7 +64,22 @@ class SideJob:
     """Per-track artists as the reviewer left them. Snapshotted at accept time
     alongside :attr:`titles`, so the review area can be handed to the next side
     immediately without the pending edits living on in the UI."""
+
+    # --- failure detail -----------------------------------------------------
+    # An ERROR state that only says "error" is useless. Every failure records
+    # what actually went wrong, which phase it went wrong in, and the traceback,
+    # so the UI can show a cause instead of a colour.
     error: str = ""
+    """One-line cause, e.g. ``PermissionError: [Errno 13] Permission denied: ...``."""
+    failed_phase: str = ""
+    """Which phase raised: ``"setup"``, ``"analysis"`` or ``"encode"``."""
+    error_detail: str = ""
+    """Full traceback, for the log's detail level. Never the only record."""
+
+    def clear_error(self) -> None:
+        self.error = ""
+        self.failed_phase = ""
+        self.error_detail = ""
 
 
 # --------------------------------------------------------------------------- #
@@ -183,13 +199,22 @@ class AlbumController:
         self._encode_pool = ThreadPoolExecutor(max_workers=max(1, max_encode_workers))
 
     # -- state helpers ------------------------------------------------------
-    def _set_state(self, side: SideJob, state: SideState, error: str = "") -> None:
+    def _set_state(self, side: SideJob, state: SideState, error: str = "",
+                   phase: str = "", detail: str = "") -> None:
         with self._lock:
             side.state = state
             if error:
                 side.error = error
+                side.failed_phase = phase
+                side.error_detail = detail
         if self._on_state_change is not None:
             self._on_state_change(side)
+
+    @staticmethod
+    def _describe(exc: BaseException) -> str:
+        """One line a human can act on. Never just the exception class."""
+        text = str(exc).strip()
+        return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
     def _by_index(self, index: int) -> SideJob:
         for side in self.sides:
@@ -205,11 +230,39 @@ class AlbumController:
         return self._should_cancel(side)()
 
     # -- lifecycle ----------------------------------------------------------
+    def retry_side(self, index: int) -> bool:
+        """Re-run a failed side's analysis from scratch. Returns whether it ran.
+
+        A transient failure -- the share blinked, the file was locked, ffmpeg was
+        busy -- used to cost the whole album, because ERROR is terminal and the
+        only way back was starting over. Retrying re-queues just this side:
+        its error is cleared, any cancel flag is reset (a side cancelled with the
+        album is not retryable, but one that *errored* may have had the flag set
+        by a later cancel_all), and analysis is submitted afresh. Every other
+        side is untouched, including ones already encoding.
+
+        Deliberately no retry limit: if it fails again the new message is shown
+        and the user decides whether to try once more or give up.
+        """
+        side = self._by_index(index)
+        with self._lock:
+            if side.state != SideState.ERROR:
+                return False
+            if side.wav_path is None:
+                return False          # nothing to retry; it was never mapped
+        side.clear_error()
+        side.analysis = None
+        self._side_cancel[index].clear()
+        self._set_state(side, SideState.QUEUED)
+        self._analysis_pool.submit(self._run_analysis, side)
+        return True
+
     def start(self) -> None:
         """Queue every mapped side for analysis. Unmapped sides go to ERROR."""
         for side in self.sides:
             if side.wav_path is None:
-                self._set_state(side, SideState.ERROR, "no WAV mapped to this side")
+                self._set_state(side, SideState.ERROR, "no WAV mapped to this side",
+                                phase="setup")
                 continue
             self._analysis_pool.submit(self._run_analysis, side)
 
@@ -224,7 +277,8 @@ class AlbumController:
             if self._cancelled(side):
                 self._set_state(side, SideState.CANCELLED)
             else:
-                self._set_state(side, SideState.ERROR, f"{type(exc).__name__}: {exc}")
+                self._set_state(side, SideState.ERROR, self._describe(exc),
+                                phase="analysis", detail=traceback.format_exc())
             return
         side.analysis = analysis
         if self._cancelled(side):
@@ -274,7 +328,8 @@ class AlbumController:
             if self._cancelled(side):
                 self._set_state(side, SideState.CANCELLED)
             else:
-                self._set_state(side, SideState.ERROR, f"{type(exc).__name__}: {exc}")
+                self._set_state(side, SideState.ERROR, self._describe(exc),
+                                phase="encode", detail=traceback.format_exc())
             return
         if self._cancelled(side):
             self._set_state(side, SideState.CANCELLED)

@@ -162,7 +162,7 @@ class FullRipTab(QWidget):
         # "Add single WAV..." and a one-row mapping table.
 
         # --- 1. Source: the primary and only entry point ------------------------
-        self.album_box = QGroupBox("Source - pick the folder holding this record's side WAVs")
+        self.album_box = QGroupBox("Source")
         album_layout = QVBoxLayout(self.album_box)
         pick_row = QHBoxLayout()
         folder_btn = QPushButton("Select folder...")
@@ -177,14 +177,20 @@ class FullRipTab(QWidget):
         self.cancel_album_btn = QPushButton("Cancel album")
         self.cancel_album_btn.setEnabled(False)
         self.cancel_album_btn.clicked.connect(self._cancel_album)
+        # A failed side used to cost the whole album. Retry re-runs just that one.
+        self.retry_side_btn = QPushButton("Retry side")
+        self.retry_side_btn.setEnabled(False)
+        self.retry_side_btn.setToolTip("Re-run the selected failed side from scratch.")
+        self.retry_side_btn.clicked.connect(self._retry_selected_side)
         pick_row.addWidget(self.start_album_btn)
+        pick_row.addWidget(self.retry_side_btn)
         pick_row.addWidget(self.cancel_album_btn)
         album_layout.addLayout(pick_row)
 
         self.mapping_hint = QLabel(
-            "One row per WAV found. Set the side for the files belonging to this "
-            "record; leave anything else on — skip —. Only mapped rows are "
-            "processed — run again with a different mapping for the next album."
+            "Select the folder containing your ripped WAV files. Assign each file "
+            "to a side of the record — files left on “skip” are ignored, so you "
+            "can keep multiple albums in one folder and process one at a time."
         )
         self.mapping_hint.setWordWrap(True)
         album_layout.addWidget(self.mapping_hint)
@@ -203,6 +209,7 @@ class FullRipTab(QWidget):
         self.side_list.setMinimumHeight(_MAP_TABLE_H)
         self.side_list.setMaximumHeight(_MAP_TABLE_H)
         self.side_list.itemClicked.connect(self._on_side_list_click)
+        self.side_list.currentItemChanged.connect(lambda *_: self._update_retry_enabled())
         map_side_row.addWidget(self.side_list, 1)
         album_layout.addLayout(map_side_row)
         root.addWidget(self.album_box)
@@ -370,6 +377,10 @@ class FullRipTab(QWidget):
         panel.statusMessage.connect(self._log)
         panel.releaseSelected.connect(lambda detail: (self._apply_release(detail), dialog.accept()))
         layout.addWidget(panel)
+        # Clicking "Look up release..." with artist/album already filled in *is*
+        # the search intent; making the user press Search again is friction. An
+        # empty open still waits for input.
+        panel.search_on_open()
         dialog.exec()
 
     def _apply_release(self, detail) -> None:
@@ -704,7 +715,14 @@ class FullRipTab(QWidget):
             return "Side analyzing..."
         if any(s == SideState.READY for s in states):
             return "A side is ready - pick it from the list to review its splits."
-        if all(s in (SideState.DONE, SideState.ERROR, SideState.CANCELLED) for s in states):
+        done = all(s in (SideState.DONE, SideState.ERROR, SideState.CANCELLED) for s in states)
+        if any(s == SideState.ERROR for s in states):
+            failed = ", ".join(x.label for x in self._album.sides
+                               if x.state == SideState.ERROR)
+            head = "Album finished." if done else "Waiting for the next side..."
+            return (f"{head}\n\n{failed} failed - select it in the list to see why, "
+                    "then press 'Retry side'.")
+        if done:
             return "Album finished."
         return "Waiting for the next side..."
 
@@ -848,11 +866,25 @@ class FullRipTab(QWidget):
             item = self.side_list.item(i)
             if item.data(Qt.ItemDataRole.UserRole) == side.index:
                 item.setText(f"{side.label} - {side.state.value}")
+                if side.state == SideState.ERROR and side.error:
+                    phase = side.failed_phase or "processing"
+                    item.setToolTip(f"{side.label} failed during {phase}:\n{side.error}")
+                else:
+                    item.setToolTip(f"{side.label} - {side.state.value}")
                 break
+        self._update_retry_enabled()
         if side.state == SideState.READY:
             self._log(f"Album: {side.label} ready for review.")
         elif side.state == SideState.ERROR:
-            self._log(f"Album: {side.label} ERROR - {side.error}")
+            # Say what actually went wrong, at the moment it goes wrong. The one
+            # informative line used to be the only record, and the log pane shows
+            # ~4 lines by default, so it scrolled away and clicking the side then
+            # answered "not ready yet (error)" -- an error naming itself.
+            phase = side.failed_phase or "processing"
+            self._log(f"Album: {side.label} failed during {phase}: {side.error}")
+            for line in (side.error_detail or "").rstrip().splitlines():
+                self._log(f"    {line}")
+            self._log(f"  -> select {side.label} and press 'Retry side' to run it again.")
         elif side.state == SideState.DONE:
             self._log(f"Album: {side.label} done.")
         if self._album_review_index is None:
@@ -866,9 +898,13 @@ class FullRipTab(QWidget):
         if self._album is None:
             return
         side = self._album_side(item.data(Qt.ItemDataRole.UserRole))
-        if side is None or side.analysis is None:
-            if side is not None:
-                self._log(f"Album: {side.label} not ready yet ({side.state.value}).")
+        if side is None:
+            return
+        if side.state == SideState.ERROR:
+            self._show_side_error(side)
+            return
+        if side.analysis is None:
+            self._log(f"Album: {side.label} not ready yet ({side.state.value}).")
             return
         if side.index == self._album_review_index:
             return                                  # already open
@@ -900,6 +936,42 @@ class FullRipTab(QWidget):
         self._album_review_index = None
         self._clear_review()
         return True
+
+    def _show_side_error(self, side) -> None:
+        """An errored side puts its cause in the review area, not an empty panel."""
+        self._album_review_index = None
+        phase = side.failed_phase or "processing"
+        self._set_empty_state(
+            f"{side.label} failed during {phase}.\n\n{side.error}\n\n"
+            "Fix the cause, then press 'Retry side' to run this side again. "
+            "The other sides are unaffected."
+        )
+        self._log(f"Album: {side.label} failed during {phase}: {side.error}")
+        self._update_retry_enabled()
+
+    def _selected_side(self):
+        item = self.side_list.currentItem()
+        if item is None or self._album is None:
+            return None
+        return self._album_side(item.data(Qt.ItemDataRole.UserRole))
+
+    def _update_retry_enabled(self) -> None:
+        side = self._selected_side()
+        self.retry_side_btn.setEnabled(
+            side is not None and side.state == SideState.ERROR and side.wav_path is not None)
+
+    def _retry_selected_side(self) -> None:
+        side = self._selected_side()
+        if side is None or self._album is None:
+            return
+        label = side.label
+        if self._album.retry_side(side.index):
+            self._log(f"Album: retrying {label} from scratch.")
+            if self._album_review_index is None:
+                self._set_empty_state(self._pending_review_message())
+        else:
+            self._log(f"Album: {label} cannot be retried ({side.state.value}).")
+        self._update_retry_enabled()
 
     def _load_side_for_review(self, side) -> None:
         self._album_review_index = side.index
@@ -1044,6 +1116,9 @@ class FullRipTab(QWidget):
         policy = job_settings.build_policy(cfg)
         params = job_settings.build_silence_params(cfg)
         side_dir = self._album_work_dir / f"side_{side.index}"
+        # Fresh staging every run, so a retry never inherits a half-written
+        # restored.wav from the attempt that failed.
+        shutil.rmtree(side_dir, ignore_errors=True)
         side_dir.mkdir(parents=True, exist_ok=True)
         restored = side_dir / "restored.wav"
         result = restore(side.wav_path, restored, stages, policy=policy, should_cancel=should_cancel)
