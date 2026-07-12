@@ -11,7 +11,6 @@ from core.album import (
     SideJob,
     SideState,
     guess_side_index,
-    map_wavs_to_sides,
     propose_wav_side_map,
     sides_from_proposal,
 )
@@ -37,29 +36,6 @@ def test_guess_side_index_patterns():
     assert guess_side_index("B.wav") == 1
     assert guess_side_index("01 - Side 1.wav") == 0
     assert guess_side_index("random_name.wav") is None
-
-
-def test_map_wavs_by_side_name():
-    mapping = map_wavs_to_sides(["SideB.wav", "SideA.wav"], 2)
-    assert [p.name for p in mapping] == ["SideA.wav", "SideB.wav"]
-
-
-def test_map_wavs_fallback_to_sorted_order():
-    mapping = map_wavs_to_sides(["track02.wav", "track01.wav"], 2)
-    assert [p.name for p in mapping] == ["track01.wav", "track02.wav"]
-
-
-def test_map_wavs_collision_fills_empty_side():
-    mapping = map_wavs_to_sides(["SideA.wav", "A_bonus.wav"], 2)
-    # SideA takes side 0; the second 'A' hint collides and lands on the free side.
-    assert mapping[0].name == "SideA.wav"
-    assert mapping[1].name == "A_bonus.wav"
-
-
-def test_map_wavs_unmapped_side_is_none():
-    mapping = map_wavs_to_sides(["SideA.wav"], 2)
-    assert mapping[0].name == "SideA.wav"
-    assert mapping[1] is None
 
 
 # --------------------------------------------------------------------------- #

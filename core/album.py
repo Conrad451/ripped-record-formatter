@@ -2,9 +2,11 @@
 
 Two pieces, both GUI-agnostic:
 
-* :func:`map_wavs_to_sides` -- filename heuristics assigning a folder of WAVs to
-  the sides of a release (``SideA.wav``, ``side_a``, ``A.wav``, ``01 - side 1``).
-  It only proposes; the user confirms/corrects.
+* :func:`propose_wav_side_map` -- filename heuristics proposing a side for each
+  WAV in a folder (``SideA.wav``, ``side_a``, ``A.wav``, ``01 - side 1``). It only
+  proposes, never guesses: a file with no side hint is left unmapped for the user
+  to place or skip. :func:`sides_from_proposal` turns a confirmed mapping into a
+  job, dropping the skipped rows.
 * :class:`AlbumController` -- a small state machine + thread pools that pipelines
   the sides: analysis of side k+1 runs in the background while side k waits for
   the human to review it. Analysis concurrency is bounded (default 1 -- each
@@ -101,10 +103,10 @@ def guess_side_index(filename: str) -> int | None:
 def propose_wav_side_map(wav_paths, num_sides: int) -> list[int | None]:
     """Propose a side for each WAV, in the order given; ``None`` means *skip*.
 
-    The inverse of :func:`map_wavs_to_sides`: one entry per **WAV** rather than
-    per side, because a folder may hold WAVs from several albums and the user
-    works through one album at a time. Anything this function is not confident
-    about is left unmapped, and unmapped rows are simply excluded from the job.
+    One entry per **WAV** rather than per side, because a folder may hold WAVs
+    from several albums and the user works through one album at a time. Anything
+    this function is not confident about is left unmapped, and unmapped rows are
+    simply excluded from the job.
 
     Confident means the filename actually names a side -- ``SideA``, ``side_b``,
     ``side-2``, or a lone ``A``. A file with no side hint (``bonus.wav``,
@@ -145,35 +147,6 @@ def sides_from_proposal(wav_paths, proposal) -> dict[int, Path]:
         for path, idx in zip(wav_paths, proposal)
         if idx is not None
     }
-
-
-def map_wavs_to_sides(wav_paths, num_sides: int) -> list[Path | None]:
-    """Propose one WAV per side (index 0..num_sides-1); ``None`` where unsure.
-
-    Assignment is strength-ordered so an explicit ``SideA`` beats an incidental
-    trailing ``A``: first files that name a side outright, then single-letter
-    hints, then whatever's left filled into still-empty sides in sorted filename
-    order (so a plain ``01.wav``/``02.wav`` pair still maps).
-    """
-    paths = [Path(p) for p in wav_paths]
-    mapping: list[Path | None] = [None] * num_sides
-
-    guesses = [(p, *_guess(p.stem)) for p in sorted(paths, key=lambda p: p.name.lower())]
-    leftovers: list[Path] = []
-    for strength in (2, 1):
-        for path, idx, s in guesses:
-            if s != strength or path in leftovers or path in mapping:
-                continue
-            if idx is not None and 0 <= idx < num_sides and mapping[idx] is None:
-                mapping[idx] = path
-    for path, idx, s in guesses:
-        if path not in mapping:
-            leftovers.append(path)
-
-    empty = [i for i in range(num_sides) if mapping[i] is None]
-    for slot, path in zip(empty, leftovers):
-        mapping[slot] = path
-    return mapping
 
 
 # --------------------------------------------------------------------------- #
