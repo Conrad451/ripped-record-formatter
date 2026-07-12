@@ -70,7 +70,9 @@ def test_main_window_constructs_all_tabs(qapp):
 
     w = MainWindow()
     labels = [w.tabs.tabText(i) for i in range(w.tabs.count())]
-    assert labels == ["Full Rip", "Convert", "Re-tag", "Metadata", "Settings"]
+    # Full Rip stays the landing tab: opening on Record would seize the audio
+    # device on every launch, for someone who may only want to re-tag.
+    assert labels == ["Full Rip", "Record", "Convert", "Re-tag", "Metadata", "Settings"]
 
 
 def test_full_rip_accept_gating_and_override(qapp):

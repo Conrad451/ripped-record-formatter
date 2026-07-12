@@ -259,6 +259,7 @@ class MainWindow(QMainWindow):
 
         from gui.full_rip import FullRipTab
         from gui.metadata_panel import MetadataPanel
+        from gui.record_tab import RecordTab
         from gui.settings_panel import SettingsPanel
 
         self.tabs = QTabWidget()
@@ -267,7 +268,13 @@ class MainWindow(QMainWindow):
         self.full_rip = FullRipTab(self.settings)
         self.metadata_panel = MetadataPanel(settings=self.settings)
         self.settings_panel = SettingsPanel(self.settings)
+        self.record_tab = RecordTab(self.settings)
+        self.record_tab.logMessage.connect(self._log)
+        # The payoff: a finished side walks straight into Full Rip's mapping table.
+        self.record_tab.recordingFinished.connect(self._on_recording_finished)
+        self.record_tab.recordingStateChanged.connect(self._on_recording_state)
         self.tabs.addTab(self.full_rip, "Full Rip")
+        self.tabs.addTab(self.record_tab, "Record")
         self.tabs.addTab(self.convert_panel, "Convert")
         self.tabs.addTab(self.retag_panel, "Re-tag")
         self.tabs.addTab(self.metadata_panel, "Metadata")
@@ -323,8 +330,29 @@ class MainWindow(QMainWindow):
                   "Use Metadata to pull tracklists + cover art.")
 
     # --- metadata wiring ---------------------------------------------------
+    def _on_recording_finished(self, path) -> None:
+        """Hand the capture to Full Rip, if it is working in the same folder."""
+        if self.full_rip.add_recorded_wav(path):
+            self._log(f"Recorded side '{Path(path).name}' added to the Full Rip mapping.")
+        else:
+            self._log(f"Recorded '{Path(path).name}'. Select its folder in Full Rip "
+                      "to include it in an album.")
+
+    def _on_recording_state(self, recording: bool) -> None:
+        """Recording must be unmissable, whichever tab you are looking at."""
+        index = self.tabs.indexOf(self.record_tab)
+        self.tabs.setTabText(index, "● Record" if recording else "Record")
+        self.setStyleSheet(
+            "QTabWidget::pane { border: 2px solid #c0392b; }" if recording else "")
+        self.setWindowTitle(
+            f"Ripped Record Formatter {__version__}"
+            + (" — RECORDING" if recording else ""))
+
     def _on_tab_changed(self, index: int) -> None:
         widget = self.tabs.widget(index)
+        # Meters run whenever the Record tab is the visible one -- so you can set
+        # input gain before you ever press Record.
+        self.record_tab.set_active(widget is self.record_tab)
         if widget in (self.convert_panel, self.retag_panel):
             self._last_batch_panel = widget
 
