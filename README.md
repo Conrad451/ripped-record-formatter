@@ -24,7 +24,11 @@ You play a record into it and get a finished album back. Ripped Record Formatter
 
 ## Installation
 
-**From source — the only supported path today.** Requires **Python 3.14**. There is no packaged build yet; see [build.md](build.md).
+**Download it.** Grab the release zip, extract it anywhere, and run `RippedRecordFormatter.exe`. No Python, no ffmpeg, no installer — ffmpeg is bundled inside, and nothing is written outside the folder you extract.
+
+The build is not code-signed, so Windows SmartScreen will warn you the first time: click *More info* → *Run anyway*. The download is around 470 MB, most of which is ffmpeg and Qt.
+
+**Or run it from source.** Requires **Python 3.14**.
 
 ```bash
 git clone https://github.com/Conrad451/ripped-record-formatter.git
@@ -35,7 +39,7 @@ pip install -r requirements.txt
 python app.py
 ```
 
-ffmpeg is fetched automatically on first use — see [Runtime requirements](build.md#runtime-requirements).
+From source, ffmpeg is fetched automatically on first use — see [Runtime requirements](build.md#runtime-requirements). To build the standalone bundle yourself, see [build.md](build.md).
 
 ## Usage
 
@@ -92,7 +96,7 @@ Written as FLAC Vorbis comments. **A field that is absent writes no tag at all**
 - **Gapless sides need you.** A side mixed as a continuous piece — segues, crossfades, live recordings with applause bridging tracks — has no silence to find. The splitter will tell you which gaps it could not resolve and let you place them by hand, but it will not place them for you. This is deliberate: a wrong automatic cut in the middle of a track is worse than being asked.
 - **Defaults are conservative.** Noise reduction in particular is tuned to under-process rather than risk the gurgling artefacts of an aggressive spectral gate. If your pressing is rough, turn it up in **Settings** — every threshold, cutoff and weight is exposed there rather than buried in the code.
 - **Recording is Windows-first in practice.** The capture layer is PortAudio (via `sounddevice`) and is not OS-specific, but the device quirks documented above — and the testing — are Windows/WASAPI.
-- **From source is the only supported path.** There is no packaged build yet — see [build.md](build.md).
+- **The build is not code-signed.** Windows SmartScreen warns on first run until it is.
 - **No command-line interface.** The app is GUI-only for now; `core/` is deliberately UI-agnostic so a CLI can be added without touching the logic.
 
 ## License
