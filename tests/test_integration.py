@@ -517,3 +517,71 @@ def test_no_cover_is_visible_in_the_lookup_before_choosing(qapp):
     panel._populate_cover(_release_with(None))
     assert NO_COVER_TEXT in panel.cover_label.text()
     assert panel.cover_label.pixmap().isNull()
+
+
+# --------------------------------------------------------------------------- #
+# Layout defaults: the workflow area, not the chrome, gets the space
+# --------------------------------------------------------------------------- #
+def test_default_layout_gives_the_review_area_room(qapp):
+    from gui.main_window import MainWindow
+
+    w = MainWindow()
+    w.resize(1280, 956)                      # what a 1080p desktop gets
+    w.show()
+    qapp.processEvents()
+    fr = w.full_rip
+    fr._expected_n = 2
+    fr._expected_durations_s = []
+    fr._on_analyze_done(_fake_analysis([], []))
+    qapp.processEvents()
+
+    # The review area outweighs the source group above it...
+    assert fr.review_box.height() > fr.album_box.height()
+    # ...and the waveform is the biggest single thing in it.
+    assert fr.waveform.height() >= 190
+    assert fr.waveform.height() > fr.table.height()
+
+    # The log is present but minimal -- it must not own the window.
+    tabs_h, log_h = w._main_splitter.sizes()
+    assert log_h > 0                          # still visible
+    assert log_h < tabs_h * 0.15              # ...and out of the way
+    w.close()
+
+
+def test_mapping_table_shows_several_rows_without_scrolling(qapp):
+    from gui.main_window import MainWindow
+
+    fr = MainWindow().full_rip
+    rows_visible = (fr.mapping_table.height() - 26) // 22
+    assert 4 <= rows_visible <= 6, rows_visible
+
+
+def test_persisted_splitter_sizes_still_win_over_defaults(qapp):
+    """Defaults-only change: a size the user already chose is still honoured.
+
+    QSplitter rescales setSizes() to the widget's real height, so the *ratio* is
+    what survives, not the literal pixels.
+    """
+    from gui.main_window import MainWindow
+
+    fresh = MainWindow()
+    fresh.resize(1000, 800)
+    fresh.show()
+    qapp.processEvents()
+    default_log_fraction = fresh._main_splitter.sizes()[1] / sum(fresh._main_splitter.sizes())
+    fresh.close()
+
+    # The user drags the log much bigger and it is persisted.
+    fresh.settings.set(main_split_top=400, main_split_bottom=300)
+
+    restored = MainWindow()
+    restored.resize(1000, 800)
+    restored.show()
+    qapp.processEvents()
+    top, bottom = restored._main_splitter.sizes()
+    log_fraction = bottom / (top + bottom)
+    restored.close()
+
+    # Their choice, not the default. (The exact ratio is clamped by the tab
+    # area's minimum height, so assert the direction, not the pixel.)
+    assert log_fraction > default_log_fraction * 2

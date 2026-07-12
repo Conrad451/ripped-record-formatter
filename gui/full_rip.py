@@ -70,6 +70,13 @@ from gui.waveform import WaveformView
 # default for anything the heuristics are not confident about.
 SKIP_LABEL = "— skip —"
 
+# Mapping-table geometry: 5 rows visible without scrolling (header + 5 * row) --
+# enough for a double album plus a stray, while leaving the review area the
+# dominant share of the tab.
+_MAP_ROW_H = 22
+_MAP_TABLE_ROWS = 5
+_MAP_TABLE_H = _MAP_ROW_H * _MAP_TABLE_ROWS + 26
+
 
 class _StateRelay(QObject):
     """Marshals AlbumController state callbacks (worker threads) to the GUI."""
@@ -186,9 +193,15 @@ class FullRipTab(QWidget):
         self.mapping_table = QTableWidget(0, 2)
         self.mapping_table.setHorizontalHeaderLabels(["WAV file", "Side"])
         self.mapping_table.verticalHeader().setVisible(False)
-        self.mapping_table.verticalHeader().setDefaultSectionSize(22)
+        self.mapping_table.verticalHeader().setDefaultSectionSize(_MAP_ROW_H)
+        # ~6 rows visible before it scrolls: enough for a double album's sides
+        # plus a couple of strays, without the source group eating the waveform.
+        self.mapping_table.setMinimumHeight(_MAP_TABLE_H)
+        self.mapping_table.setMaximumHeight(_MAP_TABLE_H)
         map_side_row.addWidget(self.mapping_table, 2)
         self.side_list = QListWidget()
+        self.side_list.setMinimumHeight(_MAP_TABLE_H)
+        self.side_list.setMaximumHeight(_MAP_TABLE_H)
         self.side_list.itemClicked.connect(self._on_side_list_click)
         map_side_row.addWidget(self.side_list, 1)
         album_layout.addLayout(map_side_row)
@@ -255,7 +268,8 @@ class FullRipTab(QWidget):
 
         self.waveform = WaveformView()
         self.waveform.markersChanged.connect(self._on_markers_changed)
-        review.addWidget(self.waveform, 1)
+        self.waveform.setMinimumHeight(190)
+        review.addWidget(self.waveform, 3)
 
         # wrong-side diagnosis
         self.diagnosis_box = QGroupBox("Check the selection")
@@ -306,7 +320,8 @@ class FullRipTab(QWidget):
         self.model = TrackTableModel()
         self.table = TrackTableView()
         self.table.setModel(self.model)
-        review.addWidget(self.table, 1)
+        self.table.setMinimumHeight(110)
+        review.addWidget(self.table, 2)
 
         self.meta_summary = QLabel("")
         self.meta_summary.setWordWrap(True)
