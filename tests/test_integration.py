@@ -809,3 +809,110 @@ def test_use_this_release_delivers_the_art_to_the_main_preview(qapp):
     assert not fr.release_preview.isHidden()
     assert not fr.release_preview.thumb.pixmap().isNull()   # same art on the main tab
     assert fr.release_preview.title_label.text() == "Miles Davis - Kind of Blue"
+
+
+# --------------------------------------------------------------------------- #
+# Guard trip: reviewable in album mode, not a dead-end error
+# --------------------------------------------------------------------------- #
+def _attention_side(fr, tmp_path, reason="expected 4 tracks; only 1 of 3 boundaries confirmed"):
+    """Park a side in NEEDS_ATTENTION carrying a proposal with unresolved gaps."""
+    from core.album import AlbumController, NeedsAttention, SideJob, SideState
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QListWidgetItem
+
+    analysis = _fake_analysis([], [_FakeGap(), _FakeGap()])
+    side = SideJob(index=1, label="Side B", wav_path=tmp_path / "b.wav",
+                   titles=["t1", "t2", "t3", "t4"])
+
+    def analyze(s, c):
+        raise NeedsAttention(reason, analysis)
+
+    fr._album = AlbumController([side], analyze, lambda s, c: None,
+                                on_state_change=lambda s: fr._relay.changed.emit(s))
+    item = QListWidgetItem("Side B")
+    item.setData(Qt.ItemDataRole.UserRole, 1)
+    fr.side_list.addItem(item)
+    fr.side_list.setCurrentItem(item)
+    fr._album.start()
+    assert _wait(lambda: side.state == SideState.NEEDS_ATTENTION)
+    return side, item
+
+
+def test_guard_trip_is_reviewable_not_an_error(qapp, tmp_path):
+    from core.album import SideState
+    from gui.main_window import MainWindow
+
+    w = MainWindow()
+    fr = w.full_rip
+    side, item = _attention_side(fr, tmp_path)
+    qapp.processEvents()
+
+    assert side.state is SideState.NEEDS_ATTENTION
+    assert side.analysis is not None                 # work preserved
+    log = w.log.toPlainText()
+    assert "needs attention" in log
+    assert "boundaries confirmed" in log
+    assert "needs review" in item.toolTip()
+
+    # Clicking it opens the review area with the diagnosis banner -- not an error
+    # panel, and not the doomed auto resolve queue.
+    fr._on_side_list_click(item)
+    qapp.processEvents()
+
+    assert not fr.review_box.isHidden()
+    assert not fr.diagnosis_box.isHidden()
+    assert "gapless transitions" in fr.diagnosis_label.text()
+    assert "only 1 boundaries confirmed" in fr.diagnosis_label.text() or \
+           "boundaries confirmed" in fr.diagnosis_label.text()
+
+    # Album routes offered; single-side routes hidden.
+    assert not fr.recheck_mapping_btn.isHidden()
+    assert not fr.review_manual_btn.isHidden()
+    assert fr.reselect_btn.isHidden()
+    assert fr.resolve_anyway_btn.isHidden()
+
+    # Retry is still offered, with the honest hint.
+    assert fr.retry_side_btn.isEnabled()
+    assert "if nothing changed" in fr.retry_side_btn.toolTip()
+    fr._album.shutdown(wait=True)
+
+
+def test_review_manually_routes_into_the_resolve_gap_flow(qapp, tmp_path):
+    from gui.main_window import MainWindow
+
+    fr = MainWindow().full_rip
+    side, item = _attention_side(fr, tmp_path)
+    fr._on_side_list_click(item)
+    qapp.processEvents()
+
+    assert len(fr._unresolved) == 2                  # the windows came through
+    fr._resolve_anyway()                             # "Review and place splits manually"
+    qapp.processEvents()
+
+    assert fr.diagnosis_box.isHidden()
+    assert not fr.gap_box.isHidden()                 # the existing resolve flow, entered
+    fr._album.shutdown(wait=True)
+
+
+def test_recheck_mapping_unmaps_the_side_and_returns_to_the_table(qapp, tmp_path):
+    from gui.main_window import MainWindow
+
+    fr = MainWindow().full_rip
+    fr._apply_release(_two_side_release())
+    fr._album_wavs = [tmp_path / "SideA.wav", tmp_path / "SideB.wav"]
+    fr._rebuild_mapping_table()
+    assert fr._album_mapping == [0, 1]
+
+    side, item = _attention_side(fr, tmp_path)
+    fr._on_side_list_click(item)
+    qapp.processEvents()
+
+    fr._recheck_mapping()
+    qapp.processEvents()
+
+    # Side B's row is back on skip, awaiting a fresh choice.
+    assert fr._album_mapping == [0, None]
+    assert fr.mapping_table.cellWidget(1, 1).currentData() is None
+    assert fr.diagnosis_box.isHidden()
+    assert fr._album_review_index is None
+    fr._album.shutdown(wait=True)

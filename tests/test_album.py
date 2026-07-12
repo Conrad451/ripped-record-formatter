@@ -261,3 +261,88 @@ def test_retry_refuses_a_side_that_is_not_errored():
     assert _wait_until(lambda: side.state == SideState.READY)
     assert ctrl.retry_side(0) is False        # READY is not a failure
     ctrl.shutdown(wait=True)
+
+
+# --------------------------------------------------------------------------- #
+# Guard trips are review requests, not failures
+# --------------------------------------------------------------------------- #
+def test_guard_trip_parks_needs_attention_and_keeps_the_analysis():
+    from core.album import NeedsAttention
+
+    side = SideJob(0, "Side B", Path("b.wav"))
+    proposal = {"confirmed": [10.0], "unresolved": ["window-1", "window-2"]}
+
+    def analyze(s, c):
+        raise NeedsAttention("expected 4 tracks; only 1 of 3 boundaries confirmed",
+                             proposal)
+
+    ctrl = _controller([side], analyze, lambda s, c: None)
+    ctrl.start()
+    assert _wait_until(lambda: side.state == SideState.NEEDS_ATTENTION)
+    ctrl.shutdown(wait=True)
+
+    assert side.state is SideState.NEEDS_ATTENTION
+    assert side.state is not SideState.ERROR         # not a failure
+    assert side.analysis is proposal                 # ...and the work is NOT discarded
+    assert "only 1 of 3 boundaries confirmed" in side.attention
+    assert side.error == ""                          # nothing was recorded as an error
+
+
+def test_real_exception_still_errors_and_is_retryable():
+    """I/O and decode failures keep ERROR + Retry, exactly as in v2.0.1."""
+    side = SideJob(0, "Side A", Path("a.wav"))
+
+    def analyze(s, c):
+        raise PermissionError(13, "Permission denied")
+
+    ctrl = _controller([side], analyze, lambda s, c: None)
+    ctrl.start()
+    assert _wait_until(lambda: side.state == SideState.ERROR)
+    ctrl.shutdown(wait=True)
+
+    assert side.state is SideState.ERROR
+    assert side.analysis is None                     # no usable work to keep
+    assert "Permission denied" in side.error
+    assert side.failed_phase == "analysis"
+    assert side.attention == ""
+
+
+def test_needs_attention_side_is_retryable_and_reviewable():
+    from core.album import NeedsAttention
+
+    side = SideJob(0, "Side B", Path("b.wav"))
+    calls = {"n": 0}
+
+    def analyze(s, c):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise NeedsAttention("guard tripped", {"p": 1})
+        return {"p": 2}                              # mapping fixed -> clean run
+
+    ctrl = _controller([side], analyze, lambda s, c: None)
+    ctrl.start()
+    assert _wait_until(lambda: side.state == SideState.NEEDS_ATTENTION)
+
+    # Reviewing it is allowed, exactly like a READY side.
+    ctrl.mark_resolving(0)
+    assert side.state is SideState.RESOLVING
+
+    # And retry is allowed too (the user may have fixed the mapping first).
+    side.state = SideState.NEEDS_ATTENTION
+    assert ctrl.retry_side(0) is True
+    assert _wait_until(lambda: side.state == SideState.READY)
+    ctrl.shutdown(wait=True)
+    assert side.attention == ""                      # cleared on retry
+    assert side.analysis == {"p": 2}
+
+
+def test_guard_threshold_is_a_parameter():
+    from core.split_review import wrong_side_suspected
+
+    # A 6-track side has 5 boundaries; 3 unresolved.
+    assert wrong_side_suspected(6, 3, frac=0.5) is True     # 3 > 2.5 -> flagged
+    assert wrong_side_suspected(6, 3, frac=0.8) is False    # 3 < 4.0 -> tolerated
+    assert wrong_side_suspected(6, 3, frac=0.2) is True
+    # Raising it toward 1.0 means being told less often.
+    assert wrong_side_suspected(6, 4, frac=0.9) is False
+    assert wrong_side_suspected(6, 5, frac=0.9) is True

@@ -53,6 +53,7 @@ from PySide6.QtWidgets import (
 from core import job_settings
 from core.album import (
     AlbumController,
+    NeedsAttention,
     SideJob,
     SideState,
     propose_wav_side_map,
@@ -284,12 +285,21 @@ class FullRipTab(QWidget):
         self.diagnosis_label = QLabel("")
         self.diagnosis_label.setWordWrap(True)
         diag.addWidget(self.diagnosis_label, 1)
-        reselect = QPushButton("Re-select side")
-        reselect.clicked.connect(self._reselect_side)
-        diag.addWidget(reselect)
-        resolve_anyway = QPushButton("Resolve manually anyway")
-        resolve_anyway.clicked.connect(self._resolve_anyway)
-        diag.addWidget(resolve_anyway)
+        # Single-side routes...
+        self.reselect_btn = QPushButton("Re-select side")
+        self.reselect_btn.clicked.connect(self._reselect_side)
+        diag.addWidget(self.reselect_btn)
+        self.resolve_anyway_btn = QPushButton("Resolve manually anyway")
+        self.resolve_anyway_btn.clicked.connect(self._resolve_anyway)
+        diag.addWidget(self.resolve_anyway_btn)
+        # ...and the album equivalents. Same diagnosis, same resolve flow beneath;
+        # only the way back out differs (a mapping table, not a side combo).
+        self.recheck_mapping_btn = QPushButton("Re-check mapping")
+        self.recheck_mapping_btn.clicked.connect(self._recheck_mapping)
+        diag.addWidget(self.recheck_mapping_btn)
+        self.review_manual_btn = QPushButton("Review and place splits manually")
+        self.review_manual_btn.clicked.connect(self._resolve_anyway)
+        diag.addWidget(self.review_manual_btn)
         self.diagnosis_box.setVisible(False)
         review.addWidget(self.diagnosis_box)
 
@@ -503,7 +513,9 @@ class FullRipTab(QWidget):
 
         # Wrong-side sanity guard before opening any resolve queue.
         self._unresolved = list(proposal.unresolved)
-        if self._expected_n and wrong_side_suspected(self._expected_n, len(self._unresolved)):
+        if self._expected_n and wrong_side_suspected(
+                self._expected_n, len(self._unresolved),
+                frac=self.settings.config.wrong_side_frac):
             self._show_wrong_side_diagnosis()
         elif self._unresolved:
             self._begin_gap_resolution()
@@ -515,17 +527,58 @@ class FullRipTab(QWidget):
         self._update_accept_enabled()
 
     def _show_wrong_side_diagnosis(self) -> None:
+        album = self._album is not None and self._album_review_index is not None
         n = self._expected_n
         confirmed = (n - 1) - len(self._unresolved) if n else 0
-        self.diagnosis_label.setText(
-            f"Expected {n} tracks but could only confirm {confirmed} boundaries. "
-            "This usually means the wrong side or release is selected (the side has "
-            "fewer tracks than expected)."
-        )
+
+        if album:
+            self.diagnosis_label.setText(
+                f"Expected {n} tracks; only {confirmed} boundaries confirmed. "
+                "This can mean the wrong side or release is mapped — or the record "
+                "genuinely has gapless transitions."
+            )
+        else:
+            self.diagnosis_label.setText(
+                f"Expected {n} tracks but could only confirm {confirmed} boundaries. "
+                "This usually means the wrong side or release is selected (the side has "
+                "fewer tracks than expected)."
+            )
+        # Offer the routes that actually exist in the mode you are in.
+        self.reselect_btn.setVisible(not album)
+        self.resolve_anyway_btn.setVisible(not album)
+        self.recheck_mapping_btn.setVisible(album)
+        self.review_manual_btn.setVisible(album)
+
         self.diagnosis_box.setVisible(True)
         self.gap_box.setVisible(False)
         self.waveform.set_place_mode(False)
         self._log("Full Rip: too many gaps unresolved - suspect wrong side/release.")
+
+    def _recheck_mapping(self) -> None:
+        """Back to the mapping table, with this side unmapped and awaiting a choice."""
+        self.diagnosis_box.setVisible(False)
+        index = self._album_review_index
+        side = self._album_side(index) if index is not None else None
+        label = side.label if side else "the side"
+
+        # Re-set the row that fed this side back to skip, so the user is choosing
+        # again rather than staring at the mapping that just went wrong.
+        for row, mapped in enumerate(self._album_mapping):
+            if mapped == index:
+                self._album_mapping[row] = None
+                widget = self.mapping_table.cellWidget(row, 1)
+                if widget is not None:
+                    widget.blockSignals(True)
+                    widget.setCurrentIndex(0)          # "— skip —"
+                    widget.blockSignals(False)
+                break
+
+        self._album_review_index = None
+        self._clear_review()
+        self.mapping_table.setFocus()
+        self._log(f"Album: {label} unmapped - pick the right WAV for it, then "
+                  "press 'Retry side'.")
+        self._update_retry_enabled()
 
     def _reselect_side(self) -> None:
         self.diagnosis_box.setVisible(False)
@@ -715,6 +768,11 @@ class FullRipTab(QWidget):
             return "Side analyzing..."
         if any(s == SideState.READY for s in states):
             return "A side is ready - pick it from the list to review its splits."
+        if any(s == SideState.NEEDS_ATTENTION for s in states):
+            flagged = ", ".join(x.label for x in self._album.sides
+                                if x.state == SideState.NEEDS_ATTENTION)
+            return (f"{flagged} needs attention - click it to see why and choose "
+                    "how to resolve it.")
         done = all(s in (SideState.DONE, SideState.ERROR, SideState.CANCELLED) for s in states)
         if any(s == SideState.ERROR for s in states):
             failed = ", ".join(x.label for x in self._album.sides
@@ -869,12 +927,18 @@ class FullRipTab(QWidget):
                 if side.state == SideState.ERROR and side.error:
                     phase = side.failed_phase or "processing"
                     item.setToolTip(f"{side.label} failed during {phase}:\n{side.error}")
+                elif side.state == SideState.NEEDS_ATTENTION and side.attention:
+                    item.setToolTip(f"{side.label} needs review:\n{side.attention}")
                 else:
                     item.setToolTip(f"{side.label} - {side.state.value}")
                 break
         self._update_retry_enabled()
         if side.state == SideState.READY:
             self._log(f"Album: {side.label} ready for review.")
+        elif side.state == SideState.NEEDS_ATTENTION:
+            self._log(f"Album: {side.label} needs attention - {side.attention}. "
+                      "Click it to review: re-check the mapping, or place the "
+                      "splits by hand.")
         elif side.state == SideState.ERROR:
             # Say what actually went wrong, at the moment it goes wrong. The one
             # informative line used to be the only record, and the log pane shows
@@ -910,8 +974,15 @@ class FullRipTab(QWidget):
             return                                  # already open
         if not self._confirm_discard_review():
             return
+        # A guard-tripped side opens for review exactly like a ready one -- the
+        # analysis is intact; it just arrives with a diagnosis banner. It keeps
+        # its NEEDS_ATTENTION state while under review, rather than being flipped
+        # to RESOLVING: the flag is what keeps Retry available (the user may go
+        # fix the mapping) and what tells the list why this side is different.
         if side.state in (SideState.READY, SideState.RESOLVING):
             self._album.mark_resolving(side.index)
+            self._load_side_for_review(side)
+        elif side.state == SideState.NEEDS_ATTENTION:
             self._load_side_for_review(side)
 
     def _confirm_discard_review(self) -> bool:
@@ -957,8 +1028,15 @@ class FullRipTab(QWidget):
 
     def _update_retry_enabled(self) -> None:
         side = self._selected_side()
-        self.retry_side_btn.setEnabled(
-            side is not None and side.state == SideState.ERROR and side.wav_path is not None)
+        retryable = side is not None and side.wav_path is not None and side.state in (
+            SideState.ERROR, SideState.NEEDS_ATTENTION)
+        self.retry_side_btn.setEnabled(retryable)
+        if side is not None and side.state == SideState.NEEDS_ATTENTION:
+            self.retry_side_btn.setToolTip(
+                "Retry re-analyzes with the current mapping — if nothing changed, "
+                "the result won't either.")
+        else:
+            self.retry_side_btn.setToolTip("Re-run the selected failed side from scratch.")
 
     def _retry_selected_side(self) -> None:
         side = self._selected_side()
@@ -988,7 +1066,12 @@ class FullRipTab(QWidget):
                                   [p.confidence for p in analysis.proposal.split_points])
         self._unresolved = list(analysis.proposal.unresolved)
         self.accept_button.setText("Accept side")
-        if self._unresolved:
+        if getattr(side, "attention", ""):
+            # The guard tripped. Say so, and let the user choose between fixing
+            # the mapping and placing the splits by hand -- the same resolve flow
+            # the single-side path has always had, just reachable from here.
+            self._show_wrong_side_diagnosis()
+        elif self._unresolved:
             self._begin_gap_resolution()
         else:
             self.gap_box.setVisible(False)
@@ -1131,13 +1214,22 @@ class FullRipTab(QWidget):
         else:
             proposal = propose_splits(restored, params=params)
 
-        n = len(side.titles) or None
-        if n and wrong_side_suspected(n, len(proposal.unresolved)):
-            raise RuntimeError(
-                f"wrong side/release suspected: {len(proposal.unresolved)} of {n - 1} "
-                "boundaries unresolved")
         envelope = load_peak_envelope(restored)
-        return AnalyzeResult(result, proposal, envelope, restored)
+        analysis = AnalyzeResult(result, proposal, envelope, restored)
+
+        # The sanity guard used to raise here, which the controller turned into
+        # ERROR -- throwing away a perfectly good proposal and leaving Retry as
+        # the only exit, on input that deterministically re-fails. A guard trip
+        # is a request for review, so hand the analysis over with it.
+        n = len(side.titles) or None
+        if n and wrong_side_suspected(n, len(proposal.unresolved),
+                                      frac=cfg.wrong_side_frac):
+            confirmed = (n - 1) - len(proposal.unresolved)
+            raise NeedsAttention(
+                f"expected {n} tracks; only {confirmed} of {n - 1} boundaries confirmed",
+                analysis,
+            )
+        return analysis
 
     def _album_encode(self, side, should_cancel):
         """Runs on an AlbumController thread -- no widget access."""
