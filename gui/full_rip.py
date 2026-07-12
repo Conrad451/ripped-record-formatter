@@ -511,10 +511,16 @@ class FullRipTab(QWidget):
         if not (0 <= idx < len(self._sides)):
             return
         side = self._sides[idx]
-        self._expected_titles = [self._flat_titles[i] for i in side.track_indices]
+        # Bounds-check: sides can outlive the flat tracklist they were built from
+        # (a release replaced by a shorter one, sides defined by hand). _set_sides
+        # already guards _side_track_infos this way; these two did not, and an
+        # over-long side_index raised IndexError straight out of a signal handler.
+        self._expected_titles = [self._flat_titles[i] for i in side.track_indices
+                                 if i < len(self._flat_titles)]
         self._expected_n = side.track_count
-        durations = [self._flat_durations_ms[i] for i in side.track_indices]
-        self._expected_durations_s = [d / 1000.0 for d in durations] if all(durations) else []
+        durations = [self._flat_durations_ms[i] for i in side.track_indices
+                     if i < len(self._flat_durations_ms)]
+        self._expected_durations_s = [d / 1000.0 for d in durations] if durations and all(durations) else []
         self._review_track_infos = self._side_track_infos.get(side.index, [])
         self._review_side_position = side.index + 1
         self._warn_single_track()
@@ -1152,9 +1158,22 @@ class FullRipTab(QWidget):
         )
         out_dir = Path(self._album_output_root)
         configure_pydub()
-        convert_wavs_to_flacs(tracks, out_dir, configure=False, cover=self._cover,
-                              max_workers=self.settings.config.encode_workers,
-                              should_cancel=should_cancel)
+
+        # The single-side path surfaces batch.warnings via _on_encode_done; the
+        # album path used to throw the BatchResult away, so a failed tag write or
+        # cover embed ("Could not write tags: ...", "Could not embed cover art:
+        # ...") vanished silently and looked like the album path simply not
+        # tagging. Warnings are per-track and never fail the batch, so they have
+        # to be reported or they are lost. _log emits a signal, which is safe to
+        # call from this worker thread.
+        if self._release is None:
+            self._log(f"Album: {side.label} - no release loaded, writing minimal tags "
+                      "and no cover art. Use 'Look up release...' for full metadata.")
+        batch = convert_wavs_to_flacs(tracks, out_dir, configure=False, cover=self._cover,
+                                      max_workers=self.settings.config.encode_workers,
+                                      should_cancel=should_cancel)
+        for warning in batch.warnings:
+            self._log(f"  ! {side.label}: {warning}")
 
     def _cleanup_work_dir(self) -> None:
         if self._work_dir is not None:
