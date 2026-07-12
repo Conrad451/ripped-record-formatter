@@ -94,6 +94,55 @@ def guess_side_index(filename: str) -> int | None:
     return _guess(Path(filename).stem)[0]
 
 
+def propose_wav_side_map(wav_paths, num_sides: int) -> list[int | None]:
+    """Propose a side for each WAV, in the order given; ``None`` means *skip*.
+
+    The inverse of :func:`map_wavs_to_sides`: one entry per **WAV** rather than
+    per side, because a folder may hold WAVs from several albums and the user
+    works through one album at a time. Anything this function is not confident
+    about is left unmapped, and unmapped rows are simply excluded from the job.
+
+    Confident means the filename actually names a side -- ``SideA``, ``side_b``,
+    ``side-2``, or a lone ``A``. A file with no side hint (``bonus.wav``,
+    ``track01.wav``) is **never** guessed into a slot: it stays ``None``. If two
+    files claim the same side, the stronger hint wins ("SideA" beats a bare "A")
+    and the loser is left unmapped for the user to resolve -- we do not silently
+    bump it elsewhere.
+    """
+    paths = [Path(p) for p in wav_paths]
+    proposal: list[int | None] = [None] * len(paths)
+    taken: set[int] = set()
+
+    # Strength-ordered so an explicit "SideA" claims the slot before a bare "A".
+    # Ties inside a strength band break on filename, for determinism.
+    ranked = sorted(
+        ((i, *_guess(p.stem)) for i, p in enumerate(paths)),
+        key=lambda t: (-t[2], paths[t[0]].name.lower()),
+    )
+    for i, idx, strength in ranked:
+        if strength == 0 or idx is None:
+            continue                      # no side hint -> skip, never guess
+        if not 0 <= idx < num_sides or idx in taken:
+            continue                      # out of range, or someone stronger took it
+        proposal[i] = idx
+        taken.add(idx)
+    return proposal
+
+
+def sides_from_proposal(wav_paths, proposal) -> dict[int, Path]:
+    """``{side_index: wav}`` for mapped rows only -- skipped rows are dropped.
+
+    This is what turns a mapping table into a job: a row left on "skip" (``None``)
+    contributes nothing, so a folder holding two albums' worth of WAVs yields a
+    job containing only the sides the user actually mapped.
+    """
+    return {
+        idx: Path(path)
+        for path, idx in zip(wav_paths, proposal)
+        if idx is not None
+    }
+
+
 def map_wavs_to_sides(wav_paths, num_sides: int) -> list[Path | None]:
     """Propose one WAV per side (index 0..num_sides-1); ``None`` where unsure.
 

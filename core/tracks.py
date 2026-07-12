@@ -61,12 +61,33 @@ class Tracks:
     mb_recording_id: str = ""               # MUSICBRAINZ_RECORDINGID (recording MBID)
     mb_track_id: str = ""                   # MUSICBRAINZ_TRACKID (release-track MBID)
 
+    # --- filename-only numbering (never touches tags) ---
+    # Album jobs write every side into one flat folder, so the *filename* needs a
+    # number unique across the whole album while TRACKNUMBER stays per-side. These
+    # three fields drive :meth:`filename` and nothing else -- :meth:`vorbis_tags`
+    # ignores them entirely.
+    file_index: int | None = None           # album-wide 1-based number; None -> use track_num
+    side_letter: str = ""                   # "A", "B", ... for the [A01] style
+    use_side_letters: bool = False          # switch filename style to [A01]/[B01]
+
     def __post_init__(self) -> None:
         self.track_num = int(self.track_num)
         self.track_wav_loc = Path(self.track_wav_loc)
 
     def filename(self) -> str:
         """Output filename: ``[NN] - name.flac`` with 2-digit zero padding.
+
+        Three numbering styles, chosen by the fields set on this track -- all of
+        them *filename-only*, none of them visible in the tags:
+
+        * ``use_side_letters`` + a ``side_letter`` -> ``[A01]``, ``[B01]`` --
+          the per-side number, prefixed by its side. Unique across an album
+          because the letter disambiguates.
+        * ``file_index`` set -> ``[01]``..``[NN]`` continuing across sides. This
+          is what album jobs use: every side lands in one flat folder, so the
+          number has to be album-wide even though TRACKNUMBER stays per-side.
+        * neither -> ``[NN]`` from :attr:`track_num`. The single-side default,
+          unchanged.
 
         The title is sanitized for the filesystem (so a pasted title like
         ``"Intro / Outro"`` cannot produce an invalid path); the *tags* keep the
@@ -76,7 +97,14 @@ class Tracks:
         name = sanitize_filename_component(self.track_name)
         if not name:
             name = f"Track {self.track_num:02d}"
-        return f"[{self.track_num:02d}] - {name}.flac"
+
+        if self.use_side_letters and self.side_letter:
+            number = f"{self.side_letter}{self.track_num:02d}"
+        elif self.file_index is not None:
+            number = f"{self.file_index:02d}"
+        else:
+            number = f"{self.track_num:02d}"
+        return f"[{number}] - {name}.flac"
 
     def tags(self) -> dict[str, str]:
         """Metadata tags for the encoder.

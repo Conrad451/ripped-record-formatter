@@ -44,6 +44,14 @@ class Config:
     last_artist: str = ""
     last_album: str = ""
 
+    # --- output naming ---
+    filename_side_letters: bool = False
+    """Album jobs write every side into one flat output folder. Off (default):
+    filenames are numbered continuously across the album -- ``[01]``..``[NN]``,
+    side B carrying on where side A stopped. On: filenames use the per-side
+    number prefixed by its side letter instead -- ``[A01]``, ``[B01]``. Either
+    way the *tags* are untouched: TRACKNUMBER/TRACKTOTAL stay per-side."""
+
     # --- restoration: per-stage enable toggles (chain order is fixed:
     #     rumble -> hum -> noise -> declick) ---
     rumble_enabled: bool = True
