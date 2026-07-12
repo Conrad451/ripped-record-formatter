@@ -60,6 +60,7 @@ from core.album import (
 from core.side_partition import Side
 from core.split_review import detect_progressive_drift, segment_deviations, wrong_side_suspected
 from core.timefmt import format_timestamp
+from gui.release_preview import NO_COVER_TEXT, ReleasePreview
 from gui.side_editor import SideEditorDialog, side_letter
 from gui.track_model import Row, TrackTableModel, TrackTableView
 from gui.waveform import WaveformView
@@ -233,6 +234,11 @@ class FullRipTab(QWidget):
         meta_row.addWidget(self.lookup_button)
         form.addRow("Metadata:", self._wrap(meta_row))
 
+        # Always-visible summary of what is actually loaded. Its job is to make
+        # a missing cover obvious *now* rather than after the album is encoded.
+        self.release_preview = ReleasePreview()
+        form.addRow("", self.release_preview)
+
         side_row = QHBoxLayout()
         self.side_combo = QComboBox()
         self.side_combo.addItem("Select a release to choose a side...", None)
@@ -401,8 +407,11 @@ class FullRipTab(QWidget):
             start += count
         self._set_sides(sides)
         self.define_sides_button.setEnabled(bool(self._flat_titles))
+        self.release_preview.set_release(detail)
         self._log(f"Full Rip: release '{detail.title}' loaded "
                   f"({len(detail.media)} side(s), cover={'yes' if detail.cover else 'no'}).")
+        if detail.cover is None:
+            self._log(f"  ! {NO_COVER_TEXT} - tracks will be tagged without a picture.")
 
     def _set_sides(self, sides: list[Side]) -> None:
         self._sides = sides

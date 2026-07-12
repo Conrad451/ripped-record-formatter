@@ -378,3 +378,70 @@ def test_no_internal_staging_path_is_ever_displayed(qapp):
         text = edit.text().lower()
         for leak in ("rrf_fullrip_", "rrf_album_", "rrf_restore_", "rrf_split_", "\tmp", "/tmp"):
             assert leak not in text, f"staging path leaked into a display field: {edit.text()}"
+
+
+# --------------------------------------------------------------------------- #
+# Release preview: an absent cover must be loud, and visible before encoding
+# --------------------------------------------------------------------------- #
+def _release_with(cover):
+    from core.metadata_lookup import MediumInfo, ReleaseDetail, TrackInfo
+
+    return ReleaseDetail(
+        "rel", "Kind of Blue", "Miles Davis", year="1959", country="US", cover=cover,
+        media=(MediumInfo(1, "Vinyl", tracks=tuple(
+            TrackInfo(i + 1, str(i + 1), f"T{i + 1}", 180000) for i in range(5))),),
+    )
+
+
+def test_release_preview_shouts_when_there_is_no_cover(qapp):
+    from gui.main_window import MainWindow
+    from gui.release_preview import NO_COVER_TEXT
+
+    fr = MainWindow().full_rip
+    assert fr.release_preview.isHidden()             # nothing loaded yet
+
+    fr._apply_release(_release_with(None))
+
+    assert not fr.release_preview.isHidden()
+    assert NO_COVER_TEXT in fr.release_preview.cover_label.text()
+    assert fr.release_preview.thumb.text() == "NO\nART"
+    assert fr.release_preview.thumb.pixmap().isNull()
+    # ...and the summary is still there alongside the warning.
+    assert fr.release_preview.title_label.text() == "Miles Davis - Kind of Blue"
+    assert "1959" in fr.release_preview.detail_label.text()
+    assert "1 side, 5 tracks" in fr.release_preview.detail_label.text()
+
+
+def test_release_preview_shows_real_art_quietly(qapp):
+    from core.metadata_lookup import CoverArt
+    from gui.main_window import MainWindow
+    from gui.release_preview import NO_COVER_TEXT
+    from PySide6.QtCore import QBuffer
+    from PySide6.QtGui import QImage
+
+    # A real, decodable 8x8 PNG.
+    image = QImage(8, 8, QImage.Format.Format_RGB32)
+    image.fill(0x336699)
+    buf = QBuffer()
+    buf.open(QBuffer.OpenModeFlag.WriteOnly)
+    image.save(buf, "PNG")
+    cover = CoverArt(data=bytes(buf.data()), mime="image/png")
+
+    fr = MainWindow().full_rip
+    fr._apply_release(_release_with(cover))
+
+    assert not fr.release_preview.thumb.pixmap().isNull()   # art rendered
+    assert fr.release_preview.thumb.text() == ""
+    assert NO_COVER_TEXT not in fr.release_preview.cover_label.text()
+    assert fr.release_preview.cover_label.text() == ""
+
+
+def test_no_cover_is_visible_in_the_lookup_before_choosing(qapp):
+    """The dialog says it too -- so a coverless release can be rejected up front."""
+    from gui.metadata_panel import MetadataPanel
+    from gui.release_preview import NO_COVER_TEXT
+
+    panel = MetadataPanel()
+    panel._populate_cover(_release_with(None))
+    assert NO_COVER_TEXT in panel.cover_label.text()
+    assert panel.cover_label.pixmap().isNull()
