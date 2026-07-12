@@ -123,6 +123,10 @@ class MetadataPanel(QWidget):
         self._pool = QThreadPool.globalInstance()
         self._results: list[ReleaseResult] = []
         self._busy = False
+        # Highlighting a result previews it; cache so committing to it, or coming
+        # back to it, costs no extra round trip (MusicBrainz allows 1 req/s).
+        self._detail_cache: dict[str, ReleaseDetail] = {}
+        self._preview_id: str | None = None
 
         root = QVBoxLayout(self)
 
@@ -151,7 +155,7 @@ class MetadataPanel(QWidget):
         self.results_table.verticalHeader().setVisible(False)
         self.results_table.verticalHeader().setDefaultSectionSize(20)  # compact rows
         self.results_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.results_table.itemSelectionChanged.connect(self._update_choose_enabled)
+        self.results_table.itemSelectionChanged.connect(self._on_selection_changed)
         self.results_table.doubleClicked.connect(self._start_fetch_detail)
 
         top = QWidget()
@@ -195,6 +199,19 @@ class MetadataPanel(QWidget):
         # --- status ---------------------------------------------------------
         self.status_label = QLabel("Enter an artist and/or album, then Search.")
         root.addWidget(self.status_label)
+
+    def search_on_open(self) -> bool:
+        """Search straight away if the fields were seeded. Returns whether it ran.
+
+        A caller that opens this panel with an artist/album already filled in has
+        an intent; re-typing nothing and pressing Search adds a click and no
+        information. With both fields empty there is nothing to search for, so we
+        wait for input as before.
+        """
+        if not (self.artist_edit.text().strip() or self.album_edit.text().strip()):
+            return False
+        self._start_search()
+        return True
 
     # -- splitter persistence ------------------------------------------------
     def _restore_split(self) -> None:
@@ -288,6 +305,61 @@ class MetadataPanel(QWidget):
     def _update_choose_enabled(self) -> None:
         self.choose_button.setEnabled(not self._busy and self._selected_row() is not None)
 
+    # -- preview on highlight ------------------------------------------------
+    def _on_selection_changed(self) -> None:
+        """Fetch and preview the highlighted release -- before it is committed to.
+
+        The preview box used to be filled only by _on_detail_done, which fires on
+        "Use selected release" and immediately emits releaseSelected -- and the
+        Full Rip host closes the dialog on that signal. So the cover was painted
+        into a widget that was already going away: the art was rendered for
+        roughly zero frames, and the picker looked as though it never had any.
+        Cover presence was undiscoverable at exactly the moment it mattered.
+
+        Now highlighting a row previews it. Fetches are cached per release and
+        run on the thread pool; a stale reply (the user moved on) is discarded.
+        """
+        self._update_choose_enabled()
+        row = self._selected_row()
+        if row is None:
+            return
+        release_id = self._results[row].release_id
+
+        cached = self._detail_cache.get(release_id)
+        if cached is not None:
+            self._show_preview(cached)
+            return
+
+        self._preview_id = release_id
+        self.track_table.setRowCount(0)
+        self.cover_label.setPixmap(QPixmap())
+        self.cover_label.setText("Loading cover...")
+        self.cover_label.setStyleSheet(_COVER_STYLE)
+
+        task = _CallableTask(self._get_provider().get_release, release_id)
+        task.signals.done.connect(self._on_preview_done)
+        task.signals.error.connect(self._on_preview_error)
+        self._pool.start(task)
+
+    def _on_preview_done(self, detail: ReleaseDetail) -> None:
+        self._detail_cache[detail.release_id] = detail
+        if detail.release_id != self._preview_id:
+            return                      # the user has moved on; stale reply
+        self._show_preview(detail)
+
+    def _on_preview_error(self, message: str) -> None:
+        self.cover_label.setPixmap(QPixmap())
+        self.cover_label.setText("Could not load preview")
+        self.cover_label.setStyleSheet(_NO_COVER_STYLE)
+        self._set_status(message)
+
+    def _show_preview(self, detail: ReleaseDetail) -> None:
+        self._populate_tracks(detail)
+        self._populate_cover(detail)
+        art = "with cover art" if detail.cover else NO_COVER_TEXT
+        self._set_status(f"{detail.title} - {detail.track_count} track(s), {art}.")
+
+    # -- commit --------------------------------------------------------------
     def _start_fetch_detail(self, *args) -> None:
         if self._busy:
             return
@@ -295,6 +367,13 @@ class MetadataPanel(QWidget):
         if row is None:
             return
         result = self._results[row]
+
+        # Highlighting already fetched this; commit without a second round trip.
+        cached = self._detail_cache.get(result.release_id)
+        if cached is not None:
+            self._on_detail_done(cached)
+            return
+
         self._set_busy(True)
         self._set_status(f"Fetching tracklist for {result.title!r}...")
         task = _CallableTask(self._get_provider().get_release, result.release_id)
@@ -303,6 +382,7 @@ class MetadataPanel(QWidget):
         self._pool.start(task)
 
     def _on_detail_done(self, detail: ReleaseDetail) -> None:
+        self._detail_cache[detail.release_id] = detail
         self._populate_tracks(detail)
         self._populate_cover(detail)
         self._set_busy(False)
@@ -310,6 +390,8 @@ class MetadataPanel(QWidget):
         self._set_status(
             f"{detail.title} - {detail.track_count} track(s), {art}. Ready to use."
         )
+        # Carries the cover bytes with it, so the host's preview row shows the
+        # same art (or the same loud warning) the dialog just showed.
         self.releaseSelected.emit(detail)
 
     def _populate_tracks(self, detail: ReleaseDetail) -> None:

@@ -162,7 +162,7 @@ class FullRipTab(QWidget):
         # "Add single WAV..." and a one-row mapping table.
 
         # --- 1. Source: the primary and only entry point ------------------------
-        self.album_box = QGroupBox("Source - pick the folder holding this record's side WAVs")
+        self.album_box = QGroupBox("Source")
         album_layout = QVBoxLayout(self.album_box)
         pick_row = QHBoxLayout()
         folder_btn = QPushButton("Select folder...")
@@ -188,9 +188,9 @@ class FullRipTab(QWidget):
         album_layout.addLayout(pick_row)
 
         self.mapping_hint = QLabel(
-            "One row per WAV found. Set the side for the files belonging to this "
-            "record; leave anything else on — skip —. Only mapped rows are "
-            "processed — run again with a different mapping for the next album."
+            "Select the folder containing your ripped WAV files. Assign each file "
+            "to a side of the record — files left on “skip” are ignored, so you "
+            "can keep multiple albums in one folder and process one at a time."
         )
         self.mapping_hint.setWordWrap(True)
         album_layout.addWidget(self.mapping_hint)
@@ -377,6 +377,10 @@ class FullRipTab(QWidget):
         panel.statusMessage.connect(self._log)
         panel.releaseSelected.connect(lambda detail: (self._apply_release(detail), dialog.accept()))
         layout.addWidget(panel)
+        # Clicking "Look up release..." with artist/album already filled in *is*
+        # the search intent; making the user press Search again is friction. An
+        # empty open still waits for input.
+        panel.search_on_open()
         dialog.exec()
 
     def _apply_release(self, detail) -> None:

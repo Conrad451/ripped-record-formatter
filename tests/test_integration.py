@@ -170,9 +170,20 @@ def test_full_rip_populated_side_picker_after_release(qapp):
 
 
 def _wait(predicate, timeout=4.0):
+    """Wait for a condition, pumping the Qt event loop.
+
+    Worker results arrive as queued signals, so a plain sleep loop would never
+    see them -- the slots only run when the event loop is spun.
+    """
     import time
+
+    from PySide6.QtWidgets import QApplication
+
     deadline = time.time() + timeout
     while time.time() < deadline:
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents()
         if predicate():
             return True
         time.sleep(0.01)
@@ -682,3 +693,119 @@ def test_retry_button_reruns_the_failed_side(qapp, tmp_path):
     assert side.error == ""
     assert not fr.retry_side_btn.isEnabled()     # nothing to retry any more
     fr._album.shutdown(wait=True)
+
+
+# --------------------------------------------------------------------------- #
+# Lookup dialog: opens pre-searched, and previews art before you commit
+# --------------------------------------------------------------------------- #
+class _StubProvider:
+    """A MetadataProvider that answers instantly, in-process."""
+
+    name = "stub"
+
+    def __init__(self, cover=None):
+        from core.metadata_lookup import MediumInfo, ReleaseDetail, ReleaseResult, TrackInfo
+
+        self.searches = []
+        self._results = [ReleaseResult("rel-1", "Kind of Blue", "Miles Davis",
+                                       year="1959", formats="Vinyl")]
+        self._detail = ReleaseDetail(
+            "rel-1", "Kind of Blue", "Miles Davis", year="1959", cover=cover,
+            media=(MediumInfo(1, "Vinyl", tracks=(TrackInfo(1, "1", "So What", 300000),)),))
+
+    def search_releases(self, artist, album, *, limit=25):
+        self.searches.append((artist, album))
+        return self._results
+
+    def get_release(self, release_id, *, with_cover=True):
+        return self._detail
+
+
+def _png_cover():
+    from core.metadata_lookup import CoverArt
+    from PySide6.QtCore import QBuffer
+    from PySide6.QtGui import QImage
+
+    img = QImage(8, 8, QImage.Format.Format_RGB32)
+    img.fill(0x336699)
+    buf = QBuffer()
+    buf.open(QBuffer.OpenModeFlag.WriteOnly)
+    img.save(buf, "PNG")
+    return CoverArt(data=bytes(buf.data()), mime="image/png")
+
+
+def test_lookup_auto_searches_when_seeded_and_waits_when_empty(qapp):
+    from gui.metadata_panel import MetadataPanel
+
+    provider = _StubProvider()
+    panel = MetadataPanel(provider=provider)
+
+    # Empty fields: nothing to search for, so it waits for input as before.
+    assert panel.search_on_open() is False
+    assert provider.searches == []
+
+    # Seeded by the caller (the user already expressed intent): fire immediately.
+    panel.artist_edit.setText("Miles Davis")
+    panel.album_edit.setText("Kind of Blue")
+    assert panel.search_on_open() is True
+    assert _wait(lambda: provider.searches == [("Miles Davis", "Kind of Blue")])
+
+
+def test_highlighting_a_result_previews_its_cover_before_committing(qapp):
+    """The blindness fix: art is visible on highlight, not painted into a dialog
+    that is already closing."""
+    from gui.metadata_panel import MetadataPanel
+
+    panel = MetadataPanel(provider=_StubProvider(cover=_png_cover()))
+    panel.artist_edit.setText("Miles Davis")
+    panel.search_on_open()
+    assert _wait(lambda: panel.results_table.rowCount() == 1)
+
+    committed = []
+    panel.releaseSelected.connect(committed.append)
+
+    panel.results_table.selectRow(0)                 # just highlight it
+    assert _wait(lambda: not panel.cover_label.pixmap().isNull())
+    qapp.processEvents()
+
+    assert not panel.cover_label.pixmap().isNull()   # art shown...
+    assert panel.track_table.rowCount() == 1         # ...and the tracklist
+    assert committed == []                           # ...without committing
+
+
+def test_highlighting_a_coverless_result_shows_the_loud_warning(qapp):
+    from gui.metadata_panel import MetadataPanel
+    from gui.release_preview import NO_COVER_TEXT
+
+    panel = MetadataPanel(provider=_StubProvider(cover=None))
+    panel.artist_edit.setText("Miles Davis")
+    panel.search_on_open()
+    assert _wait(lambda: panel.results_table.rowCount() == 1)
+
+    panel.results_table.selectRow(0)
+    assert _wait(lambda: NO_COVER_TEXT in panel.cover_label.text())
+    assert panel.cover_label.pixmap().isNull()
+
+
+def test_use_this_release_delivers_the_art_to_the_main_preview(qapp):
+    """releaseSelected carries the cover bytes, and the main tab renders them."""
+    from gui.main_window import MainWindow
+    from gui.metadata_panel import MetadataPanel
+
+    fr = MainWindow().full_rip
+    panel = MetadataPanel(provider=_StubProvider(cover=_png_cover()))
+    panel.releaseSelected.connect(fr._apply_release)      # as _open_lookup wires it
+
+    panel.artist_edit.setText("Miles Davis")
+    panel.search_on_open()
+    assert _wait(lambda: panel.results_table.rowCount() == 1)
+    panel.results_table.selectRow(0)
+    assert _wait(lambda: not panel.cover_label.pixmap().isNull())
+
+    panel._start_fetch_detail()                          # "Use selected release"
+    assert _wait(lambda: fr._release is not None)
+    qapp.processEvents()
+
+    assert not fr.release_preview.isHidden()
+    assert not fr.release_preview.thumb.pixmap().isNull()   # same art on the main tab
+    assert fr.release_preview.title_label.text() == "Miles Davis - Kind of Blue"
