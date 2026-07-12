@@ -2,22 +2,23 @@
 
 How to reproduce a working build from a clean clone.
 
-**From source is the only supported way to run the app today** — there is no
-packaged build (see [Packaging a standalone executable](#packaging-a-standalone-executable)),
-and no command-line interface. The README says the same.
+Two ways to run it: **from source** (below), or the **packaged bundle** — a
+self-contained `RippedRecordFormatter.exe` needing no Python, no ffmpeg and no
+network. See [Packaging a standalone executable](#packaging-a-standalone-executable).
+There is still no command-line interface.
 
 ## Deferred work
 
 Tracked here so it is not rediscovered later:
 
-- **Packaging.** No PyInstaller spec for the Qt app yet — details below.
 - **CLI.** Deferred by decision. `core/` is UI-agnostic precisely so one can be
   added later without touching the logic.
 - **`requirements.txt` is not pruned.** It still carries the legacy interactive
   script's dependencies (`tk`/`Tcl`, `tqdm`, `alive-progress`, `colorama`), which
   the Qt app does not import. They stay until `v2/` and its pins are retired
   *together* — pruning them first would break the legacy script, which is still
-  on `main`.
+  on `main`. (The packaged bundle already excludes them — see the bundle diet.)
+- **The bundle is not code-signed.** Windows SmartScreen will warn on first run.
 
 ## Prerequisites
 
@@ -73,6 +74,9 @@ python app.py
 The app resolves ffmpeg itself, through `core/ffmpeg_locator.py` — nothing else in
 the codebase is allowed to reach for the binary directly. Resolution order:
 
+0. **An ffmpeg bundled inside the frozen app.** Packaged builds only, and checked
+   first — see [ffmpeg resolution: frozen vs. dev](#ffmpeg-resolution-frozen-vs-dev).
+   Running from source this step is inert, so what follows is unchanged.
 1. **An ffmpeg managed by the `ffmpeg-downloader` package** — a static build
    unpacked into the per-user data directory. This is the preferred path: no admin
    rights, no system `PATH` pollution.
@@ -96,26 +100,125 @@ of the app keeps working.
 
 ## Packaging a standalone executable
 
-<!-- TODO(packaging): No PyInstaller spec exists for the PySide6 app yet. The
-     .gitignore already reserves *.spec (it is deliberately NOT ignored) so a
-     hand-tuned spec can be committed once written. Work still to do:
-       - author a .spec for app.py covering PySide6 plugins and the scipy/numpy
-         binary deps that PyInstaller's analysis routinely misses
-       - decide whether ffmpeg is bundled into the frozen app or left to the
-         per-user ffmpeg-downloader path (ffmpeg_locator.py is the single place
-         that would change — it was written with exactly this in mind)
-       - AGPLv3 means the corresponding source must be offered with any binary
-         you distribute
-       - then measure and record: bundle size, cold-start time, and a smoke test
-         of the frozen exe on a machine with no Python installed
-     The legacy v2 terminal app's spec is preserved at tag archive/v3-exe
-     (v2/ripped_record_formatter.spec) for reference only — it targets the old
-     console script, not the current Qt app. -->
+A **onedir** bundle: `dist/RippedRecordFormatter/` containing
+`RippedRecordFormatter.exe` (windowed) and `FrozenSmoke.exe` (the verification
+harness — see [frozen-smoke.md](frozen-smoke.md)). It is **self-contained**: it
+needs no Python, no ffmpeg and no network.
 
-**TODO** — not implemented yet. `pyinstaller` is already pinned in
-`requirements.txt`, and `.gitignore` deliberately does *not* ignore `*.spec` so a
-hand-tuned spec can be versioned once it exists. Until then the from-source path
-above is the only supported way to run the app.
+### Build it
 
-Note that AGPLv3 obliges you to offer the corresponding source alongside any
-binary you distribute.
+From a clean clone, with the venv from [above](#from-a-clean-clone) active:
+
+```bash
+python scripts/fetch_ffmpeg.py                                   # once
+python -m PyInstaller RippedRecordFormatter.spec --noconfirm
+```
+
+`build/` and `dist/` are gitignored; the spec is committed.
+
+### The pinned ffmpeg
+
+`scripts/fetch_ffmpeg.py` downloads one exact, immutable build into `vendor/`
+(gitignored — a 200 MB binary does not belong in a source repo):
+
+| | |
+| --- | --- |
+| Version | **ffmpeg 8.1.2-essentials_build** (gyan.dev static build) |
+| URL | `https://github.com/GyanD/codexffmpeg/releases/download/8.1.2/ffmpeg-8.1.2-essentials_build.zip` |
+| sha256 (zip) | `db580001caa24ac104c8cb856cd113a87b0a443f7bdf47d8c12b1d740584a2ec` |
+| Shipped | `ffmpeg.exe` (98 MB) + `ffprobe.exe` (97 MB). `ffplay` is not shipped |
+
+The script refuses to proceed if the download's size does not match, so a moved
+release cannot silently change what we ship.
+
+**ffprobe is required, not optional.** pydub shells out to it to read a FLAC when
+re-tagging; the re-tag path fails outright without it (verified by hiding it and
+watching `test_retag_same_path_guard` fail).
+
+We pin rather than reuse whatever `ffmpeg-downloader` left in the developer's
+data dir, because that is "whatever was latest the day they first ran the app" —
+not reproducible, and two machines would produce two different bundles.
+
+### ffmpeg resolution: frozen vs. dev
+
+`core/ffmpeg_locator.py` resolves in this order:
+
+0. **Bundled** — `ffmpeg/ffmpeg.exe` inside the frozen app (`sys._MEIPASS`, or
+   `_internal/` beside the exe). *Frozen only, and checked first*: the packaged
+   app must work with no ffmpeg installed and no network, and must not be at the
+   mercy of a stale ffmpeg on the user's `PATH`.
+1. The `ffmpeg-downloader`-managed per-user copy — what a developer running from
+   source gets.
+2. `ffmpeg` on `PATH`.
+
+Then, if `auto_download` is set, it fetches one. **A frozen app never gets past
+step 0**, which is what makes it network-free. Running from source, step 0 is
+inert (`sys.frozen` is unset) so dev behaviour is exactly as it always was.
+
+### Bundle diet
+
+`noisereduce` *declares* matplotlib as a dependency but only imports it inside
+`noisereduce/plotting.py`, a debug-visualisation module this app never touches —
+verified: a real `reduce_noise()` call imports none of the matplotlib family. The
+spec excludes it, along with pillow / fontTools / contourpy, tkinter (the legacy
+`v2/` script's dependency), and the Qt modules we never load.
+
+| | Size |
+| --- | --- |
+| Without the diet | **489 MB** |
+| With the diet | **454 MB** (app only) |
+| Shipped bundle | **468 MB** (adds `FrozenSmoke.exe`) |
+
+Cold start: **~0.9 s** to a visible window (3 runs: 0.98 / 0.85 / 0.82 s).
+
+The bundle is dominated by things that cannot be dieted away: **ffmpeg 195 MB**
+(two static binaries), **Qt 122 MB**, **SciPy 68 MB**, **NumPy 28 MB**.
+
+### AGPL
+
+The bundle ships `LICENSE` and a generated `SOURCE.txt` naming the repository and
+the **exact commit** it was built from. Distributing the binary obliges us to
+offer the corresponding source; `SOURCE.txt` is that offer, made concrete. It
+also records that ffmpeg is redistributed under its own separate licence.
+
+### Verify before shipping
+
+Run [`frozen-smoke.md`](frozen-smoke.md)'s ritual. `FrozenSmoke.exe` exercises
+every subsystem *in the frozen environment* — Qt, pyqtgraph, SciPy, soundfile,
+noisereduce, mutagen, QtMultimedia, PortAudio, the bundled ffmpeg, and one full
+restore → split → encode. Eleven checks; all must pass.
+
+### Stakeholder checklist — what one machine cannot prove
+
+A dev machine has Python, ffmpeg and audio drivers already installed, so it
+**cannot** prove the bundle stands alone. On a second machine:
+
+1. Copy **`dist\RippedRecordFormatter\`** across — that is the folder containing
+   `_internal\`, `RippedRecordFormatter.exe` and `FrozenSmoke.exe`. It is the
+   whole product. (`build\` is PyInstaller's scaffolding, not the product; ignore
+   it.) Do not install anything.
+2. Run `FrozenSmoke.exe` — **double-clicking it is fine**, the window now stays
+   open until you press Enter. Expect **11/11 passed**; send the output back if
+   not. On a machine with no sound card the two audio checks report `[SKIP]` and
+   the summary reads *"9/11 passed, 2 skipped: no audio hardware"* — that is
+   expected and is not a bundle defect. Only a `[FAIL]` is.
+3. Launch `RippedRecordFormatter.exe`. Confirm the window opens and the title
+   shows the version.
+4. Time the launch. Confirm the delay to a visible window is acceptable
+   (~1 s here; a slower disk or a cold file cache will be worse).
+5. Open all six tabs; confirm none errors.
+6. **Record** tab: confirm the device list is populated for *that* machine's
+   hardware and the meters move when audio is playing in.
+7. Record a few seconds, press Stop, confirm the WAV lands and the clip/peak
+   readout looked sane.
+8. **Full Rip** → *Add single WAV…* → point it at that recording → **Analyze**.
+   Confirm the waveform draws and splits are proposed.
+9. Accept a side and confirm a tagged FLAC is written.
+10. Press **Play** / **Preview cut** on the audition player and confirm you hear
+    audio through *that* machine's output.
+
+If you cannot get a second machine, approximate it on this one: rename
+`%LOCALAPPDATA%fmpegio` away and sanitise `PATH` before running (this is what
+the dev build was verified against), but note that Qt/audio drivers already
+present cannot be hidden this way.
+

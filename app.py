@@ -11,9 +11,16 @@ any sys.path juggling. The legacy terminal UI remains available at
 
 import sys
 
-from PySide6.QtWidgets import QApplication
+# Before anything imports pydub: put the resolved ffmpeg on PATH so pydub's
+# import-time probe finds it. Otherwise the frozen app prints a RuntimeWarning
+# claiming ffmpeg is missing while it sits bundled a few directories away.
+from core.ffmpeg_locator import prime_path
 
-from gui.main_window import MainWindow
+prime_path()
+
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+from gui.main_window import MainWindow  # noqa: E402
 
 
 def main() -> int:
