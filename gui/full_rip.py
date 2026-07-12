@@ -4,11 +4,18 @@ Self-sufficient: it has its own embedded release lookup (a modal seeded with the
 current artist/album), so the whole side->tracks flow lives on one tab. A single
 restoration pass feeds both the split proposal and the final encode.
 
+The tab reads top-to-bottom in the order the work happens: **Source** (a folder
+of side WAVs, one row per WAV, mapped to sides), **Metadata**, **Side**, then the
+**Review** area, which stays hidden behind an empty state until a side has been
+analysed. There is one way in -- the Source group. A single WAV is just a one-row
+mapping table.
+
 Two-step Accept: **Accept splits** cuts the restored WAV and fills an editable
-track table; **Encode N tracks** then encodes+tags+covers those segments (in
-parallel). Analyze and Encode are cancellable at stage/task boundaries; staging
-is always cleaned. Every user-facing time is rendered m:ss via
-:func:`core.timefmt.format_timestamp`.
+track table; **Encode N tracks** then hands the side (with the edited titles) to
+the AlbumController, which encodes+tags+covers it in the background while later
+sides are still being analysed. Staging is always cleaned, and no internal
+staging path is ever shown in a user-facing field. Every user-facing time is
+rendered via :func:`core.timefmt.format_timestamp`.
 """
 
 from __future__ import annotations
@@ -50,16 +57,16 @@ from core.album import (
     propose_wav_side_map,
     sides_from_proposal,
 )
-
-# Shown in the side dropdown for a WAV that is not part of this album. It is the
-# default for anything the heuristics are not confident about.
-SKIP_LABEL = "— skip —"
 from core.side_partition import Side
 from core.split_review import detect_progressive_drift, segment_deviations, wrong_side_suspected
 from core.timefmt import format_timestamp
 from gui.side_editor import SideEditorDialog, side_letter
 from gui.track_model import Row, TrackTableModel, TrackTableView
 from gui.waveform import WaveformView
+
+# Shown in the side dropdown for a WAV that is not part of this album. It is the
+# default for anything the heuristics are not confident about.
+SKIP_LABEL = "— skip —"
 
 
 class _StateRelay(QObject):
@@ -86,61 +93,6 @@ class _Signals(QObject):
     cancelled = Signal()
 
 
-class AnalyzeWorker(QRunnable):
-    def __init__(self, source, work_dir, stages, policy, params,
-                 expected_durations_ms, track_count, window_s, speed_tolerance, cancel_event):
-        super().__init__()
-        self.source = Path(source)
-        self.work_dir = Path(work_dir)
-        self.stages = stages
-        self.policy = policy
-        self.params = params
-        self.expected_durations_ms = expected_durations_ms
-        self.track_count = track_count
-        self.window_s = window_s
-        self.speed_tolerance = speed_tolerance
-        self._cancel = cancel_event
-        self.signals = _Signals()
-
-    def run(self) -> None:
-        try:
-            from core.restoration import Cancelled, restore
-            from core.splitting import propose_splits, propose_splits_anchored
-            from core.waveform import load_peak_envelope
-
-            restored = self.work_dir / "restored.wav"
-            self.signals.progress.emit("Restoring side (this can take a while)...")
-
-            def on_stage(name, idx, total):
-                self.signals.progress.emit(f"  restore [{idx}/{total}] {name}")
-
-            try:
-                result = restore(self.source, restored, self.stages, on_progress=on_stage,
-                                 policy=self.policy, should_cancel=self._cancel.is_set)
-            except Cancelled:
-                self.signals.cancelled.emit()
-                return
-
-            self.signals.progress.emit("Proposing splits on the restored audio...")
-            if self.expected_durations_ms:
-                proposal = propose_splits_anchored(
-                    restored, self.expected_durations_ms, params=self.params,
-                    window_s=self.window_s, speed_tolerance=self.speed_tolerance)
-            elif self.track_count:
-                proposal = propose_splits(restored, track_count=self.track_count, params=self.params)
-            else:
-                proposal = propose_splits(restored, params=self.params)
-
-            if self._cancel.is_set():
-                self.signals.cancelled.emit()
-                return
-            self.signals.progress.emit("Computing waveform...")
-            envelope = load_peak_envelope(restored)
-            self.signals.finished.emit(AnalyzeResult(result, proposal, envelope, restored))
-        except Exception as exc:
-            self.signals.error.emit(f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}")
-
-
 class SplitWorker(QRunnable):
     def __init__(self, restored, timestamps, split_dir):
         super().__init__()
@@ -157,35 +109,6 @@ class SplitWorker(QRunnable):
                 self.restored, self.timestamps, self.split_dir,
                 on_progress=lambda i, t, n: self.signals.progress.emit(f"  cut [{i}/{t}] {n}"))
             self.signals.finished.emit(segments)
-        except Exception as exc:
-            self.signals.error.emit(f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}")
-
-
-class EncodeWorker(QRunnable):
-    def __init__(self, tracks, output_dir, cover, max_workers, cancel_event):
-        super().__init__()
-        self.tracks = tracks
-        self.output_dir = Path(output_dir)
-        self.cover = cover
-        self.max_workers = max_workers
-        self._cancel = cancel_event
-        self.signals = _Signals()
-
-    def run(self) -> None:
-        try:
-            from core.converter import convert_wavs_to_flacs
-            from core.ffmpeg_locator import configure_pydub
-            self.signals.progress.emit("Encoding + tagging FLACs...")
-            configure_pydub()
-            batch = convert_wavs_to_flacs(
-                self.tracks, self.output_dir,
-                on_progress=lambda i, t, n: self.signals.progress.emit(f"  encode [{i} of {t}]"),
-                configure=False, cover=self.cover,
-                max_workers=self.max_workers, should_cancel=self._cancel.is_set)
-            if self._cancel.is_set():
-                self.signals.cancelled.emit()
-                return
-            self.signals.finished.emit(batch)
         except Exception as exc:
             self.signals.error.emit(f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}")
 
@@ -222,6 +145,10 @@ class FullRipTab(QWidget):
         self._gap_idx = 0
         self._busy = False
         self._cancel = threading.Event()
+        # Where the file dialogs open. Deliberately NOT a display field: the
+        # old 'Side-long WAV' QLineEdit could end up showing an internal
+        # staging path (%TEMP%\tmp...\src). Nothing internal is ever shown.
+        self._browse_start: str = settings.config.source_dir or ""
 
         # album mode
         self._album: AlbumController | None = None
@@ -231,66 +158,24 @@ class FullRipTab(QWidget):
         self._album_output_root = ""
         self._album_meta: dict = {}
         self._album_review_index: int | None = None
+        # (side_index, timestamps) held between Accept splits and Encode.
+        self._album_pending: tuple[int, list[float]] | None = None
         self._relay = _StateRelay()
         self._relay.changed.connect(self._on_side_state)
 
         root = QVBoxLayout(self)
 
-        form = QFormLayout()
-        self.source_edit = QLineEdit(settings.config.source_dir)
-        form.addRow("Side-long WAV:", self._path_row(self.source_edit, self._browse_source))
-        self.output_edit = QLineEdit(settings.config.output_dir)
-        form.addRow("Output folder:", self._path_row(self.output_edit, self._browse_output))
+        # The tab reads top-to-bottom in the order the user actually works:
+        #   1. Source   -- the folder of WAVs, and which side each one is
+        #   2. Metadata -- who made this record
+        #   3. Side     -- how the release is carved into sides
+        #   4. Review   -- appears once a side has been analysed
+        # There is exactly one way in (the Source group). The old standalone
+        # "Side-long WAV" browse field and its Analyze/Cancel row were a second,
+        # competing entry point; single-WAV use now goes through
+        # "Add single WAV..." and a one-row mapping table.
 
-        # metadata + lookup
-        meta_row = QHBoxLayout()
-        self.artist_edit = QLineEdit(settings.config.last_artist)
-        self.artist_edit.setPlaceholderText("Artist")
-        self.album_edit = QLineEdit(settings.config.last_album)
-        self.album_edit.setPlaceholderText("Album")
-        meta_row.addWidget(self.artist_edit, 1)
-        meta_row.addWidget(self.album_edit, 1)
-        self.lookup_button = QPushButton("Look up release...")
-        self.lookup_button.clicked.connect(self._open_lookup)
-        meta_row.addWidget(self.lookup_button)
-        form.addRow("Metadata:", self._wrap(meta_row))
-
-        # side picker + define sides + manual count
-        side_row = QHBoxLayout()
-        self.side_combo = QComboBox()
-        self.side_combo.addItem("Select a release to choose a side...", None)
-        self.side_combo.setEnabled(False)
-        self.side_combo.currentIndexChanged.connect(self._on_side_changed)
-        side_row.addWidget(self.side_combo, 1)
-        self.define_sides_button = QPushButton("Define sides...")
-        self.define_sides_button.setEnabled(False)
-        self.define_sides_button.clicked.connect(self._open_side_editor)
-        side_row.addWidget(self.define_sides_button)
-        side_row.addWidget(QLabel("or tracks:"))
-        self.count_spin = QSpinBox()
-        self.count_spin.setRange(1, 40)
-        self.count_spin.setValue(1)
-        self.count_spin.valueChanged.connect(self._on_count_changed)
-        side_row.addWidget(self.count_spin)
-        form.addRow("Side:", self._wrap(side_row))
-        root.addLayout(form)
-
-        run_row = QHBoxLayout()
-        self.analyze_button = QPushButton("Analyze")
-        self.analyze_button.clicked.connect(self._analyze)
-        run_row.addWidget(self.analyze_button)
-        self.cancel_button = QPushButton("Cancel")
-        self.cancel_button.setEnabled(False)
-        self.cancel_button.clicked.connect(self._request_cancel)
-        run_row.addWidget(self.cancel_button)
-        run_row.addStretch(1)
-        root.addLayout(run_row)
-
-        # --- Source: a folder of side WAVs is the primary entry point ----------
-        # Album handling used to hide behind an "Album mode" checkbox nobody
-        # found. It is now the default affordance: pick a folder, get a row per
-        # WAV, map the ones belonging to this album, run. A single WAV is just a
-        # one-row table.
+        # --- 1. Source: the primary and only entry point ------------------------
         self.album_box = QGroupBox("Source - pick the folder holding this record's side WAVs")
         album_layout = QVBoxLayout(self.album_box)
         pick_row = QHBoxLayout()
@@ -330,9 +215,63 @@ class FullRipTab(QWidget):
         album_layout.addLayout(map_side_row)
         root.addWidget(self.album_box)
 
+        # --- 2. Metadata, 3. Side context, output ------------------------------
+        form = QFormLayout()
+
+        meta_row = QHBoxLayout()
+        # Real Qt placeholders (greyed, not content). Prefill only when the
+        # remembered value is actually something -- an empty string leaves the
+        # placeholder showing rather than an empty-looking populated field.
+        self.artist_edit = QLineEdit(settings.config.last_artist or "")
+        self.artist_edit.setPlaceholderText("Artist")
+        self.album_edit = QLineEdit(settings.config.last_album or "")
+        self.album_edit.setPlaceholderText("Album")
+        meta_row.addWidget(self.artist_edit, 1)
+        meta_row.addWidget(self.album_edit, 1)
+        self.lookup_button = QPushButton("Look up release...")
+        self.lookup_button.clicked.connect(self._open_lookup)
+        meta_row.addWidget(self.lookup_button)
+        form.addRow("Metadata:", self._wrap(meta_row))
+
+        side_row = QHBoxLayout()
+        self.side_combo = QComboBox()
+        self.side_combo.addItem("Select a release to choose a side...", None)
+        self.side_combo.setEnabled(False)
+        self.side_combo.currentIndexChanged.connect(self._on_side_changed)
+        side_row.addWidget(self.side_combo, 1)
+        self.define_sides_button = QPushButton("Define sides...")
+        self.define_sides_button.setEnabled(False)
+        self.define_sides_button.clicked.connect(self._open_side_editor)
+        side_row.addWidget(self.define_sides_button)
+        side_row.addWidget(QLabel("or tracks:"))
+        self.count_spin = QSpinBox()
+        self.count_spin.setRange(1, 40)
+        self.count_spin.setValue(1)
+        self.count_spin.valueChanged.connect(self._on_count_changed)
+        side_row.addWidget(self.count_spin)
+        form.addRow("Side:", self._wrap(side_row))
+
+        self.output_edit = QLineEdit(settings.config.output_dir)
+        form.addRow("Output folder:", self._path_row(self.output_edit, self._browse_output))
+        root.addLayout(form)
+
+        # --- 4. Review: only meaningful once a side is ready --------------------
+        # Everything below lives in one widget so it can be swapped for an
+        # empty-state label instead of presenting a screenful of dead controls.
+        self.empty_state = QLabel("Select a folder to begin.")
+        self.empty_state.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_state.setStyleSheet("QLabel { color: palette(mid); padding: 24px; }")
+        root.addWidget(self.empty_state, 1)
+
+        self.review_box = QWidget()
+        review = QVBoxLayout(self.review_box)
+        review.setContentsMargins(0, 0, 0, 0)
+        root.addWidget(self.review_box, 1)
+        self.review_box.setVisible(False)
+
         self.waveform = WaveformView()
         self.waveform.markersChanged.connect(self._on_markers_changed)
-        root.addWidget(self.waveform, 1)
+        review.addWidget(self.waveform, 1)
 
         # wrong-side diagnosis
         self.diagnosis_box = QGroupBox("Check the selection")
@@ -347,7 +286,7 @@ class FullRipTab(QWidget):
         resolve_anyway.clicked.connect(self._resolve_anyway)
         diag.addWidget(resolve_anyway)
         self.diagnosis_box.setVisible(False)
-        root.addWidget(self.diagnosis_box)
+        review.addWidget(self.diagnosis_box)
 
         # gap guidance
         self.gap_box = QGroupBox("Resolve gap (click on the highlighted region to place a split)")
@@ -362,7 +301,7 @@ class FullRipTab(QWidget):
         gap_layout.addWidget(self.prev_gap_btn)
         gap_layout.addWidget(self.next_gap_btn)
         self.gap_box.setVisible(False)
-        root.addWidget(self.gap_box)
+        review.addWidget(self.gap_box)
 
         ctl = QHBoxLayout()
         add_btn = QPushButton("Add split at center")
@@ -378,17 +317,17 @@ class FullRipTab(QWidget):
         self.accept_button.setEnabled(False)
         self.accept_button.clicked.connect(self._accept_splits)
         ctl.addWidget(self.accept_button)
-        root.addLayout(ctl)
+        review.addLayout(ctl)
 
         self.model = TrackTableModel()
         self.table = TrackTableView()
         self.table.setModel(self.model)
-        root.addWidget(self.table, 1)
+        review.addWidget(self.table, 1)
 
         self.meta_summary = QLabel("")
         self.meta_summary.setWordWrap(True)
         self.meta_summary.setStyleSheet("QLabel { color: palette(mid); }")
-        root.addWidget(self.meta_summary)
+        review.addWidget(self.meta_summary)
 
         encode_row = QHBoxLayout()
         encode_row.addStretch(1)
@@ -396,7 +335,7 @@ class FullRipTab(QWidget):
         self.encode_button.setEnabled(False)
         self.encode_button.clicked.connect(self._encode)
         encode_row.addWidget(self.encode_button)
-        root.addLayout(encode_row)
+        review.addLayout(encode_row)
 
         self.progress = QProgressBar()
         root.addWidget(self.progress)
@@ -418,12 +357,6 @@ class FullRipTab(QWidget):
 
     def _log(self, msg: str) -> None:
         self.logMessage.emit(msg)
-
-    def _browse_source(self) -> None:
-        start = self.source_edit.text().strip() or str(Path.home())
-        chosen, _ = QFileDialog.getOpenFileName(self, "Select side-long WAV", start, "WAV files (*.wav)")
-        if chosen:
-            self.source_edit.setText(chosen)
 
     def _browse_output(self) -> None:
         start = self.output_edit.text().strip() or str(Path.home())
@@ -538,57 +471,12 @@ class FullRipTab(QWidget):
             self._log("Single track - no splits will be proposed; is this intended?")
 
     # -- analyze ------------------------------------------------------------
-    def _analyze(self) -> None:
-        if self._busy:
-            return
-        source = self.source_edit.text().strip()
-        if not source or not Path(source).is_file():
-            self._log(f"Full Rip: source WAV not found: {source!r}")
-            return
-        if self._release is None:
-            self._expected_n = self.count_spin.value()
-        self._warn_single_track()
-
-        cfg = self.settings.config
-        stages = job_settings.build_stages(cfg)
-        policy = job_settings.build_policy(cfg)
-        params = job_settings.build_silence_params(cfg)
-
-        expected_ms = None
-        track_count = None
-        if self._expected_durations_s:
-            expected_ms = [int(round(s * 1000)) for s in self._expected_durations_s]
-            self._log("Full Rip: anchored mode (per-track durations available).")
-        elif self._expected_n:
-            track_count = self._expected_n
-            self._log(f"Full Rip: count mode (N={track_count}).")
-        else:
-            self._log("Full Rip: threshold mode (no tracklist).")
-
-        self._cleanup_work_dir()
-        self._work_dir = Path(tempfile.mkdtemp(prefix="rrf_fullrip_"))
-        self._cancel.clear()
-        self._segments = []
-        self.model.clear()
-        self.encode_button.setEnabled(False)
-        self.diagnosis_box.setVisible(False)
-
-        self._set_busy(True)
-        self.progress.setRange(0, 0)
-        worker = AnalyzeWorker(source, self._work_dir, stages, policy, params,
-                               expected_ms, track_count, cfg.window_s, cfg.speed_tolerance,
-                               self._cancel)
-        worker.signals.progress.connect(self._log)
-        worker.signals.finished.connect(self._on_analyze_done)
-        worker.signals.error.connect(self._on_error)
-        worker.signals.cancelled.connect(self._on_cancelled)
-        self.pool.start(worker)
-
     def _on_analyze_done(self, analysis: AnalyzeResult) -> None:
         self._analysis = analysis
         self.progress.setRange(0, 1)
         self.progress.setValue(1)
         self._set_busy(False)
+        self._show_review()
 
         self.waveform.set_envelope(analysis.envelope)
         proposal = analysis.proposal
@@ -768,51 +656,36 @@ class FullRipTab(QWidget):
                   "Edit titles if needed, then Encode.")
 
     def _encode(self) -> None:
-        if self._busy or not self._segments:
+        """Hand the reviewed side, with its edited titles, back to the controller.
+
+        The cutting already happened in :meth:`_accept_album_side`; the segments
+        ride along on the SideJob so the controller does not split twice. The
+        controller owns encoding (it pipelines it against later sides still being
+        analysed), so this is the point where the side leaves the review area.
+        """
+        if self._busy or not self._segments or self._album is None:
+            return
+        if self._album_pending is None:
             return
         output = self.output_edit.text().strip()
         if not output:
             self._log("Full Rip: choose an output folder first.")
             return
-        artist = self._release.artist if self._release else self.settings.config.last_artist
-        album = self._release.title if self._release else self.settings.config.last_album
-        rows = self.model.rows()
-        titles = [r.title for r in rows]
-        segments = [r.source_path for r in rows]
-        tracks = self._enrich_tracks(titles, segments, self._review_track_infos,
-                                     self._review_side_position, self._total_sides or 1,
-                                     artist, album)
 
-        self._cancel.clear()
-        self._set_busy(True)
-        self.progress.setRange(0, 0)
-        worker = EncodeWorker(tracks, output, self._cover,
-                              self.settings.config.encode_workers, self._cancel)
-        worker.signals.progress.connect(self._log)
-        worker.signals.finished.connect(self._on_encode_done)
-        worker.signals.error.connect(self._on_error)
-        worker.signals.cancelled.connect(self._on_cancelled)
-        self.pool.start(worker)
+        index, timestamps = self._album_pending
+        side = self._album_side(index)
+        if side is None:
+            return
+        side.segments = list(self._segments)
+        titles = [r.title for r in self.model.rows()]
 
-    def _on_encode_done(self, batch) -> None:
-        self.progress.setRange(0, 1)
-        self.progress.setValue(1)
-        self._set_busy(False)
-        self._log(batch.summary())
-        for w in batch.warnings:
-            self._log(f"  ! {w}")
+        self._album.accept_side(index, timestamps, titles)
+        self._log(f"Album: {side.label} accepted ({len(self._segments)} tracks); "
+                  "encoding in the background.")
 
-    # -- cancel / errors ----------------------------------------------------
-    def _request_cancel(self) -> None:
-        if self._busy:
-            self._cancel.set()
-            self._log("Cancelling at the next stage boundary...")
-
-    def _on_cancelled(self) -> None:
-        self.progress.setRange(0, 1)
-        self.progress.setValue(0)
-        self._set_busy(False)
-        self._log("Cancelled.")
+        self._album_pending = None
+        self._album_review_index = None
+        self._clear_review()
 
     def _on_error(self, message: str) -> None:
         self.progress.setRange(0, 1)
@@ -821,8 +694,7 @@ class FullRipTab(QWidget):
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
-        self.analyze_button.setEnabled(not busy)
-        self.cancel_button.setEnabled(busy)
+        self.start_album_btn.setEnabled(not busy and self._album is None)
         if busy:
             self.accept_button.setEnabled(False)
             self.encode_button.setEnabled(False)
@@ -830,10 +702,55 @@ class FullRipTab(QWidget):
             self._update_accept_enabled()
             self.encode_button.setEnabled(bool(self._segments))
 
+    # -- review area visibility ---------------------------------------------
+    def _show_review(self) -> None:
+        """Swap the empty state out for the review controls."""
+        self.empty_state.setVisible(False)
+        self.review_box.setVisible(True)
+
+    def _set_empty_state(self, message: str) -> None:
+        """Hide the review controls behind an explanatory line.
+
+        Dead, greyed-out controls tell the user nothing; a sentence saying what
+        the tab is waiting for tells them what to do next.
+        """
+        self.empty_state.setText(message)
+        self.empty_state.setVisible(True)
+        self.review_box.setVisible(False)
+
+    def _clear_review(self) -> None:
+        """Return the review area to its empty state after a side is handed off."""
+        self._analysis = None
+        self._segments = []
+        self.model.set_rows([])
+        self.waveform.clear_markers(emit=False)
+        self.waveform.clear_region()
+        self.waveform.set_place_mode(False)
+        self.gap_box.setVisible(False)
+        self.diagnosis_box.setVisible(False)
+        self.accept_button.setText("Accept splits")
+        self.accept_button.setEnabled(False)
+        self.encode_button.setEnabled(False)
+        self._set_empty_state(self._pending_review_message())
+
+    def _pending_review_message(self) -> str:
+        if self._album is None:
+            if not self._album_wavs:
+                return "Select a folder to begin."
+            return "Map each WAV to a side, then press Start album."
+        states = [s.state for s in self._album.sides]
+        if any(s == SideState.ANALYZING for s in states):
+            return "Side analyzing..."
+        if any(s == SideState.READY for s in states):
+            return "A side is ready - pick it from the list to review its splits."
+        if all(s in (SideState.DONE, SideState.ERROR, SideState.CANCELLED) for s in states):
+            return "Album finished."
+        return "Waiting for the next side..."
+
     # -- album mode ---------------------------------------------------------
     def _album_select_folder(self) -> None:
         """The primary entry point: a folder is what the user actually has."""
-        start = self.source_edit.text().strip() or str(Path.home())
+        start = self._browse_start or str(Path.home())
         folder = QFileDialog.getExistingDirectory(
             self, "Select the folder holding this record's WAVs", start)
         if folder:
@@ -843,7 +760,7 @@ class FullRipTab(QWidget):
 
     def _album_add_wavs(self) -> None:
         """Secondary affordance -- a single WAV is just a one-row mapping table."""
-        start = self.source_edit.text().strip() or str(Path.home())
+        start = self._browse_start or str(Path.home())
         path, _ = QFileDialog.getOpenFileName(self, "Select a side WAV", start, "WAV files (*.wav)")
         if path:
             self._album_wavs = [Path(path)]
@@ -886,6 +803,8 @@ class FullRipTab(QWidget):
         mapped = sum(1 for m in self._album_mapping if m is not None)
         self._log(f"Source: {len(self._album_wavs)} WAV(s) - {mapped} mapped by name, "
                   f"{len(self._album_wavs) - mapped} left on skip.")
+        if self._analysis is None:
+            self._set_empty_state(self._pending_review_message())
 
     def _mapping_changed(self, row: int, combo: QComboBox) -> None:
         side_index = combo.currentData()
@@ -975,6 +894,8 @@ class FullRipTab(QWidget):
             self._log(f"Album: {side.label} ERROR - {side.error}")
         elif side.state == SideState.DONE:
             self._log(f"Album: {side.label} done.")
+        if self._album_review_index is None:
+            self._set_empty_state(self._pending_review_message())
         if self._album and all(s.state in (SideState.DONE, SideState.ERROR, SideState.CANCELLED)
                                for s in self._album.sides):
             self.cancel_album_btn.setEnabled(False)
@@ -994,8 +915,10 @@ class FullRipTab(QWidget):
 
     def _load_side_for_review(self, side) -> None:
         self._album_review_index = side.index
+        self._album_pending = None
         analysis = side.analysis
         self._analysis = analysis
+        self._show_review()
         self._expected_titles = list(side.titles)
         self._expected_n = len(side.titles) or None
         self._expected_durations_s = (
@@ -1084,19 +1007,30 @@ class FullRipTab(QWidget):
         self.meta_summary.setText("Will also write: " + " | ".join(bits))
 
     def _accept_album_side(self) -> None:
+        """Cut the reviewed side and fill the track table -- the first of two steps.
+
+        Accepting used to hand straight to the controller, which meant an album
+        side was encoded with the release's titles and no chance to edit them.
+        Now it cuts, shows the tracks, and waits for Encode -- the same two-step
+        the single-side flow always had.
+        """
+        if self._busy:
+            return
         index = self._album_review_index
         side = self._album_side(index)
+        if side is None or side.analysis is None:
+            return
         timestamps = self.waveform.marker_times()
-        self._album.accept_side(index, timestamps, list(side.titles) if side else None)
-        self._log(f"Album: {side.label if side else 'side'} accepted; encoding in background.")
-        self._album_review_index = None
-        self._analysis = None
-        self.waveform.clear_markers(emit=False)
-        self.waveform.clear_region()
-        self.waveform.set_place_mode(False)
-        self.gap_box.setVisible(False)
-        self.accept_button.setText("Accept splits")
-        self.accept_button.setEnabled(False)
+        self._album_pending = (index, list(timestamps))
+
+        self._set_busy(True)
+        self.progress.setRange(0, 0)
+        split_dir = self._album_work_dir / f"side_{index}" / "segments"
+        worker = SplitWorker(side.analysis.restored_path, timestamps, split_dir)
+        worker.signals.progress.connect(self._log)
+        worker.signals.finished.connect(self._on_split_done)
+        worker.signals.error.connect(self._on_error)
+        self.pool.start(worker)
 
     def _album_analyze(self, side, should_cancel):
         """Runs on an AlbumController thread -- no widget access."""
@@ -1137,7 +1071,10 @@ class FullRipTab(QWidget):
         from core.tracks import Tracks
 
         side_dir = self._album_work_dir / f"side_{side.index}"
-        segments = execute_split(side.analysis.restored_path, side.timestamps, side_dir / "segments")
+        # The reviewer already cut this side (Accept splits) to fill the track
+        # table; reuse those segments rather than splitting a side-long WAV twice.
+        segments = list(side.segments) or execute_split(
+            side.analysis.restored_path, side.timestamps, side_dir / "segments")
         artist = self._album_meta.get("artist", "")
         album = self._album_meta.get("album", "")
         track_infos = self._side_track_infos.get(side.index, [])

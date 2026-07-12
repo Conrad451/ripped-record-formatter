@@ -57,6 +57,9 @@ class SideJob:
     state: SideState = SideState.QUEUED
     analysis: object | None = None      # whatever analyze_fn returns
     timestamps: list[float] = field(default_factory=list)
+    segments: list[Path] = field(default_factory=list)
+    """Cut track files, when the reviewer already produced them. Lets encode_fn
+    reuse the reviewer's cut rather than splitting the side a second time."""
     error: str = ""
 
 

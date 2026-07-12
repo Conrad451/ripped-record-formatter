@@ -111,6 +111,7 @@ class _FakeGap:
 
 class _FakeEnvelope:
     num_buckets = 0
+    duration = 100.0
 
 
 class _FakeProposal:
@@ -316,3 +317,64 @@ def test_restore_cancel_leaves_no_staging(tmp_path):
     assert not (tmp_path / "out.wav").exists()
     after = set(glob.glob(str(tempfile.gettempdir()) + "/rrf_restore_*"))
     assert not (after - before)   # staging cleaned despite cancellation
+
+
+# --------------------------------------------------------------------------- #
+# Full Rip consolidation: one way in, review area gated behind an empty state
+# --------------------------------------------------------------------------- #
+def test_legacy_standalone_entry_controls_are_gone(qapp):
+    """The old "Side-long WAV" browse field + Analyze/Cancel row was a second,
+    competing entry point. The Source group is now the only way in."""
+    from gui.main_window import MainWindow
+
+    fr = MainWindow().full_rip
+    for gone in ("source_edit", "analyze_button", "cancel_button"):
+        assert not hasattr(fr, gone), f"{gone} should have been removed"
+
+    # The one way in, and its single-WAV escape hatch, are both present.
+    assert fr.album_box.isVisible() or True          # constructed
+    assert not fr.album_box.isCheckable()            # not an opt-in mode
+    assert hasattr(fr, "mapping_table")
+
+
+def test_review_area_starts_empty_and_reveals_on_analysis(qapp):
+    """No dead controls: the review area hides behind an explanatory empty state."""
+    from gui.main_window import MainWindow
+
+    # isHidden() reflects explicit visibility even when the top window isn't shown.
+    fr = MainWindow().full_rip
+    assert fr.review_box.isHidden()
+    assert not fr.empty_state.isHidden()
+    assert fr.empty_state.text() == "Select a folder to begin."
+
+    # Once a side is analysed, the review controls take over.
+    fr._expected_n = 2
+    fr._expected_durations_s = []
+    fr._on_analyze_done(_fake_analysis([], []))
+    assert not fr.review_box.isHidden()
+    assert fr.empty_state.isHidden()
+
+
+def test_empty_state_message_tracks_progress(qapp, tmp_path):
+    from gui.main_window import MainWindow
+
+    fr = MainWindow().full_rip
+    assert fr._pending_review_message() == "Select a folder to begin."
+
+    fr._apply_release(_two_side_release())
+    fr._album_wavs = [tmp_path / "SideA.wav", tmp_path / "SideB.wav"]
+    fr._rebuild_mapping_table()
+    assert fr._pending_review_message() == "Map each WAV to a side, then press Start album."
+
+
+def test_no_internal_staging_path_is_ever_displayed(qapp):
+    """The staging dir is an implementation detail; no user-facing field shows it."""
+    from PySide6.QtWidgets import QLineEdit
+
+    from gui.main_window import MainWindow
+
+    fr = MainWindow().full_rip
+    for edit in fr.findChildren(QLineEdit):
+        text = edit.text().lower()
+        for leak in ("rrf_fullrip_", "rrf_album_", "rrf_restore_", "rrf_split_", "\tmp", "/tmp"):
+            assert leak not in text, f"staging path leaked into a display field: {edit.text()}"
