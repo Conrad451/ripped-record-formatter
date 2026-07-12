@@ -45,6 +45,18 @@ from core.metadata_lookup import (
     ReleaseResult,
 )
 from core.timefmt import format_timestamp
+from gui.release_preview import (
+    NO_COVER_HINT,
+    NO_COVER_TEXT,
+    UNREADABLE_COVER_TEXT,
+)
+
+_COVER_STYLE = "QLabel { border: 1px solid palette(mid); }"
+# A release with no art has to look like a problem, not an empty box.
+_NO_COVER_STYLE = (
+    "QLabel { border: 2px dashed #c07000; color: #c07000; font-weight: bold; "
+    "background: palette(alternate-base); }"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -163,11 +175,12 @@ class MetadataPanel(QWidget):
         self.track_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         preview_layout.addWidget(self.track_table, 1)
 
-        self.cover_label = QLabel("No cover")
+        self.cover_label = QLabel("")
         self.cover_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.cover_label.setWordWrap(True)
         self.cover_label.setFixedWidth(200)
         self.cover_label.setMinimumHeight(200)
-        self.cover_label.setStyleSheet("QLabel { border: 1px solid palette(mid); }")
+        self.cover_label.setStyleSheet(_COVER_STYLE)
         preview_layout.addWidget(self.cover_label)
 
         self._split = QSplitter(Qt.Orientation.Vertical)
@@ -313,9 +326,16 @@ class MetadataPanel(QWidget):
                     self.track_table.setItem(row, col, QTableWidgetItem(text))
 
     def _populate_cover(self, detail: ReleaseDetail) -> None:
+        """Render the art, or say loudly that there is none.
+
+        This runs when a release is *fetched*, before the user commits to it, so
+        a release with no art can be rejected here rather than discovered after
+        the FLACs have already been written without a picture.
+        """
         if not detail.cover:
-            self.cover_label.setText("No cover")
             self.cover_label.setPixmap(QPixmap())
+            self.cover_label.setText(f"{NO_COVER_TEXT}\n\n({NO_COVER_HINT})")
+            self.cover_label.setStyleSheet(_NO_COVER_STYLE)
             return
         pixmap = QPixmap()
         if pixmap.loadFromData(detail.cover.data):
@@ -328,8 +348,11 @@ class MetadataPanel(QWidget):
                 )
             )
             self.cover_label.setText("")
+            self.cover_label.setStyleSheet(_COVER_STYLE)
         else:
-            self.cover_label.setText("Cover unreadable")
+            self.cover_label.setPixmap(QPixmap())
+            self.cover_label.setText(f"{UNREADABLE_COVER_TEXT}\n\n({NO_COVER_HINT})")
+            self.cover_label.setStyleSheet(_NO_COVER_STYLE)
 
     # -- errors --------------------------------------------------------------
     def _on_error(self, message: str) -> None:

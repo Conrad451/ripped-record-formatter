@@ -16,7 +16,7 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, Signal
 
-from core.timefmt import format_timestamp
+from core.timefmt import format_timestamp, tick_decimals_for_span
 
 _WAVE_PEN = pg.mkPen("#3b6ea5")
 _MARKER_PEN = pg.mkPen("#c0392b", width=2)
@@ -26,10 +26,20 @@ _REGION_BRUSH = pg.mkBrush(255, 196, 0, 60)
 
 
 class _TimeAxis(pg.AxisItem):
-    """Bottom axis that prints tick values (seconds) as m:ss / h:mm:ss."""
+    """Bottom axis that prints tick values (seconds) as m:ss / h:mm:ss.
+
+    Zoomed right in, whole-second labels collapse into a row of identical ticks,
+    so the precision follows the visible span -- tenths under a minute,
+    hundredths under ten seconds. The thresholds live in :mod:`core.timefmt` so
+    the axis and every other readout keep telling the same time the same way.
+    """
 
     def tickStrings(self, values, scale, spacing):
-        return [format_timestamp(v) for v in values]
+        # `spacing` is the gap between ticks; the span they cover is what decides
+        # how much precision is needed to keep the labels distinct.
+        span = spacing * max(1, len(values))
+        decimals = tick_decimals_for_span(span)
+        return [format_timestamp(v, decimals) for v in values]
 
 
 class WaveformView(pg.PlotWidget):

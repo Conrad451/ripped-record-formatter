@@ -12,6 +12,8 @@ from core.album import (
     SideState,
     guess_side_index,
     map_wavs_to_sides,
+    propose_wav_side_map,
+    sides_from_proposal,
 )
 
 
@@ -65,6 +67,48 @@ def test_map_wavs_unmapped_side_is_none():
 # --------------------------------------------------------------------------- #
 def _controller(sides, analyze, encode, on_change=None, **kw):
     return AlbumController(sides, analyze, encode, on_change, **kw)
+
+
+# --------------------------------------------------------------------------- #
+# Folder-first mapping: one row per WAV, ambiguity is never guessed
+# --------------------------------------------------------------------------- #
+
+
+def test_proposal_maps_only_confident_side_names():
+    wavs = ["SideA.wav", "SideB.wav"]
+    assert propose_wav_side_map(wavs, 2) == [0, 1]
+
+
+def test_proposal_leaves_ambiguous_files_unmapped():
+    """A file with no side hint is skipped, never guessed into a free slot.
+
+    This is the mixed-folder case: bonus.wav and interview.wav belong to some
+    other album, and the old sorted-order fallback would have mapped them.
+    """
+    wavs = ["SideA.wav", "bonus.wav", "SideB.wav", "interview.wav"]
+    assert propose_wav_side_map(wavs, 2) == [0, None, 1, None]
+
+    # Nothing at all recognisable -> everything skipped.
+    assert propose_wav_side_map(["track01.wav", "track02.wav"], 2) == [None, None]
+
+
+def test_proposal_stronger_hint_wins_a_contested_side():
+    """"SideA" beats a bare "A"; the loser is left for the user, not bumped."""
+    wavs = ["A_bonus.wav", "SideA.wav"]
+    assert propose_wav_side_map(wavs, 2) == [None, 0]
+
+
+def test_skipped_rows_are_excluded_from_the_job():
+    """Only mapped rows become sides -- a folder of two albums yields one job."""
+    wavs = ["SideA.wav", "other_album_sideA.wav", "SideB.wav", "notes.wav"]
+    proposal = [0, None, 1, None]          # user left the foreign rows on "skip"
+
+    sides = sides_from_proposal(wavs, proposal)
+
+    assert sides == {0: Path("SideA.wav"), 1: Path("SideB.wav")}
+    assert Path("notes.wav") not in sides.values()
+    assert Path("other_album_sideA.wav") not in sides.values()
+    assert len(sides) == 2                 # two sides, not four
 
 
 def test_happy_path_state_sequence():

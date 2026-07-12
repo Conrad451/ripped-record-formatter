@@ -107,6 +107,11 @@ class SettingsPanel(QWidget):
                      self._ispin("encode_workers", cfg.encode_workers, 1, 16))
         basic.addRow("Album analysis workers:",
                      self._ispin("album_analysis_workers", cfg.album_analysis_workers, 1, 4))
+        # Album output is one flat folder, so filenames must not collide across
+        # sides. Off: continuous [01]..[NN]. On: [A01]/[B01]. Tags are unaffected.
+        basic.addRow(self._check(
+            "Name files [A01]/[B01] by side (off: continuous [01]-[NN])",
+            "filename_side_letters", cfg.filename_side_letters))
         root.addWidget(basic_box)
 
         # ---------------- Advanced ----------------

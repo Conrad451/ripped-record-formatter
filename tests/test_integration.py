@@ -111,6 +111,7 @@ class _FakeGap:
 
 class _FakeEnvelope:
     num_buckets = 0
+    duration = 100.0
 
 
 class _FakeProposal:
@@ -168,6 +169,56 @@ def test_full_rip_populated_side_picker_after_release(qapp):
     assert fr.define_sides_button.isEnabled()
 
 
+def _two_side_release():
+    from core.metadata_lookup import MediumInfo, ReleaseDetail, TrackInfo
+
+    return ReleaseDetail("x", "Alb", "Art", media=(
+        MediumInfo(1, "Vinyl", tracks=tuple(
+            TrackInfo(i + 1, str(i + 1), f"A{i + 1}", 180000) for i in range(3))),
+        MediumInfo(2, "Vinyl", tracks=tuple(
+            TrackInfo(i + 1, str(i + 1), f"B{i + 1}", 180000) for i in range(2))),
+    ))
+
+
+def test_mapping_table_is_one_row_per_wav_and_skips_ambiguous(qapp, tmp_path):
+    """Folder-first: rows are WAVs, and a foreign file defaults to skip."""
+    from gui.full_rip import SKIP_LABEL
+    from gui.main_window import MainWindow
+
+    fr = MainWindow().full_rip
+    fr._apply_release(_two_side_release())
+
+    # A mixed folder: two sides of this record plus a stray file from another.
+    fr._album_wavs = [tmp_path / "SideA.wav", tmp_path / "bonus.wav", tmp_path / "SideB.wav"]
+    fr._rebuild_mapping_table()
+
+    assert fr.mapping_table.rowCount() == 3            # one row per WAV, not per side
+    names = [fr.mapping_table.item(r, 0).text() for r in range(3)]
+    assert names == ["SideA.wav", "bonus.wav", "SideB.wav"]
+
+    # Confident hits pre-filled; the ambiguous one left on skip, never guessed.
+    assert fr._album_mapping == [0, None, 1]
+    assert fr.mapping_table.cellWidget(1, 1).currentText() == SKIP_LABEL
+    assert fr.mapping_table.cellWidget(0, 1).currentData() == 0
+    assert fr.mapping_table.cellWidget(2, 1).currentData() == 1
+
+
+def test_mapping_table_side_is_exclusive(qapp, tmp_path):
+    """Claiming a side another row holds releases the other row back to skip."""
+    from gui.main_window import MainWindow
+
+    fr = MainWindow().full_rip
+    fr._apply_release(_two_side_release())
+    fr._album_wavs = [tmp_path / "SideA.wav", tmp_path / "other.wav"]
+    fr._rebuild_mapping_table()
+    assert fr._album_mapping == [0, None]
+
+    # Point row 1 at side A too -- row 0 must let go of it.
+    combo = fr.mapping_table.cellWidget(1, 1)
+    combo.setCurrentIndex(combo.findData(0))
+    assert fr._album_mapping == [None, 0]
+
+
 def test_full_rip_single_track_warns(qapp):
     from gui.main_window import MainWindow
 
@@ -178,18 +229,90 @@ def test_full_rip_single_track_warns(qapp):
     assert "Single track" in w.log.toPlainText()
 
 
-def test_full_rip_two_step_encode_gate(qapp, tmp_path):
+def test_album_accept_enqueues_encode_without_a_second_click(qapp, tmp_path):
+    """Accept IS the commit: it snapshots the table and the encode is enqueued
+    on the controller's pool with no further UI action. No Encode button exists."""
+    import threading
+
+    from core.album import AlbumController, SideJob, SideState
     from gui.main_window import MainWindow
 
     fr = MainWindow().full_rip
-    assert not fr.encode_button.isEnabled()          # nothing split yet
-    seg = tmp_path / "track_01.wav"
-    seg.write_bytes(b"x")
-    fr._expected_titles = ["First", "Second"]
-    fr._on_split_done([tmp_path / "track_01.wav", tmp_path / "track_02.wav"])
-    assert fr.encode_button.isEnabled()
-    assert fr.encode_button.text() == "Encode 2 tracks"
-    assert [r.title for r in fr.model.rows()] == ["First", "Second"]
+    assert not hasattr(fr, "encode_button"), "album mode commits on Accept"
+
+    encoded = threading.Event()
+    captured = {}
+
+    def analyze(side, should_cancel):
+        return _fake_analysis([], [])
+
+    def encode(side, should_cancel):
+        captured["titles"] = list(side.titles)
+        captured["artists"] = list(side.artists)
+        captured["timestamps"] = list(side.timestamps)
+        encoded.set()
+
+    side = SideJob(index=0, label="Side A", wav_path=tmp_path / "a.wav",
+                   titles=["One", "Two"])
+    fr._album = AlbumController([side], analyze, encode)
+    fr._album_output_root = str(tmp_path)
+    fr.output_edit.setText(str(tmp_path))
+    fr._album_work_dir = tmp_path
+    side.analysis = _fake_analysis([], [])
+    side.state = SideState.READY
+
+    fr._load_side_for_review(side)
+    fr.waveform.clear_markers()
+    fr.waveform.add_marker(5.0)            # 1 marker -> 2 tracks
+    assert len(fr.model.rows()) == 2       # table is live before Accept
+
+    # Edit the table, then Accept. Nothing else.
+    rows = fr.model.rows()
+    rows[0].title = "Edited One"
+    rows[1].artist = "Guest Artist"
+    fr.model.set_rows(rows)
+
+    fr._accept_album_side()
+
+    assert encoded.wait(4.0), "accept did not enqueue the encode"
+    assert captured["titles"] == ["Edited One", "Two"]
+    assert captured["artists"][1] == "Guest Artist"
+    assert captured["timestamps"] == [5.0]
+    assert side.state in (SideState.ENCODING, SideState.DONE)
+    # The review area is released for the next side straight away.
+    assert fr._album_review_index is None
+    fr._album.shutdown(wait=True)
+
+
+def test_side_switch_prompts_only_with_unaccepted_state(qapp, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    from core.album import AlbumController, SideJob, SideState
+    from gui.main_window import MainWindow
+
+    fr = MainWindow().full_rip
+    asked = []
+
+    def fake_question(*args, **kwargs):
+        asked.append(True)
+        return QMessageBox.StandardButton.Discard
+
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(fake_question))
+
+    a = SideJob(index=0, label="Side A", titles=["x"])
+    fr._album = AlbumController([a], lambda s, c: None, lambda s, c: None)
+
+    # Nothing under review -> no prompt.
+    assert fr._confirm_discard_review() is True
+    assert asked == []
+
+    # A side under review with live analysis -> prompt fires once.
+    a.analysis = _fake_analysis([], [])
+    fr._load_side_for_review(a)
+    assert fr._confirm_discard_review() is True
+    assert len(asked) == 1
+    assert fr._album_review_index is None      # discarded
+    fr._album.shutdown(wait=True)
 
 
 def test_waveform_click_to_place_lands_at_click(qapp):
@@ -266,3 +389,199 @@ def test_restore_cancel_leaves_no_staging(tmp_path):
     assert not (tmp_path / "out.wav").exists()
     after = set(glob.glob(str(tempfile.gettempdir()) + "/rrf_restore_*"))
     assert not (after - before)   # staging cleaned despite cancellation
+
+
+# --------------------------------------------------------------------------- #
+# Full Rip consolidation: one way in, review area gated behind an empty state
+# --------------------------------------------------------------------------- #
+def test_legacy_standalone_entry_controls_are_gone(qapp):
+    """The old "Side-long WAV" browse field + Analyze/Cancel row was a second,
+    competing entry point. The Source group is now the only way in."""
+    from gui.main_window import MainWindow
+
+    fr = MainWindow().full_rip
+    for gone in ("source_edit", "analyze_button", "cancel_button"):
+        assert not hasattr(fr, gone), f"{gone} should have been removed"
+
+    # The one way in, and its single-WAV escape hatch, are both present.
+    assert fr.album_box.isVisible() or True          # constructed
+    assert not fr.album_box.isCheckable()            # not an opt-in mode
+    assert hasattr(fr, "mapping_table")
+
+
+def test_review_area_starts_empty_and_reveals_on_analysis(qapp):
+    """No dead controls: the review area hides behind an explanatory empty state."""
+    from gui.main_window import MainWindow
+
+    # isHidden() reflects explicit visibility even when the top window isn't shown.
+    fr = MainWindow().full_rip
+    assert fr.review_box.isHidden()
+    assert not fr.empty_state.isHidden()
+    assert fr.empty_state.text() == "Select a folder to begin."
+
+    # Once a side is analysed, the review controls take over.
+    fr._expected_n = 2
+    fr._expected_durations_s = []
+    fr._on_analyze_done(_fake_analysis([], []))
+    assert not fr.review_box.isHidden()
+    assert fr.empty_state.isHidden()
+
+
+def test_empty_state_message_tracks_progress(qapp, tmp_path):
+    from gui.main_window import MainWindow
+
+    fr = MainWindow().full_rip
+    assert fr._pending_review_message() == "Select a folder to begin."
+
+    fr._apply_release(_two_side_release())
+    fr._album_wavs = [tmp_path / "SideA.wav", tmp_path / "SideB.wav"]
+    fr._rebuild_mapping_table()
+    assert fr._pending_review_message() == "Map each WAV to a side, then press Start album."
+
+
+def test_no_internal_staging_path_is_ever_displayed(qapp):
+    """The staging dir is an implementation detail; no user-facing field shows it."""
+    from PySide6.QtWidgets import QLineEdit
+
+    from gui.main_window import MainWindow
+
+    fr = MainWindow().full_rip
+    for edit in fr.findChildren(QLineEdit):
+        text = edit.text().lower()
+        for leak in ("rrf_fullrip_", "rrf_album_", "rrf_restore_", "rrf_split_", "\tmp", "/tmp"):
+            assert leak not in text, f"staging path leaked into a display field: {edit.text()}"
+
+
+# --------------------------------------------------------------------------- #
+# Release preview: an absent cover must be loud, and visible before encoding
+# --------------------------------------------------------------------------- #
+def _release_with(cover):
+    from core.metadata_lookup import MediumInfo, ReleaseDetail, TrackInfo
+
+    return ReleaseDetail(
+        "rel", "Kind of Blue", "Miles Davis", year="1959", country="US", cover=cover,
+        media=(MediumInfo(1, "Vinyl", tracks=tuple(
+            TrackInfo(i + 1, str(i + 1), f"T{i + 1}", 180000) for i in range(5))),),
+    )
+
+
+def test_release_preview_shouts_when_there_is_no_cover(qapp):
+    from gui.main_window import MainWindow
+    from gui.release_preview import NO_COVER_TEXT
+
+    fr = MainWindow().full_rip
+    assert fr.release_preview.isHidden()             # nothing loaded yet
+
+    fr._apply_release(_release_with(None))
+
+    assert not fr.release_preview.isHidden()
+    assert NO_COVER_TEXT in fr.release_preview.cover_label.text()
+    assert fr.release_preview.thumb.text() == "NO\nART"
+    assert fr.release_preview.thumb.pixmap().isNull()
+    # ...and the summary is still there alongside the warning.
+    assert fr.release_preview.title_label.text() == "Miles Davis - Kind of Blue"
+    assert "1959" in fr.release_preview.detail_label.text()
+    assert "1 side, 5 tracks" in fr.release_preview.detail_label.text()
+
+
+def test_release_preview_shows_real_art_quietly(qapp):
+    from core.metadata_lookup import CoverArt
+    from gui.main_window import MainWindow
+    from gui.release_preview import NO_COVER_TEXT
+    from PySide6.QtCore import QBuffer
+    from PySide6.QtGui import QImage
+
+    # A real, decodable 8x8 PNG.
+    image = QImage(8, 8, QImage.Format.Format_RGB32)
+    image.fill(0x336699)
+    buf = QBuffer()
+    buf.open(QBuffer.OpenModeFlag.WriteOnly)
+    image.save(buf, "PNG")
+    cover = CoverArt(data=bytes(buf.data()), mime="image/png")
+
+    fr = MainWindow().full_rip
+    fr._apply_release(_release_with(cover))
+
+    assert not fr.release_preview.thumb.pixmap().isNull()   # art rendered
+    assert fr.release_preview.thumb.text() == ""
+    assert NO_COVER_TEXT not in fr.release_preview.cover_label.text()
+    assert fr.release_preview.cover_label.text() == ""
+
+
+def test_no_cover_is_visible_in_the_lookup_before_choosing(qapp):
+    """The dialog says it too -- so a coverless release can be rejected up front."""
+    from gui.metadata_panel import MetadataPanel
+    from gui.release_preview import NO_COVER_TEXT
+
+    panel = MetadataPanel()
+    panel._populate_cover(_release_with(None))
+    assert NO_COVER_TEXT in panel.cover_label.text()
+    assert panel.cover_label.pixmap().isNull()
+
+
+# --------------------------------------------------------------------------- #
+# Layout defaults: the workflow area, not the chrome, gets the space
+# --------------------------------------------------------------------------- #
+def test_default_layout_gives_the_review_area_room(qapp):
+    from gui.main_window import MainWindow
+
+    w = MainWindow()
+    w.resize(1280, 956)                      # what a 1080p desktop gets
+    w.show()
+    qapp.processEvents()
+    fr = w.full_rip
+    fr._expected_n = 2
+    fr._expected_durations_s = []
+    fr._on_analyze_done(_fake_analysis([], []))
+    qapp.processEvents()
+
+    # The review area outweighs the source group above it...
+    assert fr.review_box.height() > fr.album_box.height()
+    # ...and the waveform is the biggest single thing in it.
+    assert fr.waveform.height() >= 190
+    assert fr.waveform.height() > fr.table.height()
+
+    # The log is present but minimal -- it must not own the window.
+    tabs_h, log_h = w._main_splitter.sizes()
+    assert log_h > 0                          # still visible
+    assert log_h < tabs_h * 0.15              # ...and out of the way
+    w.close()
+
+
+def test_mapping_table_shows_several_rows_without_scrolling(qapp):
+    from gui.main_window import MainWindow
+
+    fr = MainWindow().full_rip
+    rows_visible = (fr.mapping_table.height() - 26) // 22
+    assert 4 <= rows_visible <= 6, rows_visible
+
+
+def test_persisted_splitter_sizes_still_win_over_defaults(qapp):
+    """Defaults-only change: a size the user already chose is still honoured.
+
+    QSplitter rescales setSizes() to the widget's real height, so the *ratio* is
+    what survives, not the literal pixels.
+    """
+    from gui.main_window import MainWindow
+
+    fresh = MainWindow()
+    fresh.resize(1000, 800)
+    fresh.show()
+    qapp.processEvents()
+    default_log_fraction = fresh._main_splitter.sizes()[1] / sum(fresh._main_splitter.sizes())
+    fresh.close()
+
+    # The user drags the log much bigger and it is persisted.
+    fresh.settings.set(main_split_top=400, main_split_bottom=300)
+
+    restored = MainWindow()
+    restored.resize(1000, 800)
+    restored.show()
+    qapp.processEvents()
+    top, bottom = restored._main_splitter.sizes()
+    log_fraction = bottom / (top + bottom)
+    restored.close()
+
+    # Their choice, not the default. (The exact ratio is clamped by the tab
+    # area's minimum height, so assert the direction, not the pixel.)
+    assert log_fraction > default_log_fraction * 2

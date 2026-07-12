@@ -243,7 +243,12 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(f"Ripped Record Formatter {__version__}")
-        self.resize(920, 760)
+        # Default geometry follows the screen rather than a hardcoded 920x760,
+        # which squeezed the Full Rip tab (source group + metadata + waveform +
+        # track table) into uselessness. Take a generous share of the *available*
+        # area -- so a 1080p desktop gets a tall window and a 1600x900 laptop
+        # still gets one that fits. The user's own size wins once they set it.
+        self.resize(*self._default_window_size())
         self.setAcceptDrops(True)
 
         self.settings = Settings()
@@ -287,7 +292,7 @@ class MainWindow(QMainWindow):
         self.log.setMaximumBlockCount(1000)
         line_h = self.log.fontMetrics().lineSpacing()
         self.log.setMinimumHeight(line_h * 2)
-        self._default_log_height = line_h * 5 + 12
+        self._default_log_height = line_h * 4 + 12
 
         self._main_splitter = QSplitter(Qt.Orientation.Vertical)
         self._main_splitter.addWidget(self.tabs)
@@ -383,6 +388,18 @@ class MainWindow(QMainWindow):
     def _jobs_done(self) -> None:
         self.convert_panel.set_running(False)
         self.retag_panel.set_running(False)
+
+    @staticmethod
+    def _default_window_size() -> tuple[int, int]:
+        from PySide6.QtWidgets import QApplication
+
+        screen = QApplication.primaryScreen()
+        if screen is None:                       # headless / offscreen
+            return 1180, 820
+        available = screen.availableGeometry()
+        width = min(1280, int(available.width() * 0.72))
+        height = min(1000, int(available.height() * 0.92))
+        return max(1000, width), max(700, height)
 
     def _log(self, message: str) -> None:
         self.log.appendPlainText(message)
