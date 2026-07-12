@@ -21,14 +21,14 @@ def test_vorbis_tags_full_set():
     t = Tracks(3, "Song", "Album", "Artist", "x.wav",
                album_artist="AlbArt", date="1993", track_total=6,
                disc_number=1, disc_total=2, mb_album_id="alb", mb_artist_id="art",
-               mb_track_id="rec")
+               mb_recording_id="rec", mb_track_id="trk")
     tags = t.vorbis_tags()
     assert tags == {
         "artist": "Artist", "album": "Album", "title": "Song", "tracknumber": "3",
         "albumartist": "AlbArt", "date": "1993", "tracktotal": "6",
         "discnumber": "1", "disctotal": "2",
         "musicbrainz_albumid": "alb", "musicbrainz_artistid": "art",
-        "musicbrainz_trackid": "rec",
+        "musicbrainz_recordingid": "rec", "musicbrainz_trackid": "trk",
     }
 
 
@@ -47,7 +47,7 @@ def test_full_release_tags_written_verbatim(tmp_path):
     t = Tracks(2, "So What", "Kind of Blue", "Miles Davis", _wav(tmp_path),
                album_artist="Miles Davis", date="1959", track_total=5,
                disc_number=1, disc_total=2, mb_album_id="rel-mbid",
-               mb_artist_id="art-mbid", mb_track_id="rec-mbid")
+               mb_artist_id="art-mbid", mb_recording_id="rec-mbid", mb_track_id="trk-mbid")
     res = convert_wavs_to_flacs([t], tmp_path / "out", configure=False)
     assert not res.warnings, res.warnings
 
@@ -63,7 +63,8 @@ def test_full_release_tags_written_verbatim(tmp_path):
     assert f["disctotal"] == ["2"]
     assert f["musicbrainz_albumid"] == ["rel-mbid"]
     assert f["musicbrainz_artistid"] == ["art-mbid"]
-    assert f["musicbrainz_trackid"] == ["rec-mbid"]
+    assert f["musicbrainz_recordingid"] == ["rec-mbid"]
+    assert f["musicbrainz_trackid"] == ["trk-mbid"]
 
 
 def test_minimal_flow_has_no_empty_fields(tmp_path):
@@ -74,5 +75,6 @@ def test_minimal_flow_has_no_empty_fields(tmp_path):
     keys = {k.lower() for k in f.keys()}
     assert keys == {"artist", "album", "title", "tracknumber"}
     for absent in ("albumartist", "date", "tracktotal", "discnumber",
-                   "musicbrainz_albumid", "musicbrainz_artistid", "musicbrainz_trackid"):
+                   "musicbrainz_albumid", "musicbrainz_artistid",
+                   "musicbrainz_recordingid", "musicbrainz_trackid"):
         assert absent not in keys

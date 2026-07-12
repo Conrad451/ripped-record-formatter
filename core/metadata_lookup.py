@@ -122,7 +122,8 @@ class TrackInfo:
     length_ms: int | None = None      # duration in milliseconds, if known
     artist: str = ""          # per-track artist (splits/VA); "" -> use release
     artist_id: str = ""       # per-track artist MBID
-    recording_id: str = ""    # MUSICBRAINZ_TRACKID source (recording MBID)
+    recording_id: str = ""    # MUSICBRAINZ_RECORDINGID source (recording MBID)
+    track_mbid: str = ""      # MUSICBRAINZ_TRACKID source (release-track MBID)
 
     def length_display(self) -> str:
         """``m:ss`` for the duration, or ``""`` when unknown."""
@@ -519,6 +520,7 @@ def _parse_track(track: dict, index: int) -> TrackInfo:
         artist=artist,
         artist_id=artist_id,
         recording_id=recording.get("id", "") or "",
+        track_mbid=track.get("id", "") or "",   # release-track MBID
     )
 
 

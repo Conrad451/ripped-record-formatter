@@ -981,7 +981,8 @@ class FullRipTab(QWidget):
                 disc_total=(total_sides if rich else None),
                 mb_album_id=(album_mb if rich else ""),
                 mb_artist_id=((info.artist_id if info and info.artist_id else release_artist_id) if rich else ""),
-                mb_track_id=(info.recording_id if (rich and info) else ""),
+                mb_recording_id=(info.recording_id if (rich and info) else ""),
+                mb_track_id=(info.track_mbid if (rich and info) else ""),
             ))
         return result
 

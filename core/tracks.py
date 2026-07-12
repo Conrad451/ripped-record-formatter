@@ -58,7 +58,8 @@ class Tracks:
     disc_total: int | None = None
     mb_album_id: str = ""                   # MUSICBRAINZ_ALBUMID (release MBID)
     mb_artist_id: str = ""                  # MUSICBRAINZ_ARTISTID
-    mb_track_id: str = ""                   # MUSICBRAINZ_TRACKID (recording MBID)
+    mb_recording_id: str = ""               # MUSICBRAINZ_RECORDINGID (recording MBID)
+    mb_track_id: str = ""                   # MUSICBRAINZ_TRACKID (release-track MBID)
 
     def __post_init__(self) -> None:
         self.track_num = int(self.track_num)
@@ -110,6 +111,7 @@ class Tracks:
             "disctotal": self.disc_total,
             "musicbrainz_albumid": self.mb_album_id,
             "musicbrainz_artistid": self.mb_artist_id,
+            "musicbrainz_recordingid": self.mb_recording_id,
             "musicbrainz_trackid": self.mb_track_id,
         }
         return {k: str(v) for k, v in candidates.items()

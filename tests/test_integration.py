@@ -225,8 +225,8 @@ def test_full_rip_fanout_enriches_and_manual_stays_minimal(qapp, tmp_path):
     fr = MainWindow().full_rip
     detail = ReleaseDetail("rel-mbid", "Album", "Artist", year="1993", artist_id="art-mbid",
                            media=(MediumInfo(1, "Vinyl", tracks=(
-                               TrackInfo(1, "A1", "T1", 100000, recording_id="rec1"),
-                               TrackInfo(2, "A2", "T2", 100000, recording_id="rec2"))),))
+                               TrackInfo(1, "A1", "T1", 100000, recording_id="rec1", track_mbid="trk1"),
+                               TrackInfo(2, "A2", "T2", 100000, recording_id="rec2", track_mbid="trk2"))),))
     fr._apply_release(detail)              # side 0 selected -> review context set
     segs = [tmp_path / "1.wav", tmp_path / "2.wav"]
 
@@ -235,8 +235,9 @@ def test_full_rip_fanout_enriches_and_manual_stays_minimal(qapp, tmp_path):
     assert t0.album_artist == "Artist" and t0.date == "1993"
     assert t0.track_total == 2 and t0.disc_number == 1 and t0.disc_total == 1
     assert t0.mb_album_id == "rel-mbid" and t0.mb_artist_id == "art-mbid"
-    assert t0.mb_track_id == "rec1"
-    assert "musicbrainz_trackid" in t0.vorbis_tags()
+    assert t0.mb_recording_id == "rec1" and t0.mb_track_id == "trk1"
+    assert t0.vorbis_tags()["musicbrainz_recordingid"] == "rec1"
+    assert t0.vorbis_tags()["musicbrainz_trackid"] == "trk1"
 
     # No release -> fan-out stays minimal (old tag set, no empties).
     fr2 = MainWindow().full_rip
