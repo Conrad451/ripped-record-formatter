@@ -72,11 +72,11 @@ from gui.waveform import WaveformView
 # default for anything the heuristics are not confident about.
 SKIP_LABEL = "— skip —"
 
-# Mapping-table geometry: 5 rows visible without scrolling (header + 5 * row) --
+# Mapping-table geometry: 4 rows visible without scrolling (header + 4 * row) --
 # enough for a double album plus a stray, while leaving the review area the
 # dominant share of the tab.
 _MAP_ROW_H = 22
-_MAP_TABLE_ROWS = 5
+_MAP_TABLE_ROWS = 4
 _MAP_TABLE_H = _MAP_ROW_H * _MAP_TABLE_ROWS + 26
 
 
@@ -842,6 +842,36 @@ class FullRipTab(QWidget):
             self._album_wavs = [Path(path)]
             self._rebuild_mapping_table()
             self._log(f"Source: {Path(path).name}")
+
+    def add_recorded_wav(self, path) -> bool:
+        """A recording just landed. Fold it into the mapping table if it belongs.
+
+        This is the record-to-rip handoff. If the Record tab is writing into the
+        same folder this tab is pointed at, a finished side appears here on its
+        own -- record side A, flip, record side B, and the album job is mapped
+        without the user touching the mapping table at all.
+
+        Returns whether the file was adopted. A recording into some *other*
+        folder is none of this tab's business and is left alone.
+        """
+        path = Path(path)
+        if not path.exists():
+            return False
+        if any(Path(w) == path for w in self._album_wavs):
+            return True                                # already listed
+
+        # Only adopt it if it is in the folder this tab is already working from.
+        folder = self._album_wavs[0].parent if self._album_wavs else None
+        if folder is None or path.parent != folder:
+            return False
+
+        self._album_wavs = sorted({*self._album_wavs, path})
+        self._rebuild_mapping_table()
+        mapped = self._album_mapping[self._album_wavs.index(path)]
+        where = (f"mapped to Side {side_letter(mapped)}" if mapped is not None
+                 else "added, left on skip (name it SideX.wav to auto-map)")
+        self._log(f"Full Rip: recording '{path.name}' {where}.")
+        return True
 
     def _rebuild_mapping_table(self) -> None:
         """One row per scanned WAV; the side dropdown defaults to skip.

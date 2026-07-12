@@ -440,3 +440,109 @@ class Recorder:
                 shutil.rmtree(self._staging_dir, ignore_errors=True)
                 self._staging_dir = None
             self._staging_path = None
+
+
+class LevelMonitor:
+    """Live input levels *without* recording -- for setting gain before you press
+    Record.
+
+    Deliberately separate from :class:`Recorder`: it opens a stream, computes the
+    same peaks and clip runs, and writes nothing at all. No file, no queue, no
+    writer thread. Metering while idle must not be able to produce a stray WAV.
+    """
+
+    def __init__(
+        self,
+        on_telemetry: TelemetryCallback | None = None,
+        *,
+        stream_factory: Callable | None = None,
+        telemetry_interval_s: float = TELEMETRY_INTERVAL_S,
+    ) -> None:
+        self._on_telemetry = on_telemetry
+        self._stream_factory = stream_factory
+        self._telemetry_interval = telemetry_interval_s
+        self._stream = None
+        self._channels = 0
+        self._window_peak: np.ndarray | None = None
+        self._max_peak = 0.0
+        self._clips = _ClipCounter()
+        self._started_at = 0.0
+        self._last_emit = 0.0
+        self.error = ""
+
+    @property
+    def running(self) -> bool:
+        return self._stream is not None
+
+    def reset_peaks(self) -> None:
+        """Clear the running max and the latched clip count."""
+        self._max_peak = 0.0
+        self._clips = _ClipCounter()
+
+    def start(self, device: int, samplerate: int, channels: int = 2,
+              *, blocksize: int = 1024) -> None:
+        if self.running:
+            self.stop()
+        self._channels = int(channels)
+        self._window_peak = np.zeros(self._channels, dtype=np.float64)
+        self.error = ""
+        self._started_at = time.monotonic()
+        self._last_emit = 0.0
+
+        factory = self._stream_factory
+        if factory is None:
+            import sounddevice as sd
+
+            factory = sd.InputStream
+        try:
+            self._stream = factory(
+                device=device, channels=self._channels, samplerate=int(samplerate),
+                dtype="float32", blocksize=blocksize, callback=self.audio_callback,
+            )
+            self._stream.start()
+        except Exception as exc:
+            self._stream = None
+            self.error = f"{type(exc).__name__}: {exc}"
+
+    def audio_callback(self, indata, frames, time_info, status) -> None:
+        try:
+            block = np.array(indata, dtype=np.float32, copy=True)
+            if block.ndim == 1:
+                block = block.reshape(-1, 1)
+            peaks = np.abs(block).max(axis=0)
+            if self._window_peak is not None and peaks.shape == self._window_peak.shape:
+                np.maximum(self._window_peak, peaks, out=self._window_peak)
+            block_peak = float(peaks.max()) if peaks.size else 0.0
+            if block_peak > self._max_peak:
+                self._max_peak = block_peak
+            self._clips.feed(block)
+
+            if self._on_telemetry is None:
+                return
+            now = time.monotonic()
+            if now - self._last_emit < self._telemetry_interval:
+                return
+            self._last_emit = now
+            window = self._window_peak
+            peaks_db = [_to_dbfs(float(p)) for p in window] if window is not None else []
+            if window is not None:
+                window.fill(0.0)
+            self._on_telemetry(Telemetry(
+                peaks_dbfs=peaks_db,
+                max_peak_dbfs=_to_dbfs(self._max_peak),
+                clip_runs=self._clips.runs,
+                elapsed_s=now - self._started_at,
+                bytes_written=0,
+            ))
+        except Exception as exc:
+            self.error = f"{type(exc).__name__}: {exc}"
+
+    def stop(self) -> None:
+        stream, self._stream = self._stream, None
+        if stream is None:
+            return
+        try:
+            stream.stop()
+            stream.close()
+        except Exception as exc:
+            self.error = self.error or f"{type(exc).__name__}: {exc}"

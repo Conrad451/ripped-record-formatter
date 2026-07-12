@@ -94,6 +94,21 @@ class Config:
     window_s: float = 15.0
     speed_tolerance: float = 0.02
 
+    # --- recording ---
+    record_device: str = ""
+    """Input device, remembered by NAME -- PortAudio indices shift when devices
+    come and go, so an index would silently point at the wrong input."""
+
+    record_samplerate: int = 0
+    """0 = use the device's native rate. Set explicitly to pin it (a Realtek line
+    input often reports 192000 under WASAPI even though the chain is 44.1k)."""
+
+    record_subtype: str = "PCM_16"
+    """PCM_16 (default) or PCM_24."""
+
+    record_output_dir: str = ""
+    record_next_file: str = "SideA.wav"
+
     # --- audition playback ---
     preview_lead_in_s: float = 5.0
     """Preview a cut by playing from this many seconds before it, straight
