@@ -143,6 +143,36 @@ def ensure_ffmpeg(auto_download: bool = True) -> tuple[Path, Path]:
     return ffmpeg, ffprobe
 
 
+def prime_path(auto_download: bool = False) -> Path | None:
+    """Put the resolved ffmpeg's directory on ``PATH`` -- *before* pydub is imported.
+
+    pydub probes for ffmpeg at **import time** and, finding none on ``PATH``,
+    prints ``RuntimeWarning: Couldn't find ffmpeg or avconv``. In a frozen build
+    that warning is a lie -- ffmpeg is right there inside the bundle -- and it
+    appears two lines above the smoke harness reporting that the bundled ffmpeg
+    resolved fine. Contradicting yourself in your own output is how you train
+    people to ignore warnings, so we pre-empt it rather than filter it: resolve
+    ffmpeg first, put it on PATH, and pydub simply finds it.
+
+    Safe to call before anything else; returns ``None`` (silently) when no ffmpeg
+    can be found, leaving the existing error paths to complain properly later.
+    """
+    try:
+        ffmpeg, _ = find_ffmpeg()
+        if ffmpeg is None and auto_download:
+            download_ffmpeg()
+            ffmpeg, _ = find_ffmpeg()
+        if ffmpeg is None:
+            return None
+    except Exception:
+        return None
+
+    bin_dir = str(ffmpeg.parent)
+    if bin_dir not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+    return ffmpeg
+
+
 def configure_pydub(auto_download: bool = True) -> Path:
     """Point pydub at the resolved ffmpeg/ffprobe and return the ffmpeg path.
 

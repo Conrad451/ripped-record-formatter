@@ -14,12 +14,29 @@ does the subsystem do its job, in the frozen environment.
 deliberate: it loads the same DLLs, the same `_MEIPASS`, the same collected data
 as the real exe, so a pass means something.
 
+**Double-clicking it works.** The window stays open until you press Enter (it
+detects that it owns its own console). Launched from a terminal it does not hold,
+so it stays usable in scripts; pass `--no-hold` to force that off in CI. It also
+always holds on a failure — a failure you cannot read is worse than no test.
+
 ```
 dist\RippedRecordFormatter\FrozenSmoke.exe
 ```
 
-It prints a table and exits `0` (all passed) or `1` (something failed). Set
+It prints a table and exits `0` (nothing failed) or `1` (something did). Set
 `SMOKE_TRACEBACK=1` for full tracebacks.
+
+### On a machine with no sound card
+
+Servers and bare VMs have no audio hardware. The two audio checks then report
+**`[SKIP]`**, not `[FAIL]`, and the summary says so:
+
+```
+  9/11 passed, 2 skipped: no audio hardware
+```
+
+That is **not a bundle defect** — PortAudio loaded and answered; the machine
+simply has nothing to enumerate. Only a `[FAIL]` means the bundle is broken.
 
 To prove the bundle is genuinely self-contained, run it with the machine's own
 ffmpeg hidden — otherwise a bundled-ffmpeg "pass" proves nothing:

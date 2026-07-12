@@ -193,9 +193,15 @@ restore → split → encode. Eleven checks; all must pass.
 A dev machine has Python, ffmpeg and audio drivers already installed, so it
 **cannot** prove the bundle stands alone. On a second machine:
 
-1. Copy the whole `dist\RippedRecordFormatter\` folder across. Do not install
-   anything.
-2. Run `FrozenSmoke.exe`. Expect **11/11 passed**; send the output back if not.
+1. Copy **`dist\RippedRecordFormatter\`** across — that is the folder containing
+   `_internal\`, `RippedRecordFormatter.exe` and `FrozenSmoke.exe`. It is the
+   whole product. (`build\` is PyInstaller's scaffolding, not the product; ignore
+   it.) Do not install anything.
+2. Run `FrozenSmoke.exe` — **double-clicking it is fine**, the window now stays
+   open until you press Enter. Expect **11/11 passed**; send the output back if
+   not. On a machine with no sound card the two audio checks report `[SKIP]` and
+   the summary reads *"9/11 passed, 2 skipped: no audio hardware"* — that is
+   expected and is not a bundle defect. Only a `[FAIL]` is.
 3. Launch `RippedRecordFormatter.exe`. Confirm the window opens and the title
    shows the version.
 4. Time the launch. Confirm the delay to a visible window is acceptable

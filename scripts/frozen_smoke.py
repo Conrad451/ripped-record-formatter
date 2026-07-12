@@ -20,21 +20,65 @@ import tempfile
 import traceback
 from pathlib import Path
 
-RESULTS: list[tuple[str, bool, str]] = []
+# Before anything imports pydub: pydub probes for ffmpeg at import time and warns
+# if PATH has none. In a frozen build that warning contradicts the bundled-ffmpeg
+# PASS printed two lines later. Pre-empt it rather than filter it.
+from core.ffmpeg_locator import prime_path  # noqa: E402
+
+prime_path()
+
+PASS, FAIL, NOHW = "PASS", "FAIL", "SKIP"
+
+# (name, status, detail)
+RESULTS: list[tuple[str, str, str]] = []
+
+
+class NoHardware(Exception):
+    """Not a bundle defect: this machine simply has no audio hardware.
+
+    A headless server or a bare VM has no sound card and no output endpoint. The
+    bundle is fine; there is nothing to test. Reporting that as a hard failure
+    would train people to ignore a genuinely broken PortAudio DLL.
+    """
 
 
 def check(name: str):
     def wrap(fn):
         try:
             detail = fn() or "ok"
-            RESULTS.append((name, True, str(detail)))
+            RESULTS.append((name, PASS, str(detail)))
+        except NoHardware as exc:
+            RESULTS.append((name, NOHW, str(exc)))
         except Exception as exc:
-            RESULTS.append((name, False, f"{type(exc).__name__}: {exc}"))
+            RESULTS.append((name, FAIL, f"{type(exc).__name__}: {exc}"))
             if os.environ.get("SMOKE_TRACEBACK"):
                 traceback.print_exc()
         return fn
 
     return wrap
+
+
+def _owns_console() -> bool:
+    """True when we spawned our own console window -- i.e. we were double-clicked.
+
+    ``sys.stdout.isatty()`` is useless here: under PyInstaller's console
+    bootloader a double-click gets a real console, so isatty() is True either
+    way. What actually distinguishes them is *who else is attached*: launched
+    from a shell, that shell is on the console's process list too; double-clicked,
+    we are the only one. If the probe fails for any reason we return False and
+    fall back to holding on failure only.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        buffer = (wintypes.DWORD * 8)()
+        count = ctypes.windll.kernel32.GetConsoleProcessList(buffer, 8)
+        return count <= 1
+    except Exception:
+        return False
 
 
 def main() -> int:
@@ -267,6 +311,11 @@ def main() -> int:
         app = globals()["_APP"]
         player = AuditionPlayer()
         if not player.available:
+            reason = (player.unavailable_reason or "").lower()
+            if "device" in reason or "no audio" in reason:
+                raise NoHardware(
+                    "no audio output device on this machine (expected on a server "
+                    "or VM -- not a bundle defect)")
             raise RuntimeError(f"no audio backend: {player.unavailable_reason}")
 
         tmp = Path(tempfile.mkdtemp(prefix="smoke_"))
@@ -306,10 +355,14 @@ def main() -> int:
 
         from core.recorder import list_input_devices
 
+        # PortAudio itself answering proves the DLL shipped. Zero *devices* after
+        # that is a property of the machine, not of the bundle.
         version = sd.get_portaudio_version()[1]
         devices = list_input_devices()
         if not devices:
-            raise RuntimeError("zero input devices — PortAudio DLL missing?")
+            raise NoHardware(
+                f"PortAudio loaded ({version.split(',')[0]}) but this machine has no "
+                "audio input device (expected on a server or VM -- not a bundle defect)")
         return f"{version.split(',')[0]} | {len(devices)} input device(s); " \
                f"first: {devices[0].name}"
 
@@ -337,20 +390,39 @@ def main() -> int:
     # --- report --------------------------------------------------------------
     print()
     width = max(len(n) for n, _, _ in RESULTS)
-    failed = 0
-    for name, ok, detail in RESULTS:
-        mark = "PASS" if ok else "FAIL"
-        if not ok:
-            failed += 1
-        print(f"  [{mark}] {name.ljust(width)}  {detail}")
+    failed = sum(1 for _, st, _ in RESULTS if st == FAIL)
+    skipped = sum(1 for _, st, _ in RESULTS if st == NOHW)
+    passed = sum(1 for _, st, _ in RESULTS if st == PASS)
+
+    for name, status, detail in RESULTS:
+        print(f"  [{status}] {name.ljust(width)}  {detail}")
 
     print()
     print("=" * 72)
-    print(f"  {len(RESULTS) - failed}/{len(RESULTS)} passed"
-          + ("" if not failed else f"  — {failed} FAILED"))
+    summary = f"  {passed}/{len(RESULTS)} passed"
+    if skipped:
+        summary += f", {skipped} skipped: no audio hardware"
+    if failed:
+        summary += f"  —  {failed} FAILED"
+    print(summary)
+    if skipped and not failed:
+        print("  No audio hardware on this machine. The bundle is fine -- rerun on")
+        print("  a machine with a sound card to exercise playback and recording.")
     print("=" * 72)
     return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    hold_never = "--no-hold" in sys.argv           # for CI
+    code = main()
+
+    # Double-clicking the exe used to flash a console and vanish, which made the
+    # obvious way to run this the one way you could not read the output. Hold if
+    # we own the console (double-clicked), or on any failure -- because a failure
+    # you cannot read is worse than no test at all.
+    if not hold_never and (_owns_console() or code != 0):
+        try:
+            input("\nPress Enter to close...")
+        except EOFError:
+            pass
+    raise SystemExit(code)
