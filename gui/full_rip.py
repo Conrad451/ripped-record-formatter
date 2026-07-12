@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QMessageBox,
     QListWidgetItem,
     QProgressBar,
     QPushButton,
@@ -94,26 +95,6 @@ class _Signals(QObject):
     cancelled = Signal()
 
 
-class SplitWorker(QRunnable):
-    def __init__(self, restored, timestamps, split_dir):
-        super().__init__()
-        self.restored = Path(restored)
-        self.timestamps = timestamps
-        self.split_dir = Path(split_dir)
-        self.signals = _Signals()
-
-    def run(self) -> None:
-        try:
-            from core.splitting import execute_split
-            self.signals.progress.emit("Cutting tracks...")
-            segments = execute_split(
-                self.restored, self.timestamps, self.split_dir,
-                on_progress=lambda i, t, n: self.signals.progress.emit(f"  cut [{i}/{t}] {n}"))
-            self.signals.finished.emit(segments)
-        except Exception as exc:
-            self.signals.error.emit(f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}")
-
-
 # --------------------------------------------------------------------------- #
 # The tab
 # --------------------------------------------------------------------------- #
@@ -130,7 +111,6 @@ class FullRipTab(QWidget):
         self._cover = None
         self._work_dir: Path | None = None
         self._analysis: AnalyzeResult | None = None
-        self._segments: list[Path] = []
         self._flat_titles: list[str] = []
         self._flat_durations_ms: list[int] = []
         self._flat_track_infos: list = []          # TrackInfo per flat track
@@ -159,8 +139,6 @@ class FullRipTab(QWidget):
         self._album_output_root = ""
         self._album_meta: dict = {}
         self._album_review_index: int | None = None
-        # (side_index, timestamps) held between Accept splits and Encode.
-        self._album_pending: tuple[int, list[float]] | None = None
         self._relay = _StateRelay()
         self._relay.changed.connect(self._on_side_state)
 
@@ -334,14 +312,6 @@ class FullRipTab(QWidget):
         self.meta_summary.setWordWrap(True)
         self.meta_summary.setStyleSheet("QLabel { color: palette(mid); }")
         review.addWidget(self.meta_summary)
-
-        encode_row = QHBoxLayout()
-        encode_row.addStretch(1)
-        self.encode_button = QPushButton("Encode tracks")
-        self.encode_button.setEnabled(False)
-        self.encode_button.clicked.connect(self._encode)
-        encode_row.addWidget(self.encode_button)
-        review.addLayout(encode_row)
 
         self.progress = QProgressBar()
         root.addWidget(self.progress)
@@ -578,6 +548,31 @@ class FullRipTab(QWidget):
         self._update_gap_prompt()
         self._update_accept_enabled()
         self._soft_hint_deviations()
+        if self._album_review_index is not None:
+            self._sync_review_table()
+
+    def _sync_review_table(self) -> None:
+        """Keep the editable track table sized to the current split count.
+
+        The table is live from the moment a side is ready, so titles/artists can
+        be corrected *before* Accept. Moving a marker changes how many tracks
+        there are, so rows follow the markers -- edits already made are kept and
+        any new row falls back to the release's title for that position.
+        """
+        n = len(self.waveform.marker_times()) + 1
+        existing = self.model.rows()
+        default_artist = self._release.artist if self._release else self.artist_edit.text().strip()
+
+        rows = []
+        for i in range(n):
+            if i < len(existing):
+                rows.append(existing[i])                  # keep what the user typed
+                continue
+            title = self._expected_titles[i] if i < len(self._expected_titles) else f"track_{i + 1:02d}"
+            info = self._review_track_infos[i] if i < len(self._review_track_infos) else None
+            artist = info.artist if (info and info.artist) else default_artist
+            rows.append(Row(title=title, artist=artist, source_path=None))
+        self.model.set_rows(rows)
 
     def _needed_markers(self) -> int | None:
         return (self._expected_n - 1) if self._expected_n else None
@@ -626,75 +621,21 @@ class FullRipTab(QWidget):
         if detect_progressive_drift(self._segment_durations(), self._expected_durations_s):
             self._log("Splits drift from the tracklist - wrong side selected?")
 
-    # -- two-step accept: split -> (edit) -> encode -------------------------
+    # -- accept -------------------------------------------------------------
     def _accept_splits(self) -> None:
+        """Accept the reviewed side.
+
+        Asymmetry worth naming: everything in this tab is an album job now (a
+        lone WAV is a one-row mapping table), so Accept both cuts *and* encodes,
+        and there is no separate Encode button. The two-step Accept->Encode that
+        the old standalone single-WAV entry point had went away with that entry
+        point in the Full Rip consolidation; the Convert/Re-tag tabs still own
+        the "I already have per-track files" workflow.
+        """
         if self._analysis is None:
             return
         if self._album is not None and self._album_review_index is not None:
             self._accept_album_side()
-            return
-        if self._busy:
-            return
-        timestamps = self.waveform.marker_times()
-        self._set_busy(True)
-        self.progress.setRange(0, 0)
-        split_dir = self._work_dir / "segments"
-        worker = SplitWorker(self._analysis.restored_path, timestamps, split_dir)
-        worker.signals.progress.connect(self._log)
-        worker.signals.finished.connect(self._on_split_done)
-        worker.signals.error.connect(self._on_error)
-        self.pool.start(worker)
-
-    def _on_split_done(self, segments: list) -> None:
-        self.progress.setRange(0, 1)
-        self.progress.setValue(1)
-        self._set_busy(False)
-        self._segments = [Path(s) for s in segments]
-        default_artist = self._release.artist if self._release else self.settings.config.last_artist
-        rows = []
-        for i, seg in enumerate(self._segments):
-            title = self._expected_titles[i] if i < len(self._expected_titles) else f"track_{i + 1:02d}"
-            info = self._review_track_infos[i] if i < len(self._review_track_infos) else None
-            artist = info.artist if (info and info.artist) else default_artist
-            rows.append(Row(title=title, artist=artist, source_path=seg))
-        self.model.set_rows(rows)
-        self._update_meta_summary()
-        self.encode_button.setText(f"Encode {len(self._segments)} tracks")
-        self.encode_button.setEnabled(True)
-        self._log(f"Full Rip: {len(self._segments)} tracks cut. "
-                  "Edit titles if needed, then Encode.")
-
-    def _encode(self) -> None:
-        """Hand the reviewed side, with its edited titles, back to the controller.
-
-        The cutting already happened in :meth:`_accept_album_side`; the segments
-        ride along on the SideJob so the controller does not split twice. The
-        controller owns encoding (it pipelines it against later sides still being
-        analysed), so this is the point where the side leaves the review area.
-        """
-        if self._busy or not self._segments or self._album is None:
-            return
-        if self._album_pending is None:
-            return
-        output = self.output_edit.text().strip()
-        if not output:
-            self._log("Full Rip: choose an output folder first.")
-            return
-
-        index, timestamps = self._album_pending
-        side = self._album_side(index)
-        if side is None:
-            return
-        side.segments = list(self._segments)
-        titles = [r.title for r in self.model.rows()]
-
-        self._album.accept_side(index, timestamps, titles)
-        self._log(f"Album: {side.label} accepted ({len(self._segments)} tracks); "
-                  "encoding in the background.")
-
-        self._album_pending = None
-        self._album_review_index = None
-        self._clear_review()
 
     def _on_error(self, message: str) -> None:
         self.progress.setRange(0, 1)
@@ -706,10 +647,8 @@ class FullRipTab(QWidget):
         self.start_album_btn.setEnabled(not busy and self._album is None)
         if busy:
             self.accept_button.setEnabled(False)
-            self.encode_button.setEnabled(False)
         else:
             self._update_accept_enabled()
-            self.encode_button.setEnabled(bool(self._segments))
 
     # -- review area visibility ---------------------------------------------
     def _show_review(self) -> None:
@@ -730,7 +669,6 @@ class FullRipTab(QWidget):
     def _clear_review(self) -> None:
         """Return the review area to its empty state after a side is handed off."""
         self._analysis = None
-        self._segments = []
         self.model.set_rows([])
         self.waveform.clear_markers(emit=False)
         self.waveform.clear_region()
@@ -739,7 +677,6 @@ class FullRipTab(QWidget):
         self.diagnosis_box.setVisible(False)
         self.accept_button.setText("Accept splits")
         self.accept_button.setEnabled(False)
-        self.encode_button.setEnabled(False)
         self._set_empty_state(self._pending_review_message())
 
     def _pending_review_message(self) -> str:
@@ -918,13 +855,39 @@ class FullRipTab(QWidget):
             if side is not None:
                 self._log(f"Album: {side.label} not ready yet ({side.state.value}).")
             return
+        if side.index == self._album_review_index:
+            return                                  # already open
+        if not self._confirm_discard_review():
+            return
         if side.state in (SideState.READY, SideState.RESOLVING):
             self._album.mark_resolving(side.index)
             self._load_side_for_review(side)
 
+    def _confirm_discard_review(self) -> bool:
+        """Ask once before throwing away an in-progress, unaccepted review.
+
+        Only unaccepted state is at risk: an accepted side is already cut and
+        queued to encode, so switching away from it loses nothing.
+        """
+        if self._album_review_index is None or self._analysis is None:
+            return True
+        current = self._album_side(self._album_review_index)
+        label = current.label if current else "this side"
+        answer = QMessageBox.question(
+            self, "Discard review?",
+            f"Discard {label}'s review? Its splits and title edits have not been accepted.",
+            QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Discard:
+            return False
+        self._log(f"Album: {label} review discarded.")
+        self._album_review_index = None
+        self._clear_review()
+        return True
+
     def _load_side_for_review(self, side) -> None:
         self._album_review_index = side.index
-        self._album_pending = None
         analysis = side.analysis
         self._analysis = analysis
         self._show_review()
@@ -945,12 +908,15 @@ class FullRipTab(QWidget):
             self.waveform.clear_region()
             self.waveform.set_place_mode(False)
             self.waveform.zoom_full()
+        self.model.set_rows([])
+        self._sync_review_table()
         self._update_accept_enabled()
         self._log(f"Album: reviewing {side.label} "
-                  f"({len(analysis.proposal.split_points)} cut(s), {len(self._unresolved)} unresolved).")
+                  f"({len(analysis.proposal.split_points)} cut(s), {len(self._unresolved)} unresolved). "
+                  "Edit titles/artists, then Accept side.")
 
     def _enrich_tracks(self, titles, segments, track_infos, side_position, total_sides, artist, album,
-                       *, file_start=None, side_letter_="", use_side_letters=False):
+                       *, artists=None, file_start=None, side_letter_="", use_side_letters=False):
         """Build Tracks carrying every field we actually have from the release.
 
         With no release selected, only the base fields are set -- the old minimal
@@ -979,7 +945,11 @@ class FullRipTab(QWidget):
                 title = info.title
             else:
                 title = f"track_{i + 1:02d}"
-            row_artist = info.artist if (info and info.artist) else artist
+            # An artist the reviewer actually typed wins over anything derived.
+            if artists and i < len(artists) and str(artists[i]).strip():
+                row_artist = str(artists[i]).strip()
+            else:
+                row_artist = info.artist if (info and info.artist) else artist
             result.append(Tracks(
                 i + 1, title, album, row_artist, seg,
                 album_artist=(artist if rich else ""),
@@ -1016,30 +986,37 @@ class FullRipTab(QWidget):
         self.meta_summary.setText("Will also write: " + " | ".join(bits))
 
     def _accept_album_side(self) -> None:
-        """Cut the reviewed side and fill the track table -- the first of two steps.
+        """Accept *is* the commit: snapshot, enqueue the encode, free the review.
 
-        Accepting used to hand straight to the controller, which meant an album
-        side was encoded with the release's titles and no chance to edit them.
-        Now it cuts, shows the tracks, and waits for Encode -- the same two-step
-        the single-side flow always had.
+        There used to be an accepted-but-not-yet-encoded limbo -- Accept cut the
+        side, then a separate Encode button handed it to the controller -- and
+        switching sides in between silently dropped it. Now Accept snapshots the
+        table onto the SideJob and the controller enqueues the encode straight
+        onto its encode pool, so there is nothing left in the UI to lose. The
+        controller does the cutting inside encode_fn.
         """
-        if self._busy:
+        if self._busy or self._album is None:
             return
         index = self._album_review_index
         side = self._album_side(index)
         if side is None or side.analysis is None:
             return
-        timestamps = self.waveform.marker_times()
-        self._album_pending = (index, list(timestamps))
+        if not self.output_edit.text().strip():
+            self._log("Album: choose an output folder first.")
+            return
 
-        self._set_busy(True)
-        self.progress.setRange(0, 0)
-        split_dir = self._album_work_dir / f"side_{index}" / "segments"
-        worker = SplitWorker(side.analysis.restored_path, timestamps, split_dir)
-        worker.signals.progress.connect(self._log)
-        worker.signals.finished.connect(self._on_split_done)
-        worker.signals.error.connect(self._on_error)
-        self.pool.start(worker)
+        timestamps = self.waveform.marker_times()
+        rows = self.model.rows()
+        titles = [r.title for r in rows]
+        artists = [r.artist for r in rows]
+
+        # Snapshot + enqueue in one step; the side list now drives the feedback.
+        self._album.accept_side(index, timestamps, titles, artists)
+        self._log(f"Album: {side.label} accepted ({len(titles)} tracks); "
+                  "cutting and encoding in the background.")
+
+        self._album_review_index = None
+        self._clear_review()
 
     def _album_analyze(self, side, should_cancel):
         """Runs on an AlbumController thread -- no widget access."""
@@ -1080,10 +1057,8 @@ class FullRipTab(QWidget):
         from core.tracks import Tracks
 
         side_dir = self._album_work_dir / f"side_{side.index}"
-        # The reviewer already cut this side (Accept splits) to fill the track
-        # table; reuse those segments rather than splitting a side-long WAV twice.
-        segments = list(side.segments) or execute_split(
-            side.analysis.restored_path, side.timestamps, side_dir / "segments")
+        segments = execute_split(side.analysis.restored_path, side.timestamps,
+                                 side_dir / "segments")
         artist = self._album_meta.get("artist", "")
         album = self._album_meta.get("album", "")
         track_infos = self._side_track_infos.get(side.index, [])
@@ -1098,6 +1073,8 @@ class FullRipTab(QWidget):
         tracks = self._enrich_tracks(
             list(side.titles), segments, track_infos,
             side.index + 1, self._total_sides or 1, artist, album,
+            # Per-track artists as the reviewer left them, snapshotted at accept.
+            artists=list(side.artists),
             file_start=file_start,
             side_letter_=side_letter(side.index),
             use_side_letters=cfg.filename_side_letters,

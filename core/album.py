@@ -57,9 +57,10 @@ class SideJob:
     state: SideState = SideState.QUEUED
     analysis: object | None = None      # whatever analyze_fn returns
     timestamps: list[float] = field(default_factory=list)
-    segments: list[Path] = field(default_factory=list)
-    """Cut track files, when the reviewer already produced them. Lets encode_fn
-    reuse the reviewer's cut rather than splitting the side a second time."""
+    artists: list[str] = field(default_factory=list)
+    """Per-track artists as the reviewer left them. Snapshotted at accept time
+    alongside :attr:`titles`, so the review area can be handed to the next side
+    immediately without the pending edits living on in the UI."""
     error: str = ""
 
 
@@ -264,14 +265,28 @@ class AlbumController:
         if side.state == SideState.READY:
             self._set_state(side, SideState.RESOLVING)
 
-    def accept_side(self, index: int, timestamps: list[float], titles: list[str] | None = None) -> None:
-        """Confirm a side's cuts and queue it to encode in the background."""
+    def accept_side(
+        self,
+        index: int,
+        timestamps: list[float],
+        titles: list[str] | None = None,
+        artists: list[str] | None = None,
+    ) -> None:
+        """Confirm a side's cuts and queue it to encode in the background.
+
+        Accepting *is* the commit: the reviewer's titles/artists are snapshotted
+        onto the SideJob here and the encode is enqueued immediately, so there is
+        no accepted-but-not-yet-encoded limbo for a UI to lose when the user
+        moves on to the next side.
+        """
         side = self._by_index(index)
         if side.state in _TERMINAL:
             return
         side.timestamps = list(timestamps)
         if titles is not None:
             side.titles = list(titles)
+        if artists is not None:
+            side.artists = list(artists)
         self._set_state(side, SideState.ACCEPTED)
         self._encode_pool.submit(self._run_encode, side)
 

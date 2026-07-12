@@ -87,7 +87,7 @@ def _wait(predicate, timeout=90.0):
     return False
 
 
-def _run_album(qapp, tmp_path):
+def _run_album(qapp, tmp_path, edit=None):
     """Drive a full two-side album job and return the output dir."""
     from gui.main_window import MainWindow
 
@@ -119,14 +119,18 @@ def _run_album(qapp, tmp_path):
     fr._start_album()
     assert fr._album is not None
 
-    # Accept every side as it becomes ready, using the proposal's own cuts.
+    # Review + accept every side as it becomes ready, through the real GUI path:
+    # load it into the review area, then Accept -- which snapshots the table and
+    # enqueues the encode itself. `edit` may rewrite the table first.
     accepted = set()
 
     def pump():
         for side in fr._album.sides:
             if side.state == SideState.READY and side.index not in accepted:
-                cuts = [p.timestamp for p in side.analysis.proposal.split_points]
-                fr._album.accept_side(side.index, cuts, list(side.titles))
+                fr._load_side_for_review(side)
+                if edit is not None:
+                    edit(fr, side)
+                fr._accept_album_side()
                 accepted.add(side.index)
         return all(s.state in (SideState.DONE, SideState.ERROR, SideState.CANCELLED)
                    for s in fr._album.sides)
@@ -238,3 +242,38 @@ def test_album_encode_warnings_are_surfaced(qapp, tmp_path, monkeypatch):
     log = w.log.toPlainText()
     assert "Could not embed cover art" in log, log[-800:]
     assert "simulated cover failure" in log
+
+
+def test_reviewer_edits_are_snapshotted_into_the_written_tags(qapp, tmp_path):
+    """Titles/artists as the reviewer left them at Accept are what get written.
+
+    Accept snapshots the table onto the SideJob and enqueues the encode in one
+    step, so the edits must survive the hand-off even though the review area is
+    released immediately afterwards.
+    """
+    def edit(fr, side):
+        rows = fr.model.rows()
+        if side.index == 0:                       # rewrite side A only
+            rows[0].title = "So What (alt take)"
+            rows[1].artist = "Miles Davis Sextet"
+            fr.model.set_rows(rows)
+
+    out = _run_album(qapp, tmp_path, edit=edit)
+
+    produced = sorted(p.name for p in out.glob("*.flac"))
+    assert "[01] - So What (alt take).flac" in produced, produced
+
+    edited = FLAC(str(out / "[01] - So What (alt take).flac"))
+    assert edited["title"] == ["So What (alt take)"]
+    assert edited["tracknumber"] == ["1"]         # per-side numbering untouched
+    assert edited.pictures                        # cover still embedded
+
+    guest = FLAC(str(out / "[02] - Freddie Freeloader.flac"))
+    assert guest["artist"] == ["Miles Davis Sextet"]   # per-track artist edit landed
+    assert guest["albumartist"] == ["Miles Davis"]     # ...without touching ALBUMARTIST
+
+    # Side B, untouched, still carries the release's own values.
+    b = FLAC(str(out / "[03] - Blue in Green.flac"))
+    assert b["title"] == ["Blue in Green"]
+    assert b["artist"] == ["Miles Davis"]
+    assert b["discnumber"] == ["2"]

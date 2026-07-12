@@ -229,18 +229,90 @@ def test_full_rip_single_track_warns(qapp):
     assert "Single track" in w.log.toPlainText()
 
 
-def test_full_rip_two_step_encode_gate(qapp, tmp_path):
+def test_album_accept_enqueues_encode_without_a_second_click(qapp, tmp_path):
+    """Accept IS the commit: it snapshots the table and the encode is enqueued
+    on the controller's pool with no further UI action. No Encode button exists."""
+    import threading
+
+    from core.album import AlbumController, SideJob, SideState
     from gui.main_window import MainWindow
 
     fr = MainWindow().full_rip
-    assert not fr.encode_button.isEnabled()          # nothing split yet
-    seg = tmp_path / "track_01.wav"
-    seg.write_bytes(b"x")
-    fr._expected_titles = ["First", "Second"]
-    fr._on_split_done([tmp_path / "track_01.wav", tmp_path / "track_02.wav"])
-    assert fr.encode_button.isEnabled()
-    assert fr.encode_button.text() == "Encode 2 tracks"
-    assert [r.title for r in fr.model.rows()] == ["First", "Second"]
+    assert not hasattr(fr, "encode_button"), "album mode commits on Accept"
+
+    encoded = threading.Event()
+    captured = {}
+
+    def analyze(side, should_cancel):
+        return _fake_analysis([], [])
+
+    def encode(side, should_cancel):
+        captured["titles"] = list(side.titles)
+        captured["artists"] = list(side.artists)
+        captured["timestamps"] = list(side.timestamps)
+        encoded.set()
+
+    side = SideJob(index=0, label="Side A", wav_path=tmp_path / "a.wav",
+                   titles=["One", "Two"])
+    fr._album = AlbumController([side], analyze, encode)
+    fr._album_output_root = str(tmp_path)
+    fr.output_edit.setText(str(tmp_path))
+    fr._album_work_dir = tmp_path
+    side.analysis = _fake_analysis([], [])
+    side.state = SideState.READY
+
+    fr._load_side_for_review(side)
+    fr.waveform.clear_markers()
+    fr.waveform.add_marker(5.0)            # 1 marker -> 2 tracks
+    assert len(fr.model.rows()) == 2       # table is live before Accept
+
+    # Edit the table, then Accept. Nothing else.
+    rows = fr.model.rows()
+    rows[0].title = "Edited One"
+    rows[1].artist = "Guest Artist"
+    fr.model.set_rows(rows)
+
+    fr._accept_album_side()
+
+    assert encoded.wait(4.0), "accept did not enqueue the encode"
+    assert captured["titles"] == ["Edited One", "Two"]
+    assert captured["artists"][1] == "Guest Artist"
+    assert captured["timestamps"] == [5.0]
+    assert side.state in (SideState.ENCODING, SideState.DONE)
+    # The review area is released for the next side straight away.
+    assert fr._album_review_index is None
+    fr._album.shutdown(wait=True)
+
+
+def test_side_switch_prompts_only_with_unaccepted_state(qapp, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    from core.album import AlbumController, SideJob, SideState
+    from gui.main_window import MainWindow
+
+    fr = MainWindow().full_rip
+    asked = []
+
+    def fake_question(*args, **kwargs):
+        asked.append(True)
+        return QMessageBox.StandardButton.Discard
+
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(fake_question))
+
+    a = SideJob(index=0, label="Side A", titles=["x"])
+    fr._album = AlbumController([a], lambda s, c: None, lambda s, c: None)
+
+    # Nothing under review -> no prompt.
+    assert fr._confirm_discard_review() is True
+    assert asked == []
+
+    # A side under review with live analysis -> prompt fires once.
+    a.analysis = _fake_analysis([], [])
+    fr._load_side_for_review(a)
+    assert fr._confirm_discard_review() is True
+    assert len(asked) == 1
+    assert fr._album_review_index is None      # discarded
+    fr._album.shutdown(wait=True)
 
 
 def test_waveform_click_to_place_lands_at_click(qapp):
