@@ -167,3 +167,97 @@ def test_pipelining_overlaps_analysis_with_review():
 
     release[1].set()
     ctrl.shutdown(wait=True)
+
+
+# --------------------------------------------------------------------------- #
+# Failures must say why -- and be retryable
+# --------------------------------------------------------------------------- #
+def test_analysis_failure_records_cause_phase_and_traceback():
+    side = SideJob(0, "Side B", Path("b.wav"))
+
+    def analyze(s, c):
+        raise PermissionError(13, "Permission denied")
+
+    ctrl = _controller([side], analyze, lambda s, c: None)
+    ctrl.start()
+    assert _wait_until(lambda: side.state == SideState.ERROR)
+    ctrl.shutdown(wait=True)
+
+    assert "PermissionError" in side.error
+    assert "Permission denied" in side.error          # the actual cause, not "error"
+    assert side.failed_phase == "analysis"
+    assert "Traceback" in side.error_detail
+    assert "PermissionError" in side.error_detail
+
+
+def test_encode_failure_records_the_encode_phase():
+    side = SideJob(0, "Side A", Path("a.wav"))
+
+    def encode(s, c):
+        raise OSError("share went away")
+
+    ctrl = _controller([side], lambda s, c: "ok", encode)
+    ctrl.start()
+    assert _wait_until(lambda: side.state == SideState.READY)
+    ctrl.accept_side(0, [1.0], ["t"])
+    assert _wait_until(lambda: side.state == SideState.ERROR)
+    ctrl.shutdown(wait=True)
+
+    assert side.failed_phase == "encode"
+    assert "share went away" in side.error
+
+
+def test_retry_reruns_only_the_failed_side():
+    a = SideJob(0, "Side A", Path("a.wav"))
+    b = SideJob(1, "Side B", Path("b.wav"))
+    attempts = {1: 0}
+
+    def analyze(s, c):
+        if s.index == 1:
+            attempts[1] += 1
+            if attempts[1] == 1:
+                raise OSError("share hiccup")     # transient: fails once
+        return "ok"
+
+    ctrl = _controller([a, b], analyze, lambda s, c: None)
+    ctrl.start()
+    assert _wait_until(lambda: b.state == SideState.ERROR)
+    assert _wait_until(lambda: a.state == SideState.READY)
+    assert "share hiccup" in b.error
+
+    # Retry just side B; side A is untouched.
+    assert ctrl.retry_side(1) is True
+    assert _wait_until(lambda: b.state == SideState.READY)
+    ctrl.shutdown(wait=True)
+
+    assert b.error == "" and b.failed_phase == ""   # error cleared on retry
+    assert attempts[1] == 2
+    assert a.state == SideState.READY               # never disturbed
+
+
+def test_second_failure_redisplays_the_new_message():
+    side = SideJob(0, "Side B", Path("b.wav"))
+    calls = {"n": 0}
+
+    def analyze(s, c):
+        calls["n"] += 1
+        raise OSError(f"failure #{calls['n']}")
+
+    ctrl = _controller([side], analyze, lambda s, c: None)
+    ctrl.start()
+    assert _wait_until(lambda: side.state == SideState.ERROR)
+    assert "failure #1" in side.error
+
+    assert ctrl.retry_side(0) is True
+    assert _wait_until(lambda: side.state == SideState.ERROR and "failure #2" in side.error)
+    ctrl.shutdown(wait=True)
+    assert "failure #2" in side.error     # no retry limit; the new cause is shown
+
+
+def test_retry_refuses_a_side_that_is_not_errored():
+    side = SideJob(0, "A", Path("a.wav"))
+    ctrl = _controller([side], lambda s, c: "ok", lambda s, c: None)
+    ctrl.start()
+    assert _wait_until(lambda: side.state == SideState.READY)
+    assert ctrl.retry_side(0) is False        # READY is not a failure
+    ctrl.shutdown(wait=True)

@@ -169,6 +169,16 @@ def test_full_rip_populated_side_picker_after_release(qapp):
     assert fr.define_sides_button.isEnabled()
 
 
+def _wait(predicate, timeout=4.0):
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
 def _two_side_release():
     from core.metadata_lookup import MediumInfo, ReleaseDetail, TrackInfo
 
@@ -585,3 +595,90 @@ def test_persisted_splitter_sizes_still_win_over_defaults(qapp):
     # Their choice, not the default. (The exact ratio is clamped by the tab
     # area's minimum height, so assert the direction, not the pixel.)
     assert log_fraction > default_log_fraction * 2
+
+
+# --------------------------------------------------------------------------- #
+# Side errors say why, and can be retried
+# --------------------------------------------------------------------------- #
+def test_errored_side_shows_its_cause_not_just_a_colour(qapp, tmp_path):
+    """The screenshot bug: 'Side B - error' + 'Side B not ready yet (error)'."""
+    from core.album import AlbumController, SideJob, SideState
+    from gui.main_window import MainWindow
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QListWidgetItem
+
+    w = MainWindow()
+    fr = w.full_rip
+
+    side = SideJob(index=1, label="Side B", wav_path=tmp_path / "b.wav")
+
+    def analyze(s, c):
+        raise PermissionError(13, "Permission denied")
+
+    fr._album = AlbumController([side], analyze, lambda s, c: None,
+                                on_state_change=lambda s: fr._relay.changed.emit(s))
+    item = QListWidgetItem("Side B - queued")
+    item.setData(Qt.ItemDataRole.UserRole, 1)
+    fr.side_list.addItem(item)
+    fr._album.start()
+
+    assert _wait(lambda: side.state == SideState.ERROR)
+    qapp.processEvents()
+
+    log = w.log.toPlainText()
+    assert "Side B failed during analysis" in log
+    assert "Permission denied" in log            # the actual cause
+    assert "Traceback" in log                    # full detail, not just the line
+    assert "Retry side" in log                   # ...and the way out
+    assert "not ready yet" not in log            # the self-referential line is gone
+
+    # The row itself carries the cause.
+    assert "Permission denied" in fr.side_list.item(0).toolTip()
+
+    # Clicking it puts the cause in the review area instead of nothing.
+    fr.side_list.setCurrentItem(item)
+    fr._on_side_list_click(item)
+    assert "Permission denied" in fr.empty_state.text()
+    assert "Retry side" in fr.empty_state.text()
+
+    # ...and the Retry button is live for it.
+    assert fr.retry_side_btn.isEnabled()
+    fr._album.shutdown(wait=True)
+
+
+def test_retry_button_reruns_the_failed_side(qapp, tmp_path):
+    from core.album import AlbumController, SideJob, SideState
+    from gui.main_window import MainWindow
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QListWidgetItem
+
+    fr = MainWindow().full_rip
+    side = SideJob(index=0, label="Side A", wav_path=tmp_path / "a.wav")
+    attempts = {"n": 0}
+
+    def analyze(s, c):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise OSError("share hiccup")
+        return _fake_analysis([], [])
+
+    fr._album = AlbumController([side], analyze, lambda s, c: None,
+                                on_state_change=lambda s: fr._relay.changed.emit(s))
+    item = QListWidgetItem("Side A")
+    item.setData(Qt.ItemDataRole.UserRole, 0)
+    fr.side_list.addItem(item)
+    fr.side_list.setCurrentItem(item)
+    fr._album.start()
+
+    assert _wait(lambda: side.state == SideState.ERROR)
+    qapp.processEvents()
+    assert fr.retry_side_btn.isEnabled()
+
+    fr._retry_selected_side()                    # press Retry
+    assert _wait(lambda: side.state == SideState.READY)
+    qapp.processEvents()
+
+    assert attempts["n"] == 2
+    assert side.error == ""
+    assert not fr.retry_side_btn.isEnabled()     # nothing to retry any more
+    fr._album.shutdown(wait=True)
