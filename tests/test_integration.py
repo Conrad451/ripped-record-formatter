@@ -168,6 +168,56 @@ def test_full_rip_populated_side_picker_after_release(qapp):
     assert fr.define_sides_button.isEnabled()
 
 
+def _two_side_release():
+    from core.metadata_lookup import MediumInfo, ReleaseDetail, TrackInfo
+
+    return ReleaseDetail("x", "Alb", "Art", media=(
+        MediumInfo(1, "Vinyl", tracks=tuple(
+            TrackInfo(i + 1, str(i + 1), f"A{i + 1}", 180000) for i in range(3))),
+        MediumInfo(2, "Vinyl", tracks=tuple(
+            TrackInfo(i + 1, str(i + 1), f"B{i + 1}", 180000) for i in range(2))),
+    ))
+
+
+def test_mapping_table_is_one_row_per_wav_and_skips_ambiguous(qapp, tmp_path):
+    """Folder-first: rows are WAVs, and a foreign file defaults to skip."""
+    from gui.full_rip import SKIP_LABEL
+    from gui.main_window import MainWindow
+
+    fr = MainWindow().full_rip
+    fr._apply_release(_two_side_release())
+
+    # A mixed folder: two sides of this record plus a stray file from another.
+    fr._album_wavs = [tmp_path / "SideA.wav", tmp_path / "bonus.wav", tmp_path / "SideB.wav"]
+    fr._rebuild_mapping_table()
+
+    assert fr.mapping_table.rowCount() == 3            # one row per WAV, not per side
+    names = [fr.mapping_table.item(r, 0).text() for r in range(3)]
+    assert names == ["SideA.wav", "bonus.wav", "SideB.wav"]
+
+    # Confident hits pre-filled; the ambiguous one left on skip, never guessed.
+    assert fr._album_mapping == [0, None, 1]
+    assert fr.mapping_table.cellWidget(1, 1).currentText() == SKIP_LABEL
+    assert fr.mapping_table.cellWidget(0, 1).currentData() == 0
+    assert fr.mapping_table.cellWidget(2, 1).currentData() == 1
+
+
+def test_mapping_table_side_is_exclusive(qapp, tmp_path):
+    """Claiming a side another row holds releases the other row back to skip."""
+    from gui.main_window import MainWindow
+
+    fr = MainWindow().full_rip
+    fr._apply_release(_two_side_release())
+    fr._album_wavs = [tmp_path / "SideA.wav", tmp_path / "other.wav"]
+    fr._rebuild_mapping_table()
+    assert fr._album_mapping == [0, None]
+
+    # Point row 1 at side A too -- row 0 must let go of it.
+    combo = fr.mapping_table.cellWidget(1, 1)
+    combo.setCurrentIndex(combo.findData(0))
+    assert fr._album_mapping == [None, 0]
+
+
 def test_full_rip_single_track_warns(qapp):
     from gui.main_window import MainWindow
 

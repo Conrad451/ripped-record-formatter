@@ -43,11 +43,20 @@ from PySide6.QtWidgets import (
 )
 
 from core import job_settings
-from core.album import AlbumController, SideJob, SideState, map_wavs_to_sides
+from core.album import (
+    AlbumController,
+    SideJob,
+    SideState,
+    propose_wav_side_map,
+    sides_from_proposal,
+)
+
+# Shown in the side dropdown for a WAV that is not part of this album. It is the
+# default for anything the heuristics are not confident about.
+SKIP_LABEL = "— skip —"
 from core.side_partition import Side
 from core.split_review import detect_progressive_drift, segment_deviations, wrong_side_suspected
 from core.timefmt import format_timestamp
-from core.tracks import sanitize_filename_component
 from gui.side_editor import SideEditorDialog, side_letter
 from gui.track_model import Row, TrackTableModel, TrackTableView
 from gui.waveform import WaveformView
@@ -277,15 +286,17 @@ class FullRipTab(QWidget):
         run_row.addStretch(1)
         root.addLayout(run_row)
 
-        # --- Album mode --------------------------------------------------------
-        self.album_box = QGroupBox("Album mode (map WAVs to the release's sides)")
-        self.album_box.setCheckable(True)
-        self.album_box.setChecked(False)
+        # --- Source: a folder of side WAVs is the primary entry point ----------
+        # Album handling used to hide behind an "Album mode" checkbox nobody
+        # found. It is now the default affordance: pick a folder, get a row per
+        # WAV, map the ones belonging to this album, run. A single WAV is just a
+        # one-row table.
+        self.album_box = QGroupBox("Source - pick the folder holding this record's side WAVs")
         album_layout = QVBoxLayout(self.album_box)
         pick_row = QHBoxLayout()
         folder_btn = QPushButton("Select folder...")
         folder_btn.clicked.connect(self._album_select_folder)
-        wavs_btn = QPushButton("Add WAVs...")
+        wavs_btn = QPushButton("Add single WAV...")
         wavs_btn.clicked.connect(self._album_add_wavs)
         pick_row.addWidget(folder_btn)
         pick_row.addWidget(wavs_btn)
@@ -299,9 +310,17 @@ class FullRipTab(QWidget):
         pick_row.addWidget(self.cancel_album_btn)
         album_layout.addLayout(pick_row)
 
+        self.mapping_hint = QLabel(
+            "One row per WAV found. Set the side for the files belonging to this "
+            "record; leave anything else on — skip —. Only mapped rows are "
+            "processed — run again with a different mapping for the next album."
+        )
+        self.mapping_hint.setWordWrap(True)
+        album_layout.addWidget(self.mapping_hint)
+
         map_side_row = QHBoxLayout()
         self.mapping_table = QTableWidget(0, 2)
-        self.mapping_table.setHorizontalHeaderLabels(["Side", "WAV file"])
+        self.mapping_table.setHorizontalHeaderLabels(["WAV file", "Side"])
         self.mapping_table.verticalHeader().setVisible(False)
         self.mapping_table.verticalHeader().setDefaultSectionSize(22)
         map_side_row.addWidget(self.mapping_table, 2)
@@ -471,6 +490,10 @@ class FullRipTab(QWidget):
         if sides:
             self.side_combo.setCurrentIndex(0)
             self._on_side_changed()
+        # The side dropdowns in the mapping table only exist once we know the
+        # sides, so re-derive the mapping whenever the side structure changes.
+        if self._album_wavs:
+            self._rebuild_mapping_table()
 
     def _open_side_editor(self) -> None:
         if not self._flat_titles:
@@ -803,44 +826,78 @@ class FullRipTab(QWidget):
 
     # -- album mode ---------------------------------------------------------
     def _album_select_folder(self) -> None:
+        """The primary entry point: a folder is what the user actually has."""
         start = self.source_edit.text().strip() or str(Path.home())
-        folder = QFileDialog.getExistingDirectory(self, "Select folder of WAVs", start)
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select the folder holding this record's WAVs", start)
         if folder:
             self._album_wavs = sorted(Path(folder).glob("*.wav"))
-            self.album_box.setChecked(True)
             self._rebuild_mapping_table()
-            self._log(f"Album: {len(self._album_wavs)} WAV(s) found in {folder}")
+            self._log(f"Source: {len(self._album_wavs)} WAV(s) found in {folder}")
 
     def _album_add_wavs(self) -> None:
+        """Secondary affordance -- a single WAV is just a one-row mapping table."""
         start = self.source_edit.text().strip() or str(Path.home())
-        files, _ = QFileDialog.getOpenFileNames(self, "Select WAVs", start, "WAV files (*.wav)")
-        if files:
-            self._album_wavs = [Path(f) for f in files]
-            self.album_box.setChecked(True)
+        path, _ = QFileDialog.getOpenFileName(self, "Select a side WAV", start, "WAV files (*.wav)")
+        if path:
+            self._album_wavs = [Path(path)]
             self._rebuild_mapping_table()
-            self._log(f"Album: {len(self._album_wavs)} WAV(s) selected")
+            self._log(f"Source: {Path(path).name}")
 
     def _rebuild_mapping_table(self) -> None:
-        if not self._sides:
-            self._log("Album: look up a release (or Define sides) first.")
+        """One row per scanned WAV; the side dropdown defaults to skip.
+
+        The heuristics only pre-fill files that actually name a side. Anything
+        else stays on skip, which is what makes a mixed folder safe: WAVs from
+        another album are simply not part of this job.
+        """
+        self.mapping_table.setRowCount(len(self._album_wavs))
+        if not self._album_wavs:
+            self._album_mapping = []
             return
-        self._album_mapping = map_wavs_to_sides(self._album_wavs, len(self._sides))
-        names = ["(unmapped)"] + [p.name for p in self._album_wavs]
-        self.mapping_table.setRowCount(len(self._sides))
-        for row, s in enumerate(self._sides):
-            self.mapping_table.setItem(
-                row, 0, QTableWidgetItem(f"Side {side_letter(s.index)} ({s.track_count} tr)"))
+
+        num_sides = len(self._sides)
+        self._album_mapping = (
+            propose_wav_side_map(self._album_wavs, num_sides) if num_sides
+            else [None] * len(self._album_wavs)
+        )
+
+        for row, wav in enumerate(self._album_wavs):
+            self.mapping_table.setItem(row, 0, QTableWidgetItem(wav.name))
             combo = QComboBox()
-            combo.addItems(names)
-            current = self._album_mapping[row]
-            combo.setCurrentIndex(names.index(current.name) if current and current.name in names else 0)
+            combo.addItem(SKIP_LABEL, None)
+            for s in self._sides:
+                combo.addItem(f"Side {side_letter(s.index)} ({s.track_count} tr)", s.index)
+            want = self._album_mapping[row]
+            combo.setCurrentIndex(0 if want is None else max(0, combo.findData(want)))
             combo.currentIndexChanged.connect(
                 lambda _i, r=row, c=combo: self._mapping_changed(r, c))
             self.mapping_table.setCellWidget(row, 1, combo)
 
+        if not num_sides:
+            self._log("Source: look up a release (or Define sides) to choose sides.")
+            return
+        mapped = sum(1 for m in self._album_mapping if m is not None)
+        self._log(f"Source: {len(self._album_wavs)} WAV(s) - {mapped} mapped by name, "
+                  f"{len(self._album_wavs) - mapped} left on skip.")
+
     def _mapping_changed(self, row: int, combo: QComboBox) -> None:
-        selected = combo.currentText()
-        self._album_mapping[row] = next((p for p in self._album_wavs if p.name == selected), None)
+        side_index = combo.currentData()
+        self._album_mapping[row] = side_index
+        if side_index is None:
+            return
+        # A side holds exactly one WAV: if another row already claimed this side,
+        # release it rather than silently building an ambiguous job.
+        for other in range(len(self._album_mapping)):
+            if other != row and self._album_mapping[other] == side_index:
+                self._album_mapping[other] = None
+                widget = self.mapping_table.cellWidget(other, 1)
+                if widget is not None:
+                    widget.blockSignals(True)
+                    widget.setCurrentIndex(0)
+                    widget.blockSignals(False)
+                self._log(f"Source: Side {side_letter(side_index)} reassigned; "
+                          f"'{self._album_wavs[other].name}' set back to skip.")
 
     def _album_side(self, index: int):
         return next((s for s in self._album.sides if s.index == index), None) if self._album else None
@@ -856,8 +913,12 @@ class FullRipTab(QWidget):
         if not output:
             self._log("Album: choose an output folder first.")
             return
-        if not any(self._album_mapping):
-            self._log("Album: map at least one side to a WAV first.")
+        # Skipped rows are excluded outright -- they never become sides, so a
+        # folder holding a second album's WAVs costs nothing.
+        mapped = sides_from_proposal(self._album_wavs, self._album_mapping)
+        if not mapped:
+            self._log("Album: map at least one WAV to a side first "
+                      "(everything is on skip).")
             return
         cfg = self.settings.config
         self._album_output_root = output
@@ -867,11 +928,14 @@ class FullRipTab(QWidget):
         }
         self._album_work_dir = Path(tempfile.mkdtemp(prefix="rrf_album_"))
         sides = []
-        for row, s in enumerate(self._sides):
+        for s in self._sides:
+            wav = mapped.get(s.index)
+            if wav is None:
+                continue                      # unmapped side -> not in this job
             titles = [self._flat_titles[i] for i in s.track_indices] if self._flat_titles else []
             durations = [self._flat_durations_ms[i] for i in s.track_indices] if self._flat_durations_ms else []
             sides.append(SideJob(index=s.index, label=f"Side {side_letter(s.index)}",
-                                 wav_path=self._album_mapping[row], titles=titles, durations_ms=durations))
+                                 wav_path=wav, titles=titles, durations_ms=durations))
         self._album = AlbumController(
             sides, self._album_analyze, self._album_encode,
             on_state_change=lambda side: self._relay.changed.emit(side),
@@ -947,13 +1011,19 @@ class FullRipTab(QWidget):
         self._log(f"Album: reviewing {side.label} "
                   f"({len(analysis.proposal.split_points)} cut(s), {len(self._unresolved)} unresolved).")
 
-    def _enrich_tracks(self, titles, segments, track_infos, side_position, total_sides, artist, album):
+    def _enrich_tracks(self, titles, segments, track_infos, side_position, total_sides, artist, album,
+                       *, file_start=None, side_letter_="", use_side_letters=False):
         """Build Tracks carrying every field we actually have from the release.
 
         With no release selected, only the base fields are set -- the old minimal
         tag set. Track numbering is per-side (Picard vinyl convention): TRACKNUMBER
         resets each side, TRACKTOTAL is the side's track count, DISCNUMBER is the
         side position, DISCTOTAL the number of sides.
+
+        ``file_start`` is the album-wide 1-based number of this side's first track
+        and drives the *filename* only (album jobs write every side into one flat
+        folder, so filenames must not collide even though TRACKNUMBER repeats).
+        Leave it ``None`` for a single-side job to keep the plain ``[NN]`` naming.
         """
         from core.tracks import Tracks
 
@@ -983,6 +1053,10 @@ class FullRipTab(QWidget):
                 mb_artist_id=((info.artist_id if info and info.artist_id else release_artist_id) if rich else ""),
                 mb_recording_id=(info.recording_id if (rich and info) else ""),
                 mb_track_id=(info.track_mbid if (rich and info) else ""),
+                # Filename-only: never reaches the tags.
+                file_index=(file_start + i if file_start is not None else None),
+                side_letter=side_letter_,
+                use_side_letters=use_side_letters,
             ))
         return result
 
@@ -1061,9 +1135,22 @@ class FullRipTab(QWidget):
         artist = self._album_meta.get("artist", "")
         album = self._album_meta.get("album", "")
         track_infos = self._side_track_infos.get(side.index, [])
-        tracks = self._enrich_tracks(list(side.titles), segments, track_infos,
-                                     side.index + 1, self._total_sides or 1, artist, album)
-        out_dir = Path(self._album_output_root) / sanitize_filename_component(side.label)
+        # Every side lands in the SAME flat folder, so filenames carry an
+        # album-wide number (or a side letter) while the tags stay per-side.
+        # file_start is this side's first track in flat album order, which keeps
+        # numbering stable even if the sides are encoded out of order or a side
+        # is re-run on its own later.
+        cfg = self.settings.config
+        spec = next((s for s in self._sides if s.index == side.index), None)
+        file_start = (spec.track_indices[0] + 1) if spec and spec.track_indices else 1
+        tracks = self._enrich_tracks(
+            list(side.titles), segments, track_infos,
+            side.index + 1, self._total_sides or 1, artist, album,
+            file_start=file_start,
+            side_letter_=side_letter(side.index),
+            use_side_letters=cfg.filename_side_letters,
+        )
+        out_dir = Path(self._album_output_root)
         configure_pydub()
         convert_wavs_to_flacs(tracks, out_dir, configure=False, cover=self._cover,
                               max_workers=self.settings.config.encode_workers,
