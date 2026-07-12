@@ -18,13 +18,53 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable
 
 from core.tracks import Tracks
+
+if TYPE_CHECKING:
+    from core.metadata_lookup import CoverArt
 
 # on_progress(current, total, track_name) -- current is 1-based and counts
 # tracks that have *completed*.
 ProgressCallback = Callable[[int, int, str], None]
+
+
+def _embed_cover(flac_path: Path, cover: "CoverArt") -> None:
+    """Embed ``cover`` as the FLAC's front-cover picture (idempotent).
+
+    Existing pictures are cleared first so re-tagging replaces rather than
+    accumulates art. Raises on failure; callers turn that into a warning so
+    cover art never fails a whole batch.
+    """
+    from mutagen.flac import FLAC, Picture
+
+    picture = Picture()
+    picture.type = 3            # ID3 APIC type 3 = front cover
+    picture.desc = "front cover"
+    picture.mime = cover.mime
+    picture.data = cover.data
+
+    flac = FLAC(str(flac_path))
+    flac.clear_pictures()
+    flac.add_picture(picture)
+    flac.save()
+
+
+def _write_vorbis_tags(flac_path: Path, tags: dict) -> None:
+    """Write ``tags`` as the FLAC's Vorbis comments (authoritative, no empties).
+
+    Existing comments (e.g. whatever pydub/ffmpeg wrote on export) are cleared
+    first, so only the fields we actually have are present -- never an empty
+    string. Pictures are untouched (handled by :func:`_embed_cover`).
+    """
+    from mutagen.flac import FLAC
+
+    flac = FLAC(str(flac_path))
+    flac.delete()
+    for key, value in tags.items():
+        flac[key] = value
+    flac.save()
 
 
 @dataclass
@@ -65,18 +105,69 @@ def _prepare_output_dir(output_dir: Path) -> Path:
     return output_dir
 
 
+def _run_batch(tracks, work, on_progress, max_workers, should_cancel) -> BatchResult:
+    """Run ``work(track)`` over ``tracks``, serially or on a bounded thread pool.
+
+    Each track's export/tag/cover is independent, so with ``max_workers > 1`` they
+    run concurrently (the encode is a per-track ffmpeg subprocess). ``on_progress``
+    fires once per *completed* track with ``(completed_count, total, name)`` --
+    order-independent "N of M", never "track K". ``should_cancel`` is polled
+    before each submission; in-flight tasks finish and a partial result returns.
+    Outcomes keep original track order regardless of completion order.
+    """
+    tracks = list(tracks)
+    total = len(tracks)
+    outcomes: list = [None] * total
+
+    if max_workers and max_workers > 1 and total > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {}
+            for i, track in enumerate(tracks):
+                if should_cancel is not None and should_cancel():
+                    break
+                futures[pool.submit(work, track)] = i
+            completed = 0
+            for future in as_completed(futures):
+                outcome = future.result()
+                outcomes[futures[future]] = outcome
+                completed += 1
+                if on_progress is not None:
+                    on_progress(completed, total, outcome.track.track_name)
+    else:
+        completed = 0
+        for i, track in enumerate(tracks):
+            if should_cancel is not None and should_cancel():
+                break
+            outcomes[i] = work(track)
+            completed += 1
+            if on_progress is not None:
+                on_progress(completed, total, outcomes[i].track.track_name)
+
+    result = BatchResult()
+    result.outcomes = [o for o in outcomes if o is not None]
+    return result
+
+
 def convert_wavs_to_flacs(
     tracks: Iterable[Tracks],
     output_dir: str | Path,
     on_progress: ProgressCallback | None = None,
     *,
     configure: bool = True,
+    cover: "CoverArt | None" = None,
+    max_workers: int = 1,
+    should_cancel=None,
 ) -> BatchResult:
     """Convert each track's source WAV to a tagged FLAC in ``output_dir``.
 
-    Source files are left in place. ``on_progress`` fires once per track after
-    it has been written. Set ``configure=False`` to skip ffmpeg setup when the
-    caller has already configured pydub.
+    Source files are left in place. ``on_progress`` fires once per completed
+    track (``max_workers > 1`` encodes several at once; progress is "N of M").
+    Set ``configure=False`` to skip ffmpeg setup when the caller has already
+    configured pydub. If ``cover`` is given it is embedded as the front cover of
+    every track; a failure to embed becomes a per-track warning and never fails
+    the batch. ``should_cancel`` is polled before each track is submitted.
     """
     if configure:
         from core.ffmpeg_locator import configure_pydub
@@ -84,19 +175,25 @@ def convert_wavs_to_flacs(
         configure_pydub()
     from pydub import AudioSegment
 
-    tracks = list(tracks)
     out_dir = _prepare_output_dir(output_dir)
-    result = BatchResult()
 
-    for index, track in enumerate(tracks, start=1):
+    def work(track):
         dest = out_dir / track.filename()
         audio = AudioSegment.from_wav(str(track.track_wav_loc))
         audio.export(str(dest), format="flac", tags=track.tags())
-        result.outcomes.append(TrackOutcome(track=track, output_path=dest))
-        if on_progress is not None:
-            on_progress(index, len(tracks), track.track_name)
+        outcome = TrackOutcome(track=track, output_path=dest)
+        try:
+            _write_vorbis_tags(dest, track.vorbis_tags())
+        except Exception as exc:
+            outcome.warnings.append(f"Could not write tags: {exc}")
+        if cover is not None:
+            try:
+                _embed_cover(dest, cover)
+            except Exception as exc:  # art never fails a batch
+                outcome.warnings.append(f"Could not embed cover art: {exc}")
+        return outcome
 
-    return result
+    return _run_batch(tracks, work, on_progress, max_workers, should_cancel)
 
 
 def retag_flacs(
@@ -106,6 +203,9 @@ def retag_flacs(
     *,
     delete_source: bool = False,
     configure: bool = True,
+    cover: "CoverArt | None" = None,
+    max_workers: int = 1,
+    should_cancel=None,
 ) -> BatchResult:
     """Re-export each source FLAC into ``output_dir`` with fresh tags.
 
@@ -113,7 +213,10 @@ def retag_flacs(
     opt-in. When it is true the original file is removed after a
     successful write -- *except* when the source and destination resolve to the
     same path, in which case deletion is skipped and a warning is recorded so we
-    never destroy the file we just produced.
+    never destroy the file we just produced. If ``cover`` is given it is embedded
+    as the front cover; embed failures become per-track warnings, never batch
+    failures. ``max_workers``/``should_cancel`` behave as in
+    :func:`convert_wavs_to_flacs`.
     """
     if configure:
         from core.ffmpeg_locator import configure_pydub
@@ -121,19 +224,23 @@ def retag_flacs(
         configure_pydub()
     from pydub import AudioSegment
 
-    tracks = list(tracks)
     out_dir = _prepare_output_dir(output_dir)
-    result = BatchResult()
 
-    for index, track in enumerate(tracks, start=1):
+    def work(track):
         source = Path(track.track_wav_loc)
         dest = out_dir / track.filename()
-
         audio = AudioSegment.from_file(str(source), "flac")
         audio.export(str(dest), format="flac", tags=track.tags())
-
         outcome = TrackOutcome(track=track, output_path=dest)
-
+        try:
+            _write_vorbis_tags(dest, track.vorbis_tags())
+        except Exception as exc:
+            outcome.warnings.append(f"Could not write tags: {exc}")
+        if cover is not None:
+            try:
+                _embed_cover(dest, cover)
+            except Exception as exc:  # art never fails a batch
+                outcome.warnings.append(f"Could not embed cover art: {exc}")
         same_file = source.resolve() == dest.resolve()
         if delete_source and same_file:
             outcome.warnings.append(
@@ -143,9 +250,6 @@ def retag_flacs(
         elif delete_source:
             source.unlink(missing_ok=True)
             outcome.source_deleted = True
+        return outcome
 
-        result.outcomes.append(outcome)
-        if on_progress is not None:
-            on_progress(index, len(tracks), track.track_name)
-
-    return result
+    return _run_batch(tracks, work, on_progress, max_workers, should_cancel)

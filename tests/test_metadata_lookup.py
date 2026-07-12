@@ -212,6 +212,38 @@ def test_search_passes_both_fields_to_client():
     assert fields == {"artist": "Miles Davis", "release": "Kind of Blue"}
 
 
+def _ranking_payload():
+    def rel(rid, title, fmt, tc, secondary=None):
+        rg = {"type": "Album"}
+        if secondary:
+            rg["secondary-type-list"] = secondary
+        return {
+            "id": rid, "title": title, "artist-credit-phrase": "Nirvana",
+            "medium-list": [{"format": fmt, "track-count": tc}],
+            "release-group": rg,
+        }
+    return {"release-list": [
+        rel("studio-cd", "In Utero", "CD", 12),
+        rel("comp-vinyl", "Nirvana", "Vinyl", 14, ["Compilation"]),
+        rel("studio-vinyl", "In Utero", "Vinyl", 12),
+        rel("comp-cd", "Nirvana", "CD", 14, ["Compilation"]),
+    ], "release-count": 4}
+
+
+def test_search_ranks_studio_and_vinyl_first():
+    mb = FakeMusicBrainz(search=_ranking_payload())
+    results = make_provider(mb).search_releases("Nirvana", "In Utero")
+    # Studio albums before compilations; vinyl before CD within the same type.
+    assert [r.release_id for r in results] == [
+        "studio-vinyl", "studio-cd", "comp-vinyl", "comp-cd",
+    ]
+    # ...and both search terms still constrained the query.
+    _, fields, _ = mb.calls[0]
+    assert fields == {"artist": "Nirvana", "release": "In Utero"}
+    assert results[0].is_vinyl and not results[0].is_compilation
+    assert results[2].is_compilation
+
+
 def test_search_with_no_query_short_circuits_without_network():
     mb = FakeMusicBrainz()
     results = make_provider(mb).search_releases("  ", "")
@@ -256,6 +288,26 @@ def test_get_release_requests_needed_includes():
     _, rid, includes = detail_call
     assert rid == "mbid-vinyl"
     assert {"recordings", "media", "artist-credits"} <= set(includes)
+
+
+def test_detail_parses_mbids_and_per_track_artist():
+    detail = {"release": {
+        "id": "rel-id", "title": "Split LP", "date": "2000",
+        "artist-credit-phrase": "Various", "artist-credit": [{"artist": {"id": "va-id", "name": "Various"}}],
+        "medium-list": [{"position": "1", "format": "Vinyl", "track-list": [
+            {"id": "trk-1", "position": "1", "number": "A1", "title": "T1", "length": "100000",
+             "recording": {"id": "rec-1"},
+             "artist-credit-phrase": "Band A", "artist-credit": [{"artist": {"id": "a-id", "name": "Band A"}}]},
+            {"position": "2", "number": "A2", "recording": {"id": "rec-2", "title": "T2"}},
+        ]}],
+    }}
+    d = make_provider(FakeMusicBrainz(detail=detail)).get_release("rel-id")
+    assert d.artist_id == "va-id"
+    t0, t1 = d.tracks
+    assert t0.recording_id == "rec-1" and t0.track_mbid == "trk-1"
+    assert t0.artist == "Band A" and t0.artist_id == "a-id"   # per-track credit
+    assert t1.recording_id == "rec-2" and t1.track_mbid == ""  # no release-track id
+    assert t1.artist == "" and t1.artist_id == ""             # no per-track credit -> blank
 
 
 def test_empty_release_id_raises_response_error():

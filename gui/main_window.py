@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSplitter,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -61,6 +62,7 @@ class BatchPanel(QWidget):
         self.kind = kind
         self.settings = settings
         self._file_glob = "*.wav" if kind == "convert" else "*.flac"
+        self._cover = None   # set from a selected MusicBrainz release
 
         cfg = settings.config
         layout = QVBoxLayout(self)
@@ -208,10 +210,28 @@ class BatchPanel(QWidget):
             self.logMessage.emit("No tracks to process -- load files first.")
             return None
 
+        max_workers = self.settings.config.encode_workers
         if self.kind == "convert":
-            return converter.convert_wavs_to_flacs, tracks, Path(output), {}
+            kwargs = {"max_workers": max_workers}
+            if self._cover is not None:
+                kwargs["cover"] = self._cover
+            return converter.convert_wavs_to_flacs, tracks, Path(output), kwargs
         delete = bool(self.delete_check and self.delete_check.isChecked())
-        return converter.retag_flacs, tracks, Path(output), {"delete_source": delete}
+        kwargs = {"delete_source": delete, "max_workers": max_workers}
+        if self._cover is not None:
+            kwargs["cover"] = self._cover
+        return converter.retag_flacs, tracks, Path(output), kwargs
+
+    def apply_release(self, detail) -> None:
+        """Fill artist/album, replace track titles by order, stash cover art."""
+        self.artist_edit.setText(detail.artist)
+        self.settings.set(last_artist=detail.artist)
+        self.album_edit.setText(detail.title)
+        self.settings.set(last_album=detail.title)
+        titles = [t.title for t in detail.tracks]
+        if titles and self.model.rowCount():
+            self.model.paste_titles(0, titles)
+        self._cover = detail.cover
 
     def set_running(self, running: bool) -> None:
         self.run_button.setEnabled(not running)
@@ -222,7 +242,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Ripped Record Formatter")
-        self.resize(760, 620)
+        self.resize(920, 760)
         self.setAcceptDrops(True)
 
         self.settings = Settings()
@@ -231,18 +251,53 @@ class MainWindow(QMainWindow):
         central = QWidget()
         root = QVBoxLayout(central)
 
+        from gui.full_rip import FullRipTab
+        from gui.metadata_panel import MetadataPanel
+        from gui.settings_panel import SettingsPanel
+
         self.tabs = QTabWidget()
         self.convert_panel = BatchPanel("convert", self.settings)
         self.retag_panel = BatchPanel("retag", self.settings)
+        self.full_rip = FullRipTab(self.settings)
+        self.metadata_panel = MetadataPanel(settings=self.settings)
+        self.settings_panel = SettingsPanel(self.settings)
+        self.tabs.addTab(self.full_rip, "Full Rip")
         self.tabs.addTab(self.convert_panel, "Convert")
         self.tabs.addTab(self.retag_panel, "Re-tag")
-        root.addWidget(self.tabs, 1)
+        self.tabs.addTab(self.metadata_panel, "Metadata")
+        self.tabs.addTab(self.settings_panel, "Settings")
 
         for panel in (self.convert_panel, self.retag_panel):
             panel.logMessage.connect(self._log)
             panel.runRequested.connect(lambda p=panel: self._start_job(p))
 
+        self.full_rip.logMessage.connect(self._log)
+        self.metadata_panel.statusMessage.connect(self._log)
+        self.metadata_panel.releaseSelected.connect(self._on_release_selected)
+        self._last_batch_panel = self.convert_panel
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
         self._last_output_dir: Path | None = None
+
+        # Log pane: compact (~5 lines), collapsible, and it must never reclaim
+        # space on a new message -- a QSplitter, not stretch, controls its size.
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(1000)
+        line_h = self.log.fontMetrics().lineSpacing()
+        self.log.setMinimumHeight(line_h * 2)
+        self._default_log_height = line_h * 5 + 12
+
+        self._main_splitter = QSplitter(Qt.Orientation.Vertical)
+        self._main_splitter.addWidget(self.tabs)
+        self._main_splitter.addWidget(self.log)
+        self._main_splitter.setStretchFactor(0, 1)
+        self._main_splitter.setStretchFactor(1, 0)
+        self._main_splitter.setCollapsible(0, False)
+        self._main_splitter.setCollapsible(1, True)
+        self._main_splitter.splitterMoved.connect(self._save_main_split)
+        root.addWidget(self._main_splitter, 1)
+
         progress_row = QHBoxLayout()
         self.progress = QProgressBar()
         self.progress.setTextVisible(True)
@@ -253,13 +308,30 @@ class MainWindow(QMainWindow):
         progress_row.addWidget(self.open_output_button)
         root.addLayout(progress_row)
 
-        self.log = QPlainTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setMaximumBlockCount(1000)
-        root.addWidget(self.log, 1)
-
+        self._restore_main_split()
         self.setCentralWidget(central)
-        self._log("Ready. Load files, edit the table, then Convert or Re-tag.")
+        self._log("Ready. Full Rip a side, or Convert/Re-tag folders. "
+                  "Use Metadata to pull tracklists + cover art.")
+
+    # --- metadata wiring ---------------------------------------------------
+    def _on_tab_changed(self, index: int) -> None:
+        widget = self.tabs.widget(index)
+        if widget in (self.convert_panel, self.retag_panel):
+            self._last_batch_panel = widget
+
+    def _on_release_selected(self, detail) -> None:
+        # The standalone Metadata tab feeds the last-used batch panel only;
+        # Full Rip has its own embedded lookup (scoped to itself).
+        panel = getattr(self, "_last_batch_panel", self.convert_panel)
+        panel.apply_release(detail)
+        which = "Convert" if panel is self.convert_panel else "Re-tag"
+        self._log(f"Release selected: {detail.artist} - {detail.title} "
+                  f"({detail.track_count} track(s), cover={'yes' if detail.cover else 'no'}) "
+                  f"-> applied to the {which} panel.")
+
+    def closeEvent(self, event) -> None:
+        self.full_rip.cleanup()
+        super().closeEvent(event)
 
     # --- job orchestration -------------------------------------------------
     def _start_job(self, panel: BatchPanel) -> None:
@@ -313,6 +385,19 @@ class MainWindow(QMainWindow):
 
     def _log(self, message: str) -> None:
         self.log.appendPlainText(message)
+
+    # --- splitter persistence ----------------------------------------------
+    def _restore_main_split(self) -> None:
+        cfg = self.settings.config
+        if cfg.main_split_top > 0 and cfg.main_split_bottom > 0:
+            self._main_splitter.setSizes([cfg.main_split_top, cfg.main_split_bottom])
+        else:
+            self._main_splitter.setSizes([10000, self._default_log_height])
+
+    def _save_main_split(self, *_args) -> None:
+        sizes = self._main_splitter.sizes()
+        if len(sizes) == 2:
+            self.settings.set(main_split_top=sizes[0], main_split_bottom=sizes[1])
 
     # --- drag and drop -----------------------------------------------------
     def _dropped_dir(self, event) -> str | None:

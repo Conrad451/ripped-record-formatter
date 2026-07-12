@@ -90,6 +90,16 @@ class ReleaseResult:
     formats: str = ""       # e.g. "Vinyl", "2xVinyl", "CD"
     track_count: int = 0
     disambiguation: str = ""  # MusicBrainz free-text note, if any
+    primary_type: str = ""    # release-group primary type ("Album", "Single", ...)
+    secondary_types: tuple[str, ...] = ()  # e.g. ("Compilation", "Live")
+
+    @property
+    def is_vinyl(self) -> bool:
+        return "vinyl" in self.formats.lower()
+
+    @property
+    def is_compilation(self) -> bool:
+        return any(t.lower() == "compilation" for t in self.secondary_types)
 
     def label(self) -> str:
         """A one-line human summary for a results row / log line."""
@@ -110,6 +120,10 @@ class TrackInfo:
     number: str               # printed track number ("A1", "3", ...)
     title: str
     length_ms: int | None = None      # duration in milliseconds, if known
+    artist: str = ""          # per-track artist (splits/VA); "" -> use release
+    artist_id: str = ""       # per-track artist MBID
+    recording_id: str = ""    # MUSICBRAINZ_RECORDINGID source (recording MBID)
+    track_mbid: str = ""      # MUSICBRAINZ_TRACKID source (release-track MBID)
 
     def length_display(self) -> str:
         """``m:ss`` for the duration, or ``""`` when unknown."""
@@ -149,6 +163,7 @@ class ReleaseDetail:
     country: str = ""
     media: tuple[MediumInfo, ...] = ()
     cover: CoverArt | None = None
+    artist_id: str = ""       # MUSICBRAINZ_ARTISTID (release artist)
 
     @property
     def tracks(self) -> list[TrackInfo]:
@@ -285,7 +300,7 @@ class MusicBrainzProvider(MetadataProvider):
         self,
         app_name: str = "RippedRecordFormatter",
         app_version: str = "2.0",
-        contact: str = "https://github.com/ripped-record-formatter",
+        contact: str = "https://github.com/Conrad451/ripped-record-formatter",
         *,
         timeout: float = 15.0,
         rate_limiter: RateLimiter | None = None,
@@ -341,7 +356,13 @@ class MusicBrainzProvider(MetadataProvider):
             fields["release"] = album
         data = self._call(self._mb.search_releases, limit=limit, **fields)
         releases = data.get("release-list", []) if isinstance(data, dict) else []
-        return [_parse_search_release(r) for r in releases]
+        results = [_parse_search_release(r) for r in releases]
+        # This is a vinyl tool: surface the pressing the user actually wants.
+        # Studio albums outrank compilations (the reported failure mode), and
+        # vinyl outranks CD within the same album type. sorted() is stable, so
+        # MusicBrainz's own relevance order breaks any remaining ties.
+        results.sort(key=_rank_key)
+        return results
 
     def get_release(self, release_id: str, *, with_cover: bool = True) -> ReleaseDetail:
         if not release_id:
@@ -395,6 +416,24 @@ def _artist_from_credit(entry: dict) -> str:
     return joined or "Unknown Artist"
 
 
+def _artist_id_from_credit(entry: dict) -> str:
+    """First artist's MBID from an artist-credit list, or ``""``."""
+    for credit in entry.get("artist-credit", []):
+        if isinstance(credit, dict):
+            artist = credit.get("artist", {})
+            mbid = artist.get("id")
+            if mbid:
+                return mbid
+    return ""
+
+
+def _track_artist(track: dict) -> tuple[str, str]:
+    """Per-track ``(artist, artist_id)`` -- only when the track names its own."""
+    if track.get("artist-credit") or track.get("artist-credit-phrase"):
+        return _artist_from_credit(track), _artist_id_from_credit(track)
+    return "", ""
+
+
 def _formats_from_media(media: Sequence[dict]) -> str:
     """Summarise media formats, e.g. two vinyl discs -> ``"2xVinyl"``."""
     counts: dict[str, int] = {}
@@ -413,6 +452,16 @@ def _formats_from_media(media: Sequence[dict]) -> str:
     return " + ".join(pieces)
 
 
+def _rank_key(r: ReleaseResult) -> tuple[int, int]:
+    """Sort key: studio albums before compilations, then vinyl before CD.
+
+    Album type dominates (picking the right *release* matters most -- a
+    compilation ranking first was the reported bug); format is the tiebreak so a
+    vinyl pressing of the wanted album beats its CD.
+    """
+    return (1 if r.is_compilation else 0, 0 if r.is_vinyl else 1)
+
+
 def _parse_search_release(r: dict) -> ReleaseResult:
     media = r.get("medium-list", []) or []
     track_count = 0
@@ -424,6 +473,9 @@ def _parse_search_release(r: dict) -> ReleaseResult:
             except (TypeError, ValueError):
                 pass
     date = r.get("date", "") or ""
+    group = r.get("release-group", {}) or {}
+    primary_type = group.get("type") or group.get("primary-type") or ""
+    secondary_types = tuple(group.get("secondary-type-list", []) or ())
     return ReleaseResult(
         release_id=r.get("id", ""),
         title=r.get("title", "") or "",
@@ -433,6 +485,8 @@ def _parse_search_release(r: dict) -> ReleaseResult:
         formats=_formats_from_media(media),
         track_count=track_count,
         disambiguation=r.get("disambiguation", "") or "",
+        primary_type=primary_type,
+        secondary_types=secondary_types,
     )
 
 
@@ -457,11 +511,16 @@ def _parse_track(track: dict, index: int) -> TrackInfo:
     except (TypeError, ValueError):
         position = index
     number = str(track.get("number", position))
+    artist, artist_id = _track_artist(track)
     return TrackInfo(
         position=position,
         number=number,
         title=title,
         length_ms=_parse_length(track),
+        artist=artist,
+        artist_id=artist_id,
+        recording_id=recording.get("id", "") or "",
+        track_mbid=track.get("id", "") or "",   # release-track MBID
     )
 
 
@@ -493,4 +552,5 @@ def _parse_release_detail(release: dict, cover: CoverArt | None) -> ReleaseDetai
         country=release.get("country", "") or "",
         media=tuple(media),
         cover=cover,
+        artist_id=_artist_id_from_credit(release),
     )

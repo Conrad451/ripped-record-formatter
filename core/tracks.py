@@ -48,6 +48,19 @@ class Tracks:
     track_artist: str
     track_wav_loc: Path
 
+    # Optional richer metadata (from a release lookup). Every field is optional:
+    # absent data writes no tag at all -- never an empty string. Existing call
+    # sites that construct only the five positional fields are unaffected.
+    album_artist: str = ""
+    date: str = ""                         # release year, e.g. "1993"
+    track_total: int | None = None         # tracks on this side (see README)
+    disc_number: int | None = None         # side/medium position
+    disc_total: int | None = None
+    mb_album_id: str = ""                   # MUSICBRAINZ_ALBUMID (release MBID)
+    mb_artist_id: str = ""                  # MUSICBRAINZ_ARTISTID
+    mb_recording_id: str = ""               # MUSICBRAINZ_RECORDINGID (recording MBID)
+    mb_track_id: str = ""                   # MUSICBRAINZ_TRACKID (release-track MBID)
+
     def __post_init__(self) -> None:
         self.track_num = int(self.track_num)
         self.track_wav_loc = Path(self.track_wav_loc)
@@ -77,6 +90,32 @@ class Tracks:
             "title": self.track_name,
             "track": str(self.track_num),
         }
+
+    def vorbis_tags(self) -> dict[str, str]:
+        """FLAC Vorbis comments to write, omitting every field we don't have.
+
+        Empty/absent values are dropped entirely (no empty-string tags). This is
+        the authoritative set the converter writes via mutagen; the base four
+        (artist/album/title/tracknumber) are included when present, the richer
+        release fields only when supplied.
+        """
+        candidates = {
+            "artist": self.track_artist,
+            "album": self.track_album,
+            "title": self.track_name,
+            "tracknumber": str(self.track_num),
+            "albumartist": self.album_artist,
+            "date": self.date,
+            "tracktotal": self.track_total,
+            "discnumber": self.disc_number,
+            "disctotal": self.disc_total,
+            "musicbrainz_albumid": self.mb_album_id,
+            "musicbrainz_artistid": self.mb_artist_id,
+            "musicbrainz_recordingid": self.mb_recording_id,
+            "musicbrainz_trackid": self.mb_track_id,
+        }
+        return {k: str(v) for k, v in candidates.items()
+                if v is not None and str(v).strip() != ""}
 
     def __str__(self) -> str:
         return self.filename()

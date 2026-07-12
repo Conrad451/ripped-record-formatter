@@ -17,7 +17,8 @@ so tests can round-trip without touching the real user config.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, fields
+import os
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 from platformdirs import user_config_dir
@@ -28,12 +29,76 @@ CONFIG_FILENAME = "settings.json"
 
 @dataclass
 class Config:
-    """User-facing persistent settings. Empty string means "unset / ask"."""
+    """User-facing persistent settings.
 
+    Flat by design: :func:`load` fills missing keys with these defaults and
+    ignores unknown ones, so the schema can grow without breaking old files.
+    Empty string means "unset / ask". Stage objects / params are *not* built
+    here (that would drag numpy/scipy into a widely-imported module) -- see
+    :mod:`core.job_settings`.
+    """
+
+    # --- directories + last-used metadata ---
     source_dir: str = ""
     output_dir: str = ""
     last_artist: str = ""
     last_album: str = ""
+
+    # --- restoration: per-stage enable toggles (chain order is fixed:
+    #     rumble -> hum -> noise -> declick) ---
+    rumble_enabled: bool = True
+    hum_enabled: bool = True
+    noise_enabled: bool = True
+    declick_enabled: bool = True
+
+    # --- RumbleFilter ---
+    rumble_cutoff_hz: float = 25.0
+    rumble_order: int = 4
+
+    # --- HumRemoval ---
+    hum_base_freq: float = 60.0
+    hum_harmonics: int = 4
+    hum_quality: float = 30.0
+
+    # --- NoiseReduction ---
+    noise_strength: float = 0.5
+    noise_profile_start: float = 0.0
+    noise_profile_duration: float = 2.0
+
+    # --- OutputPolicy ---
+    headroom_target_dbfs: float = -0.1
+
+    # --- splitting: SilenceParams ---
+    silence_threshold_db: float = -40.0
+    min_silence: float = 1.0
+    min_track_length: float = 20.0
+    frame_ms: float = 20.0
+    hop_ms: float = 10.0
+    db_floor_eps: float = 1e-10
+    depth_ref_db: float = 20.0
+    duration_ref_s: float = 2.0
+    quality_depth_weight: float = 0.5
+    confidence_round_digits: int = 4
+    proximity_weight: float = 0.5
+    post_miss_penalty: float = 0.8
+
+    # --- anchored-search windows ---
+    window_s: float = 15.0
+    speed_tolerance: float = 0.02
+
+    # --- encoding ---
+    encode_workers: int = field(default_factory=lambda: min(4, os.cpu_count() or 1))
+    """How many tracks to encode in parallel (each is an independent ffmpeg run)."""
+
+    album_analysis_workers: int = 1
+    """Sides analysed at once in Album mode. Conservative: each holds a whole
+    side in RAM and rips usually stream off a contended network share."""
+
+    # --- window layout (splitter sizes in px; 0 = use default proportion) ---
+    main_split_top: int = 0
+    main_split_bottom: int = 0
+    meta_split_top: int = 0
+    meta_split_bottom: int = 0
 
 
 def config_path() -> Path:
