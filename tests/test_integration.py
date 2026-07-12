@@ -343,11 +343,17 @@ def test_waveform_click_to_place_lands_at_click(qapp):
     view = WaveformView()
 
     class _Click:
+        def __init__(self, modifiers=Qt.KeyboardModifier.NoModifier):
+            self._modifiers = modifiers
+
         def double(self):
             return False
 
         def button(self):
             return Qt.MouseButton.LeftButton
+
+        def modifiers(self):
+            return self._modifiers
 
         def scenePos(self):
             return QPointF(0, 0)

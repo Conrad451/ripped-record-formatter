@@ -140,6 +140,11 @@ class SettingsPanel(QWidget):
         adv.addRow("Post-miss penalty:", self._dspin("post_miss_penalty", cfg.post_miss_penalty, 0.0, 1.0, 0.05, 2))
         adv.addRow("Confidence digits:", self._ispin("confidence_round_digits", cfg.confidence_round_digits, 0, 8))
         adv.addRow("dB floor eps:", self._dspin("db_floor_eps", cfg.db_floor_eps, 1e-12, 1e-3, 1e-10, 12))
+        adv.addRow(QLabel("<b>Audition playback</b>"))
+        adv.addRow("Preview lead-in (s):",
+                   self._dspin("preview_lead_in_s", cfg.preview_lead_in_s, 0.5, 30.0, 0.5, 1))
+        adv.addRow("Marker nudge (ms):",
+                   self._ispin("marker_nudge_ms", cfg.marker_nudge_ms, 1, 2000))
         adv.addRow(QLabel("<b>Review sanity guard</b>"))
         adv.addRow("Max unconfirmed boundaries (fraction):",
                    self._dspin("wrong_side_frac", cfg.wrong_side_frac, 0.0, 1.0, 0.05, 2))

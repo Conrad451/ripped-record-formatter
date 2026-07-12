@@ -62,6 +62,7 @@ from core.album import (
 from core.side_partition import Side
 from core.split_review import detect_progressive_drift, segment_deviations, wrong_side_suspected
 from core.timefmt import format_timestamp
+from gui.playback import AuditionPlayer
 from gui.release_preview import NO_COVER_TEXT, ReleasePreview
 from gui.side_editor import SideEditorDialog, side_letter
 from gui.track_model import Row, TrackTableModel, TrackTableView
@@ -277,7 +278,40 @@ class FullRipTab(QWidget):
         self.waveform = WaveformView()
         self.waveform.markersChanged.connect(self._on_markers_changed)
         self.waveform.setMinimumHeight(190)
+        self.waveform.seekRequested.connect(self._on_seek_requested)
+        self.waveform.selectionChanged.connect(self._update_preview_enabled)
         review.addWidget(self.waveform, 3)
+
+        # --- audition transport ------------------------------------------------
+        # Splits on gapless material can only be judged by ear. Plays the RESTORED
+        # staged WAV -- the audio the cuts actually apply to, never the raw source.
+        self.player = AuditionPlayer(self)
+        self.player.positionChanged.connect(self.waveform.set_playhead)
+        self.player.playingChanged.connect(self._on_playing_changed)
+        self.player.errorOccurred.connect(lambda m: self._log(f"Playback: {m}"))
+
+        play_row = QHBoxLayout()
+        self.play_btn = QPushButton("Play")
+        self.play_btn.clicked.connect(self._toggle_play)
+        play_row.addWidget(self.play_btn)
+        self.preview_cut_btn = QPushButton("Preview cut")
+        self.preview_cut_btn.setEnabled(False)
+        self.preview_cut_btn.clicked.connect(self._preview_selected_cut)
+        play_row.addWidget(self.preview_cut_btn)
+        self.playback_hint = QLabel(
+            "Space play/pause · Ctrl+click seeks · click a marker to select it, "
+            "arrows nudge it, then Preview cut."
+        )
+        self.playback_hint.setStyleSheet("QLabel { color: palette(mid); }")
+        play_row.addWidget(self.playback_hint, 1)
+        review.addLayout(play_row)
+
+        if not self.player.available:
+            reason = self.player.unavailable_reason or "audio unavailable"
+            for btn in (self.play_btn, self.preview_cut_btn):
+                btn.setEnabled(False)
+                btn.setToolTip(f"Playback unavailable: {reason}")
+            self.playback_hint.setText(f"Playback unavailable: {reason}")
 
         # wrong-side diagnosis
         self.diagnosis_box = QGroupBox("Check the selection")
@@ -311,6 +345,10 @@ class FullRipTab(QWidget):
         gap_layout.addWidget(self.gap_prompt, 1)
         self.prev_gap_btn = QPushButton("< Prev")
         self.prev_gap_btn.clicked.connect(lambda: self._present_gap(self._gap_idx - 1))
+        self.play_window_btn = QPushButton("Play window")
+        self.play_window_btn.setToolTip("Hear the segue before placing the split.")
+        self.play_window_btn.clicked.connect(self._play_current_window)
+        gap_layout.addWidget(self.play_window_btn)
         self.next_gap_btn = QPushButton("Next >")
         self.next_gap_btn.clicked.connect(lambda: self._present_gap(self._gap_idx + 1))
         gap_layout.addWidget(self.prev_gap_btn)
@@ -747,6 +785,7 @@ class FullRipTab(QWidget):
 
     def _clear_review(self) -> None:
         """Return the review area to its empty state after a side is handed off."""
+        self._stop_playback()
         self._analysis = None
         self.model.set_rows([])
         self.waveform.clear_markers(emit=False)
@@ -1008,6 +1047,100 @@ class FullRipTab(QWidget):
         self._clear_review()
         return True
 
+    # -- audition playback ---------------------------------------------------
+    def _load_playback_source(self, restored_path) -> None:
+        """Point the player at this side's restored WAV, transcoding if it won't play.
+
+        ``restore`` quantises its final write back to the *source* subtype, so a
+        normal 16-bit rip stages as PCM_16 and plays natively. A float-sourced rip
+        would stage as float, which Windows' media backends handle unreliably --
+        so those get a PCM_16 preview copy alongside the staging file.
+        """
+        self._stop_playback()
+        if not self.player.available or restored_path is None:
+            return
+        path = Path(restored_path)
+        if not path.exists():
+            return
+        try:
+            import soundfile as sf
+
+            if not sf.info(str(path)).subtype.startswith("PCM"):
+                from gui.playback import transcode_for_preview
+
+                preview = path.with_name(path.stem + "_preview.wav")
+                path = transcode_for_preview(path, preview)
+                self._log("Playback: staged audio is float; using a 16-bit preview copy.")
+        except Exception as exc:                       # never break review over audio
+            self._log(f"Playback: could not prepare audio ({exc}).")
+            return
+        self.player.set_source(path)
+        self._update_preview_enabled()
+
+    def _on_seek_requested(self, seconds: float) -> None:
+        self.player.seek(seconds)
+        self.waveform.set_playhead(seconds)
+
+    def _on_playing_changed(self, playing: bool) -> None:
+        self.play_btn.setText("Pause" if playing else "Play")
+
+    def _toggle_play(self) -> None:
+        self.player.toggle()
+
+    def _update_preview_enabled(self) -> None:
+        self.preview_cut_btn.setEnabled(
+            self.player.available and self.waveform.selected_time() is not None)
+
+    def _preview_selected_cut(self) -> None:
+        """The core gesture: hear the approach and the cut, decide with your ear."""
+        t = self.waveform.selected_time()
+        if t is None:
+            self._log("Playback: select a split marker first (click it on the waveform).")
+            return
+        lead = self.settings.config.preview_lead_in_s
+        self.player.preview_cut(t, lead)
+        self._log(f"Playback: previewing the cut at {format_timestamp(t)} "
+                  f"(from {lead:.0f}s before).")
+
+    def _play_current_window(self) -> None:
+        """Hear an unresolved gap's window before placing a split in it."""
+        if not self._unresolved or not 0 <= self._gap_idx < len(self._unresolved):
+            return
+        gap = self._unresolved[self._gap_idx]
+        self.player.play_window(gap.window_start, gap.window_end)
+        self._log(f"Playback: playing the window "
+                  f"{format_timestamp(gap.window_start)}-{format_timestamp(gap.window_end)}.")
+
+    def _stop_playback(self) -> None:
+        """Stop AND release the file -- staging cleanup must never hit a locked handle."""
+        self.player.stop()
+        self.waveform.set_playhead(None)
+        self.play_btn.setText("Play")
+
+    def keyPressEvent(self, event) -> None:
+        """Space plays/pauses; arrows nudge the selected marker.
+
+        Nudge-then-preview is meant to be a two-key rhythm: Left/Right to move the
+        cut, Space (or Preview cut) to hear it again.
+        """
+        if not self.review_box.isVisible():
+            super().keyPressEvent(event)
+            return
+        key = event.key()
+        if key == Qt.Key.Key_Space:
+            self._toggle_play()
+            event.accept()
+            return
+        if key in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+            step = self.settings.config.marker_nudge_ms / 1000.0
+            delta = -step if key == Qt.Key.Key_Left else step
+            if self.waveform.nudge_selected(delta):
+                t = self.waveform.selected_time()
+                self._log(f"Marker nudged to {format_timestamp(t)}." if t else "")
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
     def _show_side_error(self, side) -> None:
         """An errored side puts its cause in the review area, not an empty panel."""
         self._album_review_index = None
@@ -1065,6 +1198,8 @@ class FullRipTab(QWidget):
         self.waveform.set_markers([p.timestamp for p in analysis.proposal.split_points],
                                   [p.confidence for p in analysis.proposal.split_points])
         self._unresolved = list(analysis.proposal.unresolved)
+        # Audition the RESTORED staged WAV -- the audio the cuts actually apply to.
+        self._load_playback_source(analysis.restored_path)
         self.accept_button.setText("Accept side")
         if getattr(side, "attention", ""):
             # The guard tripped. Say so, and let the user choose between fixing
@@ -1174,6 +1309,10 @@ class FullRipTab(QWidget):
         if not self.output_edit.text().strip():
             self._log("Album: choose an output folder first.")
             return
+
+        # Release the staged file before the controller cuts and cleans it up --
+        # a live handle makes the staging delete fail on Windows.
+        self._stop_playback()
 
         timestamps = self.waveform.marker_times()
         rows = self.model.rows()

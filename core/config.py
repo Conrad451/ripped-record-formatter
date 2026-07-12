@@ -94,6 +94,15 @@ class Config:
     window_s: float = 15.0
     speed_tolerance: float = 0.02
 
+    # --- audition playback ---
+    preview_lead_in_s: float = 5.0
+    """Preview a cut by playing from this many seconds before it, straight
+    through, so the ear judges whether it lands in silence or mid-note."""
+
+    marker_nudge_ms: int = 50
+    """Arrow-key step when nudging the selected split marker. Nudge-then-preview
+    is meant to be a two-key rhythm, not a mouse dance."""
+
     # --- review sanity guard ---
     wrong_side_frac: float = 0.5
     """Fraction of a side's expected boundaries that may go unconfirmed before
