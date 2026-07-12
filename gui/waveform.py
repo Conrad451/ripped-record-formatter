@@ -46,6 +46,8 @@ class WaveformView(pg.PlotWidget):
     """Display-only waveform with editable split markers."""
 
     markersChanged = Signal()   # any add / move / delete
+    seekRequested = Signal(float)      # user asked to move the play head (seconds)
+    selectionChanged = Signal()        # the selected marker changed
 
     def __init__(self, parent=None):
         super().__init__(parent, axisItems={"bottom": _TimeAxis(orientation="bottom")})
@@ -60,6 +62,8 @@ class WaveformView(pg.PlotWidget):
         self._curve = pg.PlotCurveItem(pen=_WAVE_PEN)
         self.addItem(self._curve)
         self._markers: list[pg.InfiniteLine] = []
+        self._selected: pg.InfiniteLine | None = None
+        self._playhead: pg.InfiniteLine | None = None
         self._region: pg.LinearRegionItem | None = None
         self._env = None
         self._place_mode = False
@@ -148,6 +152,7 @@ class WaveformView(pg.PlotWidget):
         return len(self._markers)
 
     def clear_markers(self, emit: bool = True) -> None:
+        self._selected = None
         for line in self._markers:
             self.removeItem(line)
         self._markers.clear()
@@ -181,6 +186,77 @@ class WaveformView(pg.PlotWidget):
             self.setXRange(0.0, max(self._env.duration, 1e-6), padding=0.02)
 
     # -- double-click to delete a marker ------------------------------------
+    # -- play head ----------------------------------------------------------
+    def set_playhead(self, seconds: float | None) -> None:
+        """Draw (or move) the playback cursor. ``None`` removes it."""
+        if seconds is None:
+            if self._playhead is not None:
+                self.removeItem(self._playhead)
+                self._playhead = None
+            return
+        if self._playhead is None:
+            self._playhead = pg.InfiniteLine(
+                pos=seconds, angle=90, movable=False,
+                pen=pg.mkPen("#00b0ff", width=2))
+            self._playhead.setZValue(20)      # above the markers
+            self.addItem(self._playhead)
+        else:
+            self._playhead.setPos(seconds)
+
+    def playhead(self) -> float | None:
+        return None if self._playhead is None else float(self._playhead.value())
+
+    # -- marker selection ---------------------------------------------------
+    def _restyle_selection(self) -> None:
+        for line in self._markers:
+            width = 3 if line is self._selected else 1
+            pen = line.pen
+            pen.setWidth(width)
+            line.setPen(pen)
+
+    def select_marker_at(self, x: float) -> bool:
+        """Select the marker nearest ``x`` if it is within grab distance."""
+        if not self._markers:
+            return False
+        nearest = min(self._markers, key=lambda line: abs(line.value() - x))
+        if abs(nearest.value() - x) > self._x_tolerance(10):
+            return False
+        self._selected = nearest
+        self._restyle_selection()
+        self.selectionChanged.emit()
+        return True
+
+    def select_time(self, seconds: float) -> bool:
+        """Select the marker at (or nearest to) ``seconds`` regardless of zoom."""
+        if not self._markers:
+            return False
+        self._selected = min(self._markers, key=lambda line: abs(line.value() - seconds))
+        self._restyle_selection()
+        self.selectionChanged.emit()
+        return True
+
+    def selected_time(self) -> float | None:
+        if self._selected is None or self._selected not in self._markers:
+            return None
+        return float(self._selected.value())
+
+    def clear_selection(self) -> None:
+        self._selected = None
+        self._restyle_selection()
+        self.selectionChanged.emit()
+
+    def nudge_selected(self, delta_seconds: float) -> bool:
+        """Move the selected marker by ``delta_seconds``. Half of nudge-then-preview."""
+        if self._selected is None or self._selected not in self._markers:
+            return False
+        new = max(0.0, self._selected.value() + delta_seconds)
+        limit = self.duration
+        if limit > 0:                 # 0 means "no envelope loaded", not "zero-length"
+            new = min(limit, new)
+        self._selected.setPos(new)
+        self.markersChanged.emit()
+        return True
+
     def _x_tolerance(self, pixels: float) -> float:
         vb = self.getPlotItem().getViewBox()
         (x0, x1), _ = vb.viewRange()
@@ -199,7 +275,28 @@ class WaveformView(pg.PlotWidget):
                 self.markersChanged.emit()
                 event.accept()
             return
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+
+        # Seek gesture: Ctrl+left-click. Chosen because plain left-click is
+        # already click-to-place (and double-click is delete), so a modifier is
+        # the only thing that cannot collide. It works in both modes.
+        modifiers = event.modifiers()
+        if modifiers & Qt.KeyboardModifier.ControlModifier:
+            self.seekRequested.emit(max(0.0, x))
+            event.accept()
+            return
+
         # Single left-click in place mode drops a marker where the user clicked.
-        if self._place_mode and event.button() == Qt.MouseButton.LeftButton:
+        if self._place_mode:
             self.add_marker(x)
             event.accept()
+            return
+
+        # Outside place mode a plain click selects a nearby marker (to preview or
+        # nudge it), and otherwise just moves the play head.
+        if self.select_marker_at(x):
+            event.accept()
+            return
+        self.seekRequested.emit(max(0.0, x))
+        event.accept()

@@ -13,7 +13,10 @@ Two pieces, both GUI-agnostic:
   in-flight analysis holds a whole side in RAM and rips usually sit on a network
   share); accepted sides encode on a separate pool while later sides are still
   being reviewed. One side failing (bad WAV, sanity-guard trip) parks that side
-  in :attr:`SideState.ERROR` and never stops the others.
+  in :attr:`SideState.ERROR` and never stops the others. A side whose analysis
+  *worked* but tripped a sanity guard is parked in
+  :attr:`SideState.NEEDS_ATTENTION` instead, keeping its proposal, because that
+  is a review request rather than a failure.
 
 The controller is deliberately injected with ``analyze_fn`` / ``encode_fn`` so it
 can be driven by real DSP in the GUI or by instrumented fakes in tests. State
@@ -37,6 +40,14 @@ class SideState(str, Enum):
     QUEUED = "queued"
     ANALYZING = "analyzing"
     READY = "ready"            # analysis done, awaiting human review
+    NEEDS_ATTENTION = "needs attention"
+    """Analysis succeeded, but a sanity guard says the result should not be
+    trusted unreviewed -- too few boundaries confirmed for the expected track
+    count. That is a *review request*, not a failure: the analysis is intact and
+    the side opens for review like a READY one, just with a diagnosis banner. It
+    is emphatically not ERROR, whose only exit is Retry -- and retrying a guard
+    trip re-runs the same deterministic analysis on the same input and trips the
+    same guard."""
     RESOLVING = "resolving"    # human is reviewing / placing markers
     ACCEPTED = "accepted"      # cuts confirmed, queued to encode
     ENCODING = "encoding"
@@ -46,6 +57,23 @@ class SideState(str, Enum):
 
 
 _TERMINAL = {SideState.DONE, SideState.ERROR, SideState.CANCELLED}
+
+#: States a side can be re-run from.
+_RETRYABLE = {SideState.ERROR, SideState.NEEDS_ATTENTION}
+
+
+class NeedsAttention(Exception):
+    """Raised by ``analyze_fn`` when a sanity guard trips on a *usable* result.
+
+    Carries the analysis that was produced, so the controller can park the side
+    for review instead of throwing the work away. Anything else raised out of
+    ``analyze_fn`` is a real failure and still lands in ERROR.
+    """
+
+    def __init__(self, reason: str, analysis: object) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.analysis = analysis
 
 
 @dataclass
@@ -69,6 +97,8 @@ class SideJob:
     # An ERROR state that only says "error" is useless. Every failure records
     # what actually went wrong, which phase it went wrong in, and the traceback,
     # so the UI can show a cause instead of a colour.
+    attention: str = ""
+    """Why a NEEDS_ATTENTION side wants review. Not an error message."""
     error: str = ""
     """One-line cause, e.g. ``PermissionError: [Errno 13] Permission denied: ...``."""
     failed_phase: str = ""
@@ -80,6 +110,7 @@ class SideJob:
         self.error = ""
         self.failed_phase = ""
         self.error_detail = ""
+        self.attention = ""
 
 
 # --------------------------------------------------------------------------- #
@@ -246,7 +277,7 @@ class AlbumController:
         """
         side = self._by_index(index)
         with self._lock:
-            if side.state != SideState.ERROR:
+            if side.state not in _RETRYABLE:
                 return False
             if side.wav_path is None:
                 return False          # nothing to retry; it was never mapped
@@ -273,6 +304,16 @@ class AlbumController:
         self._set_state(side, SideState.ANALYZING)
         try:
             analysis = self._analyze_fn(side, self._should_cancel(side))
+        except NeedsAttention as flag:
+            # A guard trip, not a failure. Keep the analysis it produced.
+            if self._cancelled(side):
+                self._set_state(side, SideState.CANCELLED)
+                return
+            side.analysis = flag.analysis
+            with self._lock:
+                side.attention = flag.reason
+            self._set_state(side, SideState.NEEDS_ATTENTION)
+            return
         except Exception as exc:
             if self._cancelled(side):
                 self._set_state(side, SideState.CANCELLED)
@@ -289,7 +330,7 @@ class AlbumController:
     def mark_resolving(self, index: int) -> None:
         """The user opened a READY side for review."""
         side = self._by_index(index)
-        if side.state == SideState.READY:
+        if side.state in (SideState.READY, SideState.NEEDS_ATTENTION):
             self._set_state(side, SideState.RESOLVING)
 
     def accept_side(

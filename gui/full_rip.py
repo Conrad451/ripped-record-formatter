@@ -53,6 +53,7 @@ from PySide6.QtWidgets import (
 from core import job_settings
 from core.album import (
     AlbumController,
+    NeedsAttention,
     SideJob,
     SideState,
     propose_wav_side_map,
@@ -61,6 +62,7 @@ from core.album import (
 from core.side_partition import Side
 from core.split_review import detect_progressive_drift, segment_deviations, wrong_side_suspected
 from core.timefmt import format_timestamp
+from gui.playback import AuditionPlayer
 from gui.release_preview import NO_COVER_TEXT, ReleasePreview
 from gui.side_editor import SideEditorDialog, side_letter
 from gui.track_model import Row, TrackTableModel, TrackTableView
@@ -276,7 +278,40 @@ class FullRipTab(QWidget):
         self.waveform = WaveformView()
         self.waveform.markersChanged.connect(self._on_markers_changed)
         self.waveform.setMinimumHeight(190)
+        self.waveform.seekRequested.connect(self._on_seek_requested)
+        self.waveform.selectionChanged.connect(self._update_preview_enabled)
         review.addWidget(self.waveform, 3)
+
+        # --- audition transport ------------------------------------------------
+        # Splits on gapless material can only be judged by ear. Plays the RESTORED
+        # staged WAV -- the audio the cuts actually apply to, never the raw source.
+        self.player = AuditionPlayer(self)
+        self.player.positionChanged.connect(self.waveform.set_playhead)
+        self.player.playingChanged.connect(self._on_playing_changed)
+        self.player.errorOccurred.connect(lambda m: self._log(f"Playback: {m}"))
+
+        play_row = QHBoxLayout()
+        self.play_btn = QPushButton("Play")
+        self.play_btn.clicked.connect(self._toggle_play)
+        play_row.addWidget(self.play_btn)
+        self.preview_cut_btn = QPushButton("Preview cut")
+        self.preview_cut_btn.setEnabled(False)
+        self.preview_cut_btn.clicked.connect(self._preview_selected_cut)
+        play_row.addWidget(self.preview_cut_btn)
+        self.playback_hint = QLabel(
+            "Space play/pause · Ctrl+click seeks · click a marker to select it, "
+            "arrows nudge it, then Preview cut."
+        )
+        self.playback_hint.setStyleSheet("QLabel { color: palette(mid); }")
+        play_row.addWidget(self.playback_hint, 1)
+        review.addLayout(play_row)
+
+        if not self.player.available:
+            reason = self.player.unavailable_reason or "audio unavailable"
+            for btn in (self.play_btn, self.preview_cut_btn):
+                btn.setEnabled(False)
+                btn.setToolTip(f"Playback unavailable: {reason}")
+            self.playback_hint.setText(f"Playback unavailable: {reason}")
 
         # wrong-side diagnosis
         self.diagnosis_box = QGroupBox("Check the selection")
@@ -284,12 +319,21 @@ class FullRipTab(QWidget):
         self.diagnosis_label = QLabel("")
         self.diagnosis_label.setWordWrap(True)
         diag.addWidget(self.diagnosis_label, 1)
-        reselect = QPushButton("Re-select side")
-        reselect.clicked.connect(self._reselect_side)
-        diag.addWidget(reselect)
-        resolve_anyway = QPushButton("Resolve manually anyway")
-        resolve_anyway.clicked.connect(self._resolve_anyway)
-        diag.addWidget(resolve_anyway)
+        # Single-side routes...
+        self.reselect_btn = QPushButton("Re-select side")
+        self.reselect_btn.clicked.connect(self._reselect_side)
+        diag.addWidget(self.reselect_btn)
+        self.resolve_anyway_btn = QPushButton("Resolve manually anyway")
+        self.resolve_anyway_btn.clicked.connect(self._resolve_anyway)
+        diag.addWidget(self.resolve_anyway_btn)
+        # ...and the album equivalents. Same diagnosis, same resolve flow beneath;
+        # only the way back out differs (a mapping table, not a side combo).
+        self.recheck_mapping_btn = QPushButton("Re-check mapping")
+        self.recheck_mapping_btn.clicked.connect(self._recheck_mapping)
+        diag.addWidget(self.recheck_mapping_btn)
+        self.review_manual_btn = QPushButton("Review and place splits manually")
+        self.review_manual_btn.clicked.connect(self._resolve_anyway)
+        diag.addWidget(self.review_manual_btn)
         self.diagnosis_box.setVisible(False)
         review.addWidget(self.diagnosis_box)
 
@@ -301,6 +345,10 @@ class FullRipTab(QWidget):
         gap_layout.addWidget(self.gap_prompt, 1)
         self.prev_gap_btn = QPushButton("< Prev")
         self.prev_gap_btn.clicked.connect(lambda: self._present_gap(self._gap_idx - 1))
+        self.play_window_btn = QPushButton("Play window")
+        self.play_window_btn.setToolTip("Hear the segue before placing the split.")
+        self.play_window_btn.clicked.connect(self._play_current_window)
+        gap_layout.addWidget(self.play_window_btn)
         self.next_gap_btn = QPushButton("Next >")
         self.next_gap_btn.clicked.connect(lambda: self._present_gap(self._gap_idx + 1))
         gap_layout.addWidget(self.prev_gap_btn)
@@ -503,7 +551,9 @@ class FullRipTab(QWidget):
 
         # Wrong-side sanity guard before opening any resolve queue.
         self._unresolved = list(proposal.unresolved)
-        if self._expected_n and wrong_side_suspected(self._expected_n, len(self._unresolved)):
+        if self._expected_n and wrong_side_suspected(
+                self._expected_n, len(self._unresolved),
+                frac=self.settings.config.wrong_side_frac):
             self._show_wrong_side_diagnosis()
         elif self._unresolved:
             self._begin_gap_resolution()
@@ -515,17 +565,58 @@ class FullRipTab(QWidget):
         self._update_accept_enabled()
 
     def _show_wrong_side_diagnosis(self) -> None:
+        album = self._album is not None and self._album_review_index is not None
         n = self._expected_n
         confirmed = (n - 1) - len(self._unresolved) if n else 0
-        self.diagnosis_label.setText(
-            f"Expected {n} tracks but could only confirm {confirmed} boundaries. "
-            "This usually means the wrong side or release is selected (the side has "
-            "fewer tracks than expected)."
-        )
+
+        if album:
+            self.diagnosis_label.setText(
+                f"Expected {n} tracks; only {confirmed} boundaries confirmed. "
+                "This can mean the wrong side or release is mapped — or the record "
+                "genuinely has gapless transitions."
+            )
+        else:
+            self.diagnosis_label.setText(
+                f"Expected {n} tracks but could only confirm {confirmed} boundaries. "
+                "This usually means the wrong side or release is selected (the side has "
+                "fewer tracks than expected)."
+            )
+        # Offer the routes that actually exist in the mode you are in.
+        self.reselect_btn.setVisible(not album)
+        self.resolve_anyway_btn.setVisible(not album)
+        self.recheck_mapping_btn.setVisible(album)
+        self.review_manual_btn.setVisible(album)
+
         self.diagnosis_box.setVisible(True)
         self.gap_box.setVisible(False)
         self.waveform.set_place_mode(False)
         self._log("Full Rip: too many gaps unresolved - suspect wrong side/release.")
+
+    def _recheck_mapping(self) -> None:
+        """Back to the mapping table, with this side unmapped and awaiting a choice."""
+        self.diagnosis_box.setVisible(False)
+        index = self._album_review_index
+        side = self._album_side(index) if index is not None else None
+        label = side.label if side else "the side"
+
+        # Re-set the row that fed this side back to skip, so the user is choosing
+        # again rather than staring at the mapping that just went wrong.
+        for row, mapped in enumerate(self._album_mapping):
+            if mapped == index:
+                self._album_mapping[row] = None
+                widget = self.mapping_table.cellWidget(row, 1)
+                if widget is not None:
+                    widget.blockSignals(True)
+                    widget.setCurrentIndex(0)          # "— skip —"
+                    widget.blockSignals(False)
+                break
+
+        self._album_review_index = None
+        self._clear_review()
+        self.mapping_table.setFocus()
+        self._log(f"Album: {label} unmapped - pick the right WAV for it, then "
+                  "press 'Retry side'.")
+        self._update_retry_enabled()
 
     def _reselect_side(self) -> None:
         self.diagnosis_box.setVisible(False)
@@ -694,6 +785,7 @@ class FullRipTab(QWidget):
 
     def _clear_review(self) -> None:
         """Return the review area to its empty state after a side is handed off."""
+        self._stop_playback()
         self._analysis = None
         self.model.set_rows([])
         self.waveform.clear_markers(emit=False)
@@ -715,6 +807,11 @@ class FullRipTab(QWidget):
             return "Side analyzing..."
         if any(s == SideState.READY for s in states):
             return "A side is ready - pick it from the list to review its splits."
+        if any(s == SideState.NEEDS_ATTENTION for s in states):
+            flagged = ", ".join(x.label for x in self._album.sides
+                                if x.state == SideState.NEEDS_ATTENTION)
+            return (f"{flagged} needs attention - click it to see why and choose "
+                    "how to resolve it.")
         done = all(s in (SideState.DONE, SideState.ERROR, SideState.CANCELLED) for s in states)
         if any(s == SideState.ERROR for s in states):
             failed = ", ".join(x.label for x in self._album.sides
@@ -869,12 +966,18 @@ class FullRipTab(QWidget):
                 if side.state == SideState.ERROR and side.error:
                     phase = side.failed_phase or "processing"
                     item.setToolTip(f"{side.label} failed during {phase}:\n{side.error}")
+                elif side.state == SideState.NEEDS_ATTENTION and side.attention:
+                    item.setToolTip(f"{side.label} needs review:\n{side.attention}")
                 else:
                     item.setToolTip(f"{side.label} - {side.state.value}")
                 break
         self._update_retry_enabled()
         if side.state == SideState.READY:
             self._log(f"Album: {side.label} ready for review.")
+        elif side.state == SideState.NEEDS_ATTENTION:
+            self._log(f"Album: {side.label} needs attention - {side.attention}. "
+                      "Click it to review: re-check the mapping, or place the "
+                      "splits by hand.")
         elif side.state == SideState.ERROR:
             # Say what actually went wrong, at the moment it goes wrong. The one
             # informative line used to be the only record, and the log pane shows
@@ -910,8 +1013,15 @@ class FullRipTab(QWidget):
             return                                  # already open
         if not self._confirm_discard_review():
             return
+        # A guard-tripped side opens for review exactly like a ready one -- the
+        # analysis is intact; it just arrives with a diagnosis banner. It keeps
+        # its NEEDS_ATTENTION state while under review, rather than being flipped
+        # to RESOLVING: the flag is what keeps Retry available (the user may go
+        # fix the mapping) and what tells the list why this side is different.
         if side.state in (SideState.READY, SideState.RESOLVING):
             self._album.mark_resolving(side.index)
+            self._load_side_for_review(side)
+        elif side.state == SideState.NEEDS_ATTENTION:
             self._load_side_for_review(side)
 
     def _confirm_discard_review(self) -> bool:
@@ -937,6 +1047,100 @@ class FullRipTab(QWidget):
         self._clear_review()
         return True
 
+    # -- audition playback ---------------------------------------------------
+    def _load_playback_source(self, restored_path) -> None:
+        """Point the player at this side's restored WAV, transcoding if it won't play.
+
+        ``restore`` quantises its final write back to the *source* subtype, so a
+        normal 16-bit rip stages as PCM_16 and plays natively. A float-sourced rip
+        would stage as float, which Windows' media backends handle unreliably --
+        so those get a PCM_16 preview copy alongside the staging file.
+        """
+        self._stop_playback()
+        if not self.player.available or restored_path is None:
+            return
+        path = Path(restored_path)
+        if not path.exists():
+            return
+        try:
+            import soundfile as sf
+
+            if not sf.info(str(path)).subtype.startswith("PCM"):
+                from gui.playback import transcode_for_preview
+
+                preview = path.with_name(path.stem + "_preview.wav")
+                path = transcode_for_preview(path, preview)
+                self._log("Playback: staged audio is float; using a 16-bit preview copy.")
+        except Exception as exc:                       # never break review over audio
+            self._log(f"Playback: could not prepare audio ({exc}).")
+            return
+        self.player.set_source(path)
+        self._update_preview_enabled()
+
+    def _on_seek_requested(self, seconds: float) -> None:
+        self.player.seek(seconds)
+        self.waveform.set_playhead(seconds)
+
+    def _on_playing_changed(self, playing: bool) -> None:
+        self.play_btn.setText("Pause" if playing else "Play")
+
+    def _toggle_play(self) -> None:
+        self.player.toggle()
+
+    def _update_preview_enabled(self) -> None:
+        self.preview_cut_btn.setEnabled(
+            self.player.available and self.waveform.selected_time() is not None)
+
+    def _preview_selected_cut(self) -> None:
+        """The core gesture: hear the approach and the cut, decide with your ear."""
+        t = self.waveform.selected_time()
+        if t is None:
+            self._log("Playback: select a split marker first (click it on the waveform).")
+            return
+        lead = self.settings.config.preview_lead_in_s
+        self.player.preview_cut(t, lead)
+        self._log(f"Playback: previewing the cut at {format_timestamp(t)} "
+                  f"(from {lead:.0f}s before).")
+
+    def _play_current_window(self) -> None:
+        """Hear an unresolved gap's window before placing a split in it."""
+        if not self._unresolved or not 0 <= self._gap_idx < len(self._unresolved):
+            return
+        gap = self._unresolved[self._gap_idx]
+        self.player.play_window(gap.window_start, gap.window_end)
+        self._log(f"Playback: playing the window "
+                  f"{format_timestamp(gap.window_start)}-{format_timestamp(gap.window_end)}.")
+
+    def _stop_playback(self) -> None:
+        """Stop AND release the file -- staging cleanup must never hit a locked handle."""
+        self.player.stop()
+        self.waveform.set_playhead(None)
+        self.play_btn.setText("Play")
+
+    def keyPressEvent(self, event) -> None:
+        """Space plays/pauses; arrows nudge the selected marker.
+
+        Nudge-then-preview is meant to be a two-key rhythm: Left/Right to move the
+        cut, Space (or Preview cut) to hear it again.
+        """
+        if not self.review_box.isVisible():
+            super().keyPressEvent(event)
+            return
+        key = event.key()
+        if key == Qt.Key.Key_Space:
+            self._toggle_play()
+            event.accept()
+            return
+        if key in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+            step = self.settings.config.marker_nudge_ms / 1000.0
+            delta = -step if key == Qt.Key.Key_Left else step
+            if self.waveform.nudge_selected(delta):
+                t = self.waveform.selected_time()
+                self._log(f"Marker nudged to {format_timestamp(t)}." if t else "")
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
     def _show_side_error(self, side) -> None:
         """An errored side puts its cause in the review area, not an empty panel."""
         self._album_review_index = None
@@ -957,8 +1161,15 @@ class FullRipTab(QWidget):
 
     def _update_retry_enabled(self) -> None:
         side = self._selected_side()
-        self.retry_side_btn.setEnabled(
-            side is not None and side.state == SideState.ERROR and side.wav_path is not None)
+        retryable = side is not None and side.wav_path is not None and side.state in (
+            SideState.ERROR, SideState.NEEDS_ATTENTION)
+        self.retry_side_btn.setEnabled(retryable)
+        if side is not None and side.state == SideState.NEEDS_ATTENTION:
+            self.retry_side_btn.setToolTip(
+                "Retry re-analyzes with the current mapping — if nothing changed, "
+                "the result won't either.")
+        else:
+            self.retry_side_btn.setToolTip("Re-run the selected failed side from scratch.")
 
     def _retry_selected_side(self) -> None:
         side = self._selected_side()
@@ -987,8 +1198,15 @@ class FullRipTab(QWidget):
         self.waveform.set_markers([p.timestamp for p in analysis.proposal.split_points],
                                   [p.confidence for p in analysis.proposal.split_points])
         self._unresolved = list(analysis.proposal.unresolved)
+        # Audition the RESTORED staged WAV -- the audio the cuts actually apply to.
+        self._load_playback_source(analysis.restored_path)
         self.accept_button.setText("Accept side")
-        if self._unresolved:
+        if getattr(side, "attention", ""):
+            # The guard tripped. Say so, and let the user choose between fixing
+            # the mapping and placing the splits by hand -- the same resolve flow
+            # the single-side path has always had, just reachable from here.
+            self._show_wrong_side_diagnosis()
+        elif self._unresolved:
             self._begin_gap_resolution()
         else:
             self.gap_box.setVisible(False)
@@ -1092,6 +1310,10 @@ class FullRipTab(QWidget):
             self._log("Album: choose an output folder first.")
             return
 
+        # Release the staged file before the controller cuts and cleans it up --
+        # a live handle makes the staging delete fail on Windows.
+        self._stop_playback()
+
         timestamps = self.waveform.marker_times()
         rows = self.model.rows()
         titles = [r.title for r in rows]
@@ -1131,13 +1353,22 @@ class FullRipTab(QWidget):
         else:
             proposal = propose_splits(restored, params=params)
 
-        n = len(side.titles) or None
-        if n and wrong_side_suspected(n, len(proposal.unresolved)):
-            raise RuntimeError(
-                f"wrong side/release suspected: {len(proposal.unresolved)} of {n - 1} "
-                "boundaries unresolved")
         envelope = load_peak_envelope(restored)
-        return AnalyzeResult(result, proposal, envelope, restored)
+        analysis = AnalyzeResult(result, proposal, envelope, restored)
+
+        # The sanity guard used to raise here, which the controller turned into
+        # ERROR -- throwing away a perfectly good proposal and leaving Retry as
+        # the only exit, on input that deterministically re-fails. A guard trip
+        # is a request for review, so hand the analysis over with it.
+        n = len(side.titles) or None
+        if n and wrong_side_suspected(n, len(proposal.unresolved),
+                                      frac=cfg.wrong_side_frac):
+            confirmed = (n - 1) - len(proposal.unresolved)
+            raise NeedsAttention(
+                f"expected {n} tracks; only {confirmed} of {n - 1} boundaries confirmed",
+                analysis,
+            )
+        return analysis
 
     def _album_encode(self, side, should_cancel):
         """Runs on an AlbumController thread -- no widget access."""

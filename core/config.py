@@ -94,6 +94,24 @@ class Config:
     window_s: float = 15.0
     speed_tolerance: float = 0.02
 
+    # --- audition playback ---
+    preview_lead_in_s: float = 5.0
+    """Preview a cut by playing from this many seconds before it, straight
+    through, so the ear judges whether it lands in silence or mid-note."""
+
+    marker_nudge_ms: int = 50
+    """Arrow-key step when nudging the selected split marker. Nudge-then-preview
+    is meant to be a two-key rhythm, not a mouse dance."""
+
+    # --- review sanity guard ---
+    wrong_side_frac: float = 0.5
+    """Fraction of a side's expected boundaries that may go unconfirmed before
+    the proposal is flagged for review rather than trusted. An N-track side has
+    N-1 boundaries; if more than this fraction come back unresolved, the side is
+    parked as "needs attention" -- usually the wrong side/release is mapped, but
+    a record with genuine gapless segues trips it honestly. Raise it toward 1.0
+    to be told less often; lower it to be told sooner."""
+
     # --- encoding ---
     encode_workers: int = field(default_factory=lambda: min(4, os.cpu_count() or 1))
     """How many tracks to encode in parallel (each is an independent ffmpeg run)."""

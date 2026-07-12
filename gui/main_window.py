@@ -282,6 +282,9 @@ class MainWindow(QMainWindow):
         self.metadata_panel.releaseSelected.connect(self._on_release_selected)
         self._last_batch_panel = self.convert_panel
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        # Leaving Full Rip stops any audition and releases the staged file.
+        self.tabs.currentChanged.connect(
+            lambda _i: self.full_rip._stop_playback())
 
         self._last_output_dir: Path | None = None
 
