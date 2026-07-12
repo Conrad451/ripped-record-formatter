@@ -10,13 +10,19 @@ Strategy
 --------
 Resolution order:
 
+0. **A copy bundled inside the frozen app** -- ``ffmpeg/ffmpeg.exe`` beside the
+   executable (or under ``sys._MEIPASS``). Only ever present in a PyInstaller
+   build, and deliberately checked *first*: the packaged app must convert end to
+   end on a machine with no ffmpeg installed and no network, and it must not be
+   at the mercy of whatever stale ffmpeg happens to be on the user's PATH.
 1. A copy managed by the ``ffmpeg-downloader`` package (a static build unpacked
-   into the per-user data dir). This is the preferred path: no admin rights, no
-   system PATH pollution, and it foreshadows the bundling story.
+   into the per-user data dir). This is the path a developer running from source
+   gets, and the packaging story was written on top of it.
 2. An ``ffmpeg`` already on the system ``PATH`` (developer convenience / CI).
 
-If neither is present and ``auto_download`` is set, we shell out to
-``python -m ffmpeg_downloader install -y`` to fetch one.
+If none is present and ``auto_download`` is set, we shell out to
+``python -m ffmpeg_downloader install -y`` to fetch one. A frozen app never gets
+that far -- step 0 always wins -- which is what makes it network-free.
 """
 
 from __future__ import annotations
@@ -27,17 +33,57 @@ import subprocess
 import sys
 from pathlib import Path
 
-import ffmpeg_downloader as ffdl
+try:
+    import ffmpeg_downloader as ffdl
+except Exception:            # not shipped in the frozen bundle -- it is not needed
+    ffdl = None
 
 
 class FFmpegNotAvailable(RuntimeError):
     """Raised when ffmpeg cannot be located and could not be downloaded."""
 
 
+def _bundle_roots() -> list[Path]:
+    """Where a frozen build might have put its bundled ffmpeg.
+
+    Empty when running from source, which is what keeps dev behaviour identical:
+    :func:`find_ffmpeg` falls straight through to the downloader/PATH lookup.
+    """
+    if not getattr(sys, "frozen", False):
+        return []
+    roots: list[Path] = []
+    # onedir: next to the executable. onefile: extracted under _MEIPASS.
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        roots.append(Path(meipass))
+    roots.append(Path(sys.executable).parent)
+    # PyInstaller onedir >=6 puts collected data under _internal/.
+    roots.extend([root / "_internal" for root in list(roots)])
+    return roots
+
+
+def _bundled_ffmpeg() -> tuple[Path | None, Path | None]:
+    """ffmpeg shipped inside the frozen app, or ``(None, None)`` from source."""
+    for root in _bundle_roots():
+        candidate = root / "ffmpeg" / "ffmpeg.exe"
+        if not candidate.exists():
+            candidate = root / "ffmpeg" / "ffmpeg"      # non-Windows
+        if candidate.exists():
+            probe = candidate.with_name(
+                "ffprobe.exe" if candidate.suffix == ".exe" else "ffprobe")
+            return candidate, (probe if probe.exists() else None)
+    return None, None
+
+
 def _managed_ffmpeg() -> tuple[Path | None, Path | None]:
     """Paths to the ffmpeg-downloader-managed binaries, or ``(None, None)``."""
-    if ffdl.installed():
-        return Path(ffdl.ffmpeg_path), Path(ffdl.ffprobe_path)
+    if ffdl is None:
+        return None, None
+    try:
+        if ffdl.installed():
+            return Path(ffdl.ffmpeg_path), Path(ffdl.ffprobe_path)
+    except Exception:
+        pass
     return None, None
 
 
@@ -53,7 +99,11 @@ def find_ffmpeg() -> tuple[Path | None, Path | None]:
     """Locate ffmpeg/ffprobe *without* downloading.
 
     Returns ``(ffmpeg_path, ffprobe_path)``; either element may be ``None``.
+    The bundled copy wins when frozen -- see the module docstring.
     """
+    ffmpeg, ffprobe = _bundled_ffmpeg()
+    if ffmpeg is not None:
+        return ffmpeg, ffprobe
     ffmpeg, ffprobe = _managed_ffmpeg()
     if ffmpeg is not None:
         return ffmpeg, ffprobe
@@ -61,7 +111,13 @@ def find_ffmpeg() -> tuple[Path | None, Path | None]:
 
 
 def download_ffmpeg() -> None:
-    """Fetch a static ffmpeg build via ffmpeg-downloader (needs network access)."""
+    """Fetch a static ffmpeg build via ffmpeg-downloader (needs network access).
+
+    Never reached in a frozen build: the bundled copy resolves first.
+    """
+    if ffdl is None:
+        raise FFmpegNotAvailable(
+            "ffmpeg is not bundled and ffmpeg-downloader is unavailable.")
     subprocess.run(
         [sys.executable, "-m", "ffmpeg_downloader", "install", "-y"],
         check=True,
