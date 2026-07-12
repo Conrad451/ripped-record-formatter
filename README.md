@@ -1,6 +1,6 @@
 # Ripped Record Formatter
 
-You record a whole side of a record in one pass and end up with a single enormous WAV. Ripped Record Formatter turns that into a finished album: it cleans the audio (rumble, mains hum, surface noise, clicks), works out where one track ends and the next begins, looks the release up on MusicBrainz to get the real tracklist, per-side structure and cover art, and encodes tagged FLACs — one side at a time or a whole multi-disc album in one run. It is a desktop app built for the actual shape of the job, which is why it asks you where a split goes when it genuinely cannot tell, instead of guessing and quietly mangling a track.
+You play a record into it and get a finished album back. Ripped Record Formatter records the side, then turns that single enormous WAV into tagged tracks: it cleans the audio (rumble, mains hum, surface noise, clicks), works out where one track ends and the next begins, looks the release up on MusicBrainz to get the real tracklist, per-side structure and cover art, and encodes tagged FLACs — one side at a time or a whole multi-disc album in one run. It is a desktop app built for the actual shape of the job, which is why it asks you where a split goes when it genuinely cannot tell, instead of guessing and quietly mangling a track.
 
 ![The Full Rip tab](docs/screenshot.png)
 
@@ -15,10 +15,11 @@ You record a whole side of a record in one pass and end up with a single enormou
 
 ## Features
 
+- **Recording.** Capture straight from any input device — turntable into a preamp into a line-in, or a USB interface — with live stereo level meters, peak-hold ticks and a clip indicator that *latches*, so you can set your input gain before you commit and still see afterwards that something clipped. Captures stream to disk (a side never sits in RAM), record to local staging and move to your folder on stop, and say so loudly if the audio has a dropout. Naming is side-aware: the next-file field pre-fills `SideA.wav` and advances to `SideB.wav` after each stop, because the thing you do between takes is flip the record, not type.
 - **Restoration pipeline.** An ordered chain of independent stages — rumble filter (zero-phase subsonic high-pass), mains-hum removal (notch at the mains frequency and its harmonics), spectral-gating noise reduction profiled from the lead-in groove, and click/pop removal. Everything between stages is held as float, so a filter that overshoots full scale is not hard-clipped on the way to the next stage; the single conversion back to the source bit depth happens at the very end, with a headroom check that attenuates rather than clips.
 - **Duration-anchored splitting.** Given the expected track durations from the release, the splitter predicts roughly where each gap should fall, searches a window around that prediction for the real silence, and re-anchors the next prediction on the gap it just confirmed — so turntable speed error, unknown lead-out deadspace and approximate CD-sourced durations never accumulate down the side. **When a window contains no convincing silence — a segue, a crossfade, a genuinely gapless transition — it does not invent a split. It hands you that one gap, with the search window highlighted on the waveform, and asks you to place it; the rest of the side is still resolved automatically.**
 - **MusicBrainz lookup.** Search a release, pick the right pressing (vinyl is ranked above CD and studio albums above compilations, so the 1959 LP beats a later best-of), and pull down the per-side tracklist, track durations, MusicBrainz IDs and the front cover from the Cover Art Archive.
-- **Album orchestration.** Point it at the folder of side WAVs, map each file to its side, and the whole record goes through in one run — sides analyse in the background while you review the one in front of you, and accepting a side starts its encode immediately. Tracks land flat in one output folder, numbered continuously across the album, while the *tags* keep per-side TRACKNUMBER/DISCNUMBER (the Picard vinyl convention).
+- **Album orchestration.** Point it at the folder of side WAVs, map each file to its side, and the whole record goes through in one run — sides analyse in the background while you review the one in front of you, and accepting a side starts its encode immediately. Tracks land flat in one output folder, numbered continuously across the album, while the *tags* keep per-side TRACKNUMBER/DISCNUMBER (the Picard vinyl convention). A side you just recorded appears in the mapping table on its own, already assigned to its side — record A, flip, record B, and the album job is mapped without you touching it.
 - **Network-share friendly.** Rips usually live on a NAS. Every operation stages through a local temp directory — copy in, work locally, write results back — and cleans up after itself even on failure or cancellation.
 
 ## Installation
@@ -38,9 +39,9 @@ ffmpeg is fetched automatically on first use — see [Runtime requirements](buil
 
 ## Usage
 
-The happy path, in the **Full Rip** tab:
+The happy path — start at **Record** if you are playing the record now, or at **Full Rip** if you already have the WAVs.
 
-1. **Select the folder holding this record's side WAVs.** One row appears per WAV found. Set the side for each file that belongs to this record and leave the rest on **— skip —** — a folder can hold more than one album, and anything the app isn't sure about it leaves alone rather than guessing.
+1. **Record the sides** (optional). In the **Record** tab, pick your input, watch the meters while you set gain, and press Record. Stop at the end of the side, flip the record, press Record again — the file name advances from `SideA.wav` to `SideB.wav` on its own, and each finished side appears in the Full Rip mapping table already assigned. *Or start from an existing folder of WAVs:* in **Full Rip**, select the folder holding this record's side WAVs. One row appears per WAV found. Set the side for each file that belongs to this record and leave the rest on **— skip —** — a folder can hold more than one album, and anything the app isn't sure about it leaves alone rather than guessing.
 2. **Look up the release.** The preview shows the cover art — or warns you, loudly, if the release has none, while you can still do something about it.
 3. **Press Start album.** Sides analyse in the background: restoration runs, then the splitter proposes cut points.
 4. **Click a ready side to review it.** Adjust the split markers, and edit titles or per-track artists directly in the table.
@@ -50,6 +51,14 @@ The happy path, in the **Full Rip** tab:
 A single WAV is just a one-row mapping table — use **Add single WAV…** instead of selecting a folder; everything after that is identical.
 
 **Convert** and **Re-tag** are the simpler tabs for WAVs that are already one-file-per-track, or FLACs that just need their tags rewritten.
+
+## Recording
+
+An appliance, not an editor. Beyond choosing your input once and pressing Record, the whole interface is **level awareness** and **file naming** — the two things that quietly ruin a rip. There is no monitoring (Windows' own *Listen to this device* does that better), no live waveform, no editing.
+
+The meters run whenever the Record tab is open, so you set gain against real bars before you commit to a take. Clipping **latches** with a count — it is still lit when you look up — and a capture that clipped says so in the log: *"Clipping detected at 7 points — consider lowering input gain and re-recording this side."* A capture with a dropout is never shipped silently.
+
+**Pin your sample rate once.** Windows' WASAPI reports the rate your device is *actually configured at*, which for a line input is often **192 kHz** even when the whole chain is 44.1k — so the rate box defaults to whatever the device advertises. Set it to **44100 Hz** once for a standard turntable chain; it is remembered.
 
 ## How it works
 
@@ -82,6 +91,7 @@ Written as FLAC Vorbis comments. **A field that is absent writes no tag at all**
 
 - **Gapless sides need you.** A side mixed as a continuous piece — segues, crossfades, live recordings with applause bridging tracks — has no silence to find. The splitter will tell you which gaps it could not resolve and let you place them by hand, but it will not place them for you. This is deliberate: a wrong automatic cut in the middle of a track is worse than being asked.
 - **Defaults are conservative.** Noise reduction in particular is tuned to under-process rather than risk the gurgling artefacts of an aggressive spectral gate. If your pressing is rough, turn it up in **Settings** — every threshold, cutoff and weight is exposed there rather than buried in the code.
+- **Recording is Windows-first in practice.** The capture layer is PortAudio (via `sounddevice`) and is not OS-specific, but the device quirks documented above — and the testing — are Windows/WASAPI.
 - **From source is the only supported path.** There is no packaged build yet — see [build.md](build.md).
 - **No command-line interface.** The app is GUI-only for now; `core/` is deliberately UI-agnostic so a CLI can be added without touching the logic.
 
