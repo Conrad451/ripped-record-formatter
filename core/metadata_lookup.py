@@ -39,6 +39,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable, Iterator, Sequence
 
+from core.version import __version__
+
 # ---------------------------------------------------------------------------
 # Typed errors -- callers catch MetadataError (or a subclass) and degrade.
 # ---------------------------------------------------------------------------
@@ -299,7 +301,7 @@ class MusicBrainzProvider(MetadataProvider):
     def __init__(
         self,
         app_name: str = "RippedRecordFormatter",
-        app_version: str = "2.0",
+        app_version: str = __version__,
         contact: str = "https://github.com/Conrad451/ripped-record-formatter",
         *,
         timeout: float = 15.0,

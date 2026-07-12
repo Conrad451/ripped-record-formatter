@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 
 from core import config as core_config
 from core import converter
+from core.version import __version__
 from gui.track_model import COL_ARTIST, Row, TrackTableModel, TrackTableView
 
 
@@ -241,7 +242,7 @@ class BatchPanel(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Ripped Record Formatter")
+        self.setWindowTitle(f"Ripped Record Formatter {__version__}")
         self.resize(920, 760)
         self.setAcceptDrops(True)
 
