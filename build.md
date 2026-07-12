@@ -2,6 +2,23 @@
 
 How to reproduce a working build from a clean clone.
 
+**From source is the only supported way to run the app today** — there is no
+packaged build (see [Packaging a standalone executable](#packaging-a-standalone-executable)),
+and no command-line interface. The README says the same.
+
+## Deferred work
+
+Tracked here so it is not rediscovered later:
+
+- **Packaging.** No PyInstaller spec for the Qt app yet — details below.
+- **CLI.** Deferred by decision. `core/` is UI-agnostic precisely so one can be
+  added later without touching the logic.
+- **`requirements.txt` is not pruned.** It still carries the legacy interactive
+  script's dependencies (`tk`/`Tcl`, `tqdm`, `alive-progress`, `colorama`), which
+  the Qt app does not import. They stay until `v2/` and its pins are retired
+  *together* — pruning them first would break the legacy script, which is still
+  on `main`.
+
 ## Prerequisites
 
 - **Python 3.14** (the project is developed and tested only on 3.14; several pinned

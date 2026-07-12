@@ -4,23 +4,26 @@ You record a whole side of a record in one pass and end up with a single enormou
 
 ![The Full Rip tab](docs/screenshot.png)
 
-<!-- TODO(screenshot): docs/screenshot.png does not exist yet. Capture the Full Rip
-     tab (release looked up, waveform analysed, splits accepted) once the layout
-     fixes have landed, save it to docs/screenshot.png, and delete this comment. -->
+<!-- TODO(screenshot): docs/screenshot.png does not exist. An earlier capture was
+     committed by accident and removed again — it showed the pre-rework UI (a
+     standalone "Side-long WAV" field, an "Album mode" checkbox, a separate
+     "Encode tracks" button), none of which exist any more. Capture the current
+     Full Rip tab (folder selected, release looked up so the preview shows, one
+     side mid-review with markers on the waveform), save it to
+     docs/screenshot.png, and delete this comment. Until then this image is
+     broken — do not make the repo public with it missing. -->
 
 ## Features
 
 - **Restoration pipeline.** An ordered chain of independent stages — rumble filter (zero-phase subsonic high-pass), mains-hum removal (notch at the mains frequency and its harmonics), spectral-gating noise reduction profiled from the lead-in groove, and click/pop removal. Everything between stages is held as float, so a filter that overshoots full scale is not hard-clipped on the way to the next stage; the single conversion back to the source bit depth happens at the very end, with a headroom check that attenuates rather than clips.
 - **Duration-anchored splitting.** Given the expected track durations from the release, the splitter predicts roughly where each gap should fall, searches a window around that prediction for the real silence, and re-anchors the next prediction on the gap it just confirmed — so turntable speed error, unknown lead-out deadspace and approximate CD-sourced durations never accumulate down the side. **When a window contains no convincing silence — a segue, a crossfade, a genuinely gapless transition — it does not invent a split. It hands you that one gap, with the search window highlighted on the waveform, and asks you to place it; the rest of the side is still resolved automatically.**
 - **MusicBrainz lookup.** Search a release, pick the right pressing (vinyl is ranked above CD and studio albums above compilations, so the 1959 LP beats a later best-of), and pull down the per-side tracklist, track durations, MusicBrainz IDs and the front cover from the Cover Art Archive.
-- **Album orchestration.** Map a folder of side WAVs onto the release's sides and process the whole album in one run, with per-side track numbering following the Picard vinyl convention.
+- **Album orchestration.** Point it at the folder of side WAVs, map each file to its side, and the whole record goes through in one run — sides analyse in the background while you review the one in front of you, and accepting a side starts its encode immediately. Tracks land flat in one output folder, numbered continuously across the album, while the *tags* keep per-side TRACKNUMBER/DISCNUMBER (the Picard vinyl convention).
 - **Network-share friendly.** Rips usually live on a NAS. Every operation stages through a local temp directory — copy in, work locally, write results back — and cleans up after itself even on failure or cancellation.
 
 ## Installation
 
-**Packaged release.** Download the release build, unzip, run. No Python needed. *(Not published yet — see [build.md](build.md).)*
-
-**From source.** Requires **Python 3.14**.
+**From source — the only supported path today.** Requires **Python 3.14**. There is no packaged build yet; see [build.md](build.md).
 
 ```bash
 git clone https://github.com/Conrad451/ripped-record-formatter.git
@@ -37,12 +40,14 @@ ffmpeg is fetched automatically on first use — see [Runtime requirements](buil
 
 The happy path, in the **Full Rip** tab:
 
-1. **Pick your source WAV** — the whole side, as ripped.
-2. **Look up release…** — search by artist and album, and choose the pressing that matches the record in your hands.
-3. **Define sides…** (or just type the number of tracks) so the app knows how the release maps onto what you recorded.
-4. **Analyze** — the restoration chain runs and the splitter proposes cut points on the waveform.
-5. **Resolve any gaps it flagged** — for each one it could not confirm, it highlights the search window and you click where the split belongs. Then **Accept splits**.
-6. **Encode tracks** — tagged FLACs, cover art embedded, written to your output folder.
+1. **Select the folder holding this record's side WAVs.** One row appears per WAV found. Set the side for each file that belongs to this record and leave the rest on **— skip —** — a folder can hold more than one album, and anything the app isn't sure about it leaves alone rather than guessing.
+2. **Look up the release.** The preview shows the cover art — or warns you, loudly, if the release has none, while you can still do something about it.
+3. **Press Start album.** Sides analyse in the background: restoration runs, then the splitter proposes cut points.
+4. **Click a ready side to review it.** Adjust the split markers, and edit titles or per-track artists directly in the table.
+5. **Press Accept side.** The side is cut, tagged and starts encoding immediately — while you get on with reviewing the next one.
+6. **Collect your album.** Every track from every side lands flat in your output folder, numbered continuously.
+
+A single WAV is just a one-row mapping table — use **Add single WAV…** instead of selecting a folder; everything after that is identical.
 
 **Convert** and **Re-tag** are the simpler tabs for WAVs that are already one-file-per-track, or FLACs that just need their tags rewritten.
 
@@ -73,20 +78,12 @@ Written as FLAC Vorbis comments. **A field that is absent writes no tag at all**
 | `MUSICBRAINZ_TRACKID` | Release-track MBID | |
 | Front cover image | Cover Art Archive | Embedded as a FLAC picture block, type 3 (front cover) |
 
-## Command line
-
-<!-- TODO(cli): Stub. The parallel CLI session's report supplies the full --help
-     trees and a worked PowerShell example; fold them in here. Do not ship the
-     public README with this section still a stub. -->
-
-**TODO** — a headless CLI for batch and scripted use is in progress. This section will carry the `--help` output and a worked PowerShell example.
-
 ## Roadmap & known limits
 
 - **Gapless sides need you.** A side mixed as a continuous piece — segues, crossfades, live recordings with applause bridging tracks — has no silence to find. The splitter will tell you which gaps it could not resolve and let you place them by hand, but it will not place them for you. This is deliberate: a wrong automatic cut in the middle of a track is worse than being asked.
 - **Defaults are conservative.** Noise reduction in particular is tuned to under-process rather than risk the gurgling artefacts of an aggressive spectral gate. If your pressing is rough, turn it up in **Settings** — every threshold, cutoff and weight is exposed there rather than buried in the code.
-- A packaged, signed release build is not published yet.
-- The CLI is not finished.
+- **From source is the only supported path.** There is no packaged build yet — see [build.md](build.md).
+- **No command-line interface.** The app is GUI-only for now; `core/` is deliberately UI-agnostic so a CLI can be added without touching the logic.
 
 ## License
 
