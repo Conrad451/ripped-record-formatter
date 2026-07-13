@@ -419,7 +419,11 @@ class FullRipTab(QWidget):
         dialog.setWindowTitle("Look up release")
         dialog.resize(760, 640)
         layout = QVBoxLayout(dialog)
-        panel = MetadataPanel()
+        # Pass settings through: the panel reads the user's MusicBrainz contact
+        # from it (and remembers this dialog's splitter). Without it, the lookup
+        # opened from here would identify itself as having no contact even when
+        # one is configured.
+        panel = MetadataPanel(settings=self.settings)
         panel.artist_edit.setText(self.artist_edit.text())
         panel.album_edit.setText(self.album_edit.text())
         panel.statusMessage.connect(self._log)

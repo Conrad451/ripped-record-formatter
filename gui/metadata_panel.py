@@ -233,7 +233,14 @@ class MetadataPanel(QWidget):
         if self._provider is None:
             from core.metadata_lookup import MusicBrainzProvider
 
-            self._provider = MusicBrainzProvider()
+            # The contact identifying this traffic is the user's, from Settings.
+            # Without a Settings object we simply have none -- lookups still work.
+            contact = (
+                self._settings.config.metadata_contact
+                if self._settings is not None
+                else ""
+            )
+            self._provider = MusicBrainzProvider(contact=contact)
         return self._provider
 
     # -- status helper -------------------------------------------------------
