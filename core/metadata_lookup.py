@@ -36,10 +36,13 @@ from __future__ import annotations
 import socket
 import threading
 import time
+import urllib.error
+import urllib.request
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable, Iterator, Sequence
+from urllib.parse import urlsplit
 
 from core.version import __version__
 
@@ -70,6 +73,15 @@ class MetadataConfigError(MetadataError):
     """The provider was used before it was configured correctly.
 
     For MusicBrainz this means the client library rejected our User-Agent.
+    """
+
+
+class MetadataSecurityError(MetadataError):
+    """A fetch was refused because the transport would have been unsafe.
+
+    Raised when a redirect tries to move us off HTTPS. Never swallowed: an
+    https -> http downgrade on the cover-art path is either an attacker or a
+    service regression, and both deserve to be seen.
     """
 
 
@@ -375,6 +387,61 @@ def _sniff_mime(data: bytes) -> str:
     return "image/jpeg"
 
 
+# ---------------------------------------------------------------------------
+# Cover Art Archive fetch -- ours, so the transport is ours to pin.
+# ---------------------------------------------------------------------------
+#
+# The CAA does not serve image bytes itself: it answers with a redirect to the
+# Internet Archive, which redirects again to whichever node holds the file. Today
+# every hop is https (verified against the live service). But *nothing enforced
+# that*: urllib's HTTPRedirectHandler happily follows an https -> http Location,
+# so the guarantee was the servers' good behaviour, not our policy.
+#
+# musicbrainzngs builds its own opener internally, with no seam to pass a redirect
+# policy through -- so we make this one request ourselves. It costs us a small
+# amount of URL construction and buys an explicit refusal to be downgraded.
+
+CAA_BASE_URL = "https://coverartarchive.org"
+
+
+class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow redirects, but only ever to HTTPS."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        scheme = urlsplit(newurl).scheme.lower()
+        if scheme != "https":
+            raise MetadataSecurityError(
+                f"refusing to follow a {scheme or 'scheme-less'} redirect from "
+                f"{req.full_url} -- cover art must stay on HTTPS."
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def fetch_front_cover(release_id: str, agent: str, timeout: float) -> bytes:
+    """GET the front cover for ``release_id`` from the Cover Art Archive.
+
+    Returns the image bytes. Raises :class:`MetadataResponseError` when there is
+    no art (404) or the service refuses, :class:`MetadataNetworkError` on a
+    transport failure, and :class:`MetadataSecurityError` if a redirect tries to
+    take us off HTTPS.
+    """
+    url = f"{CAA_BASE_URL}/release/{release_id}/front"
+    if urlsplit(url).scheme != "https":  # pragma: no cover - guards the constant
+        raise MetadataSecurityError(f"cover-art URL is not HTTPS: {url!r}")
+    opener = urllib.request.build_opener(_HttpsOnlyRedirectHandler)
+    request = urllib.request.Request(url, headers={"User-Agent": agent})
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            return response.read()
+    except MetadataError:
+        raise
+    except urllib.error.HTTPError as exc:
+        # 404 is the common one: this release simply has no art.
+        raise MetadataResponseError(f"cover art unavailable (HTTP {exc.code})") from exc
+    except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as exc:
+        raise MetadataNetworkError(str(exc)) from exc
+
+
 @contextmanager
 def _socket_timeout(timeout: float) -> Iterator[None]:
     """Temporarily set the default socket timeout, then restore it.
@@ -417,6 +484,7 @@ class MusicBrainzProvider(MetadataProvider):
         timeout: float = 15.0,
         rate_limiter: RateLimiter | None = None,
         client=None,
+        cover_fetcher: Callable[[str, str, float], bytes] | None = None,
         notice: Callable[[str], None] | None = None,
     ) -> None:
         # ``client`` injection keeps the network library out of unit tests.
@@ -426,6 +494,7 @@ class MusicBrainzProvider(MetadataProvider):
         self._timeout = float(timeout)
         self._limiter = rate_limiter or RateLimiter(1.0)
         self._contact = contact or ""
+        self._cover_fetcher = cover_fetcher or fetch_front_cover
         self._notice = notice
 
         # ToS requirement: identify the application. The library composes its own
@@ -446,7 +515,7 @@ class MusicBrainzProvider(MetadataProvider):
 
     @property
     def user_agent(self) -> str:
-        """The User-Agent this provider identifies itself with."""
+        """The User-Agent used for the cover-art fetch we make ourselves."""
         return user_agent(self._contact)
 
     def _nudge(self) -> None:
@@ -514,13 +583,17 @@ class MusicBrainzProvider(MetadataProvider):
     def _fetch_cover(self, release_id: str) -> CoverArt | None:
         """Fetch the front cover, returning ``None`` when there is no art.
 
-        A missing image surfaces from musicbrainzngs as a ``ResponseError``
-        (HTTP 404); that is an expected, non-fatal outcome -- not every release
-        has cover art -- so we swallow it and return ``None``. Network failures
-        still propagate as :class:`MetadataNetworkError`.
+        A release with no art answers 404, which the fetcher reports as a
+        :class:`MetadataResponseError`; that is an expected, non-fatal outcome
+        -- not every release has cover art -- so we swallow it and return
+        ``None``. Network failures still propagate as
+        :class:`MetadataNetworkError`, and a refused transport as
+        :class:`MetadataSecurityError`; neither is silently turned into
+        "no cover".
         """
         try:
-            data = self._call(self._mb.get_image_front, release_id)
+            data = self._call(self._cover_fetcher, release_id,
+                              self.user_agent, self._timeout)
         except MetadataResponseError:
             return None
         if not data:

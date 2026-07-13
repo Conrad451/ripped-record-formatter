@@ -9,19 +9,26 @@ and error mapping without ever touching the network.
 
 from __future__ import annotations
 
+import urllib.error
+import urllib.request
+
 import pytest
 
 from core.metadata_lookup import (
+    CAA_BASE_URL,
     CONTACT_NUDGE,
     MAX_CONTACT_LENGTH,
     UNCONFIGURED_CONTACT,
     CoverArt,
     MetadataNetworkError,
     MetadataResponseError,
+    MetadataSecurityError,
     MusicBrainzProvider,
     RateLimiter,
     ReleaseResult,
+    _HttpsOnlyRedirectHandler,
     _sniff_mime,
+    fetch_front_cover,
     reset_contact_nudge,
     sanitize_contact,
     user_agent,
@@ -155,15 +162,18 @@ class FakeMusicBrainz:
         self._maybe_raise("detail")
         return self._detail
 
-    def get_image_front(self, rid, size=None):
+    def fetch_cover(self, rid, agent, timeout):
+        """Stands in for the real Cover Art Archive fetcher."""
         self.calls.append(("image", rid))
+        self.cover_agent = agent
         self._maybe_raise("image")
         return self._image
 
 
 def make_provider(mb, **kwargs):
-    """Provider wired to a fake client and a no-wait rate limiter."""
+    """Provider wired to a fake client, a fake CAA, and a no-wait rate limiter."""
     limiter = RateLimiter(1.0, clock=lambda: 0.0, sleep=lambda s: None)
+    kwargs.setdefault("cover_fetcher", mb.fetch_cover)
     return MusicBrainzProvider(client=mb, rate_limiter=limiter, **kwargs)
 
 
@@ -477,6 +487,88 @@ def test_with_cover_false_skips_the_image_request():
     assert not any(c[0] == "image" for c in mb.calls)
 
 
+def test_cover_fetch_carries_the_apps_user_agent():
+    mb = FakeMusicBrainz()
+    make_provider(mb, contact="me@example.com").get_release("mbid-vinyl")
+    assert mb.cover_agent == user_agent("me@example.com")
+
+
+# ---------------------------------------------------------------------------
+# Cover Art Archive transport: HTTPS end to end, including redirects.
+#
+# The CAA does not serve the bytes -- it 307s to archive.org, which 302s again to
+# a storage node. urllib's stock redirect handler will follow an https -> http
+# Location without complaint, so "it happens to be HTTPS today" was the only
+# thing keeping this path secure. These tests pin the policy instead.
+# ---------------------------------------------------------------------------
+
+
+def _redirect_to(handler, newurl, origin=f"{CAA_BASE_URL}/release/x/front"):
+    """Ask a redirect handler to follow ``newurl``; return the new request."""
+    request = urllib.request.Request(origin)
+    return handler.redirect_request(request, None, 302, "Found", {}, newurl)
+
+
+def test_https_redirect_is_followed():
+    handler = _HttpsOnlyRedirectHandler()
+    new = _redirect_to(handler, "https://archive.org/download/mbid-x/cover.jpg")
+    assert new.full_url == "https://archive.org/download/mbid-x/cover.jpg"
+
+
+@pytest.mark.parametrize(
+    "downgrade",
+    [
+        "http://archive.org/download/mbid-x/cover.jpg",   # the plain-HTTP downgrade
+        "ftp://archive.org/cover.jpg",                    # urllib would follow this too
+        "//archive.org/cover.jpg",                        # scheme-less
+    ],
+)
+def test_redirect_off_https_is_refused(downgrade):
+    handler = _HttpsOnlyRedirectHandler()
+    with pytest.raises(MetadataSecurityError):
+        _redirect_to(handler, downgrade)
+
+
+def test_stock_urllib_would_have_followed_the_downgrade():
+    # The reason the handler above exists. If this ever starts raising, urllib
+    # grew its own downgrade protection and ours became belt-and-braces.
+    stock = urllib.request.HTTPRedirectHandler()
+    new = _redirect_to(stock, "http://evil.example/plain.jpg")
+    assert new.full_url == "http://evil.example/plain.jpg"
+
+
+def test_cover_url_is_https():
+    assert CAA_BASE_URL.startswith("https://")
+
+
+def test_fetch_front_cover_maps_a_404_to_a_response_error(monkeypatch):
+    def fake_open(_self, _req, timeout=None):
+        raise urllib.error.HTTPError(f"{CAA_BASE_URL}/release/x/front", 404,
+                                     "Not Found", {}, None)
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", fake_open)
+    with pytest.raises(MetadataResponseError):
+        fetch_front_cover("mbid-x", user_agent(""), 5.0)
+
+
+def test_fetch_front_cover_maps_a_transport_failure_to_a_network_error(monkeypatch):
+    def fake_open(_self, _req, timeout=None):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", fake_open)
+    with pytest.raises(MetadataNetworkError):
+        fetch_front_cover("mbid-x", user_agent(""), 5.0)
+
+
+def test_security_refusal_is_not_swallowed_as_no_cover():
+    # A downgrade attempt must not look like "this release has no art".
+    def refuse(_rid, _agent, _timeout):
+        raise MetadataSecurityError("http redirect refused")
+
+    mb = FakeMusicBrainz()
+    provider = make_provider(mb, cover_fetcher=refuse)
+    with pytest.raises(MetadataSecurityError):
+        provider.get_release("mbid-vinyl")
 
 
 # ---------------------------------------------------------------------------
@@ -538,7 +630,9 @@ def test_rate_limiter_is_used_between_search_and_cover():
         now["t"] += s
 
     limiter = RateLimiter(1.0, clock=lambda: now["t"], sleep=sleep)
-    provider = MusicBrainzProvider(client=FakeMusicBrainz(), rate_limiter=limiter)
+    mb = FakeMusicBrainz()
+    provider = MusicBrainzProvider(client=mb, rate_limiter=limiter,
+                                   cover_fetcher=mb.fetch_cover)
     # detail fetch makes two network calls (release + cover) -> one throttle wait.
     provider.get_release("mbid-vinyl")
     assert slept == [1.0]
