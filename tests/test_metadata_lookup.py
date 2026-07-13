@@ -12,6 +12,7 @@ from __future__ import annotations
 import pytest
 
 from core.metadata_lookup import (
+    CONTACT_NUDGE,
     MAX_CONTACT_LENGTH,
     UNCONFIGURED_CONTACT,
     CoverArt,
@@ -21,6 +22,7 @@ from core.metadata_lookup import (
     RateLimiter,
     ReleaseResult,
     _sniff_mime,
+    reset_contact_nudge,
     sanitize_contact,
     user_agent,
 )
@@ -255,6 +257,56 @@ def test_header_injection_cannot_reach_the_user_agent():
 
 def test_contact_that_sanitizes_to_nothing_behaves_as_unset():
     assert user_agent("\r\n\x00") == user_agent("")
+
+
+# ---------------------------------------------------------------------------
+# The nudge: once per session, only when unconfigured, never blocking.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _fresh_session():
+    reset_contact_nudge()
+    yield
+    reset_contact_nudge()
+
+
+def test_nudge_fires_once_per_session_when_unconfigured():
+    seen: list[str] = []
+    mb = FakeMusicBrainz()
+    provider = make_provider(mb, contact="", notice=seen.append)
+
+    provider.search_releases("Miles", "Blue")
+    assert seen == [CONTACT_NUDGE]
+
+    provider.search_releases("Miles", "Blue")   # second lookup, same session
+    provider.get_release("mbid-vinyl")
+    assert seen == [CONTACT_NUDGE]              # still exactly one
+
+
+def test_nudge_is_silent_when_a_contact_is_configured():
+    seen: list[str] = []
+    provider = make_provider(FakeMusicBrainz(), contact="me@example.com",
+                             notice=seen.append)
+    provider.search_releases("Miles", "Blue")
+    provider.get_release("mbid-vinyl")
+    assert seen == []
+
+
+def test_lookup_works_identically_with_no_notice_sink():
+    # Nobody listening for the nudge must not change what a lookup returns.
+    with_sink = make_provider(FakeMusicBrainz(), contact="", notice=lambda _m: None)
+    reset_contact_nudge()
+    without = make_provider(FakeMusicBrainz(), contact="")
+    assert (with_sink.search_releases("Miles", "Blue")
+            == without.search_releases("Miles", "Blue"))
+
+
+def test_nudge_is_shared_across_providers_in_one_session():
+    seen: list[str] = []
+    make_provider(FakeMusicBrainz(), contact="", notice=seen.append).search_releases("a", "b")
+    make_provider(FakeMusicBrainz(), contact="", notice=seen.append).search_releases("a", "b")
+    assert seen == [CONTACT_NUDGE]  # a second panel does not re-nag
 
 
 # ---------------------------------------------------------------------------

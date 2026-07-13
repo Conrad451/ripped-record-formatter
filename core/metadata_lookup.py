@@ -92,6 +92,11 @@ APP_NAME = "RippedRecordFormatter"
 SOURCE_URL = "github.com/Conrad451/ripped-record-formatter"
 UNCONFIGURED_CONTACT = f"unconfigured; source: {SOURCE_URL}"
 
+CONTACT_NUDGE = (
+    "Tip: set a MusicBrainz contact in Settings -- your lookups currently "
+    "identify only the app."
+)
+
 #: Longest contact we will put in a header. A contact is an email or a URL; a
 #: kilobyte of one is a mistake or an attack, and either way it is not going out
 #: over the wire on the user's behalf.
@@ -146,6 +151,30 @@ def user_agent(
     """
     clean = sanitize_contact(contact, max_length=max_length) or UNCONFIGURED_CONTACT
     return f"{app_name}/{version} ({clean})"
+
+
+# One nudge per process. The user is told once that their lookups are anonymous;
+# telling them on every search would be nagging, and a dialog would be worse.
+_nudged = False
+
+
+def take_contact_nudge(contact: str) -> str | None:
+    """Return the nudge text the *first* time a lookup runs unconfigured.
+
+    ``None`` every other time -- because a contact is set, or because it has
+    already been said once this session.
+    """
+    global _nudged
+    if sanitize_contact(contact) or _nudged:
+        return None
+    _nudged = True
+    return CONTACT_NUDGE
+
+
+def reset_contact_nudge() -> None:
+    """Forget that the nudge was shown. For tests; a process is one session."""
+    global _nudged
+    _nudged = False
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +403,7 @@ class MusicBrainzProvider(MetadataProvider):
 
     ``contact`` is the *user's* -- an email or URL they set in Settings. Left
     empty the client still works, but identifies itself as having no contact
-    (see :func:`user_agent`).
+    (see :func:`user_agent`) and asks, once, for one via ``notice``.
     """
 
     name = "MusicBrainz"
@@ -388,6 +417,7 @@ class MusicBrainzProvider(MetadataProvider):
         timeout: float = 15.0,
         rate_limiter: RateLimiter | None = None,
         client=None,
+        notice: Callable[[str], None] | None = None,
     ) -> None:
         # ``client`` injection keeps the network library out of unit tests.
         if client is None:
@@ -396,6 +426,7 @@ class MusicBrainzProvider(MetadataProvider):
         self._timeout = float(timeout)
         self._limiter = rate_limiter or RateLimiter(1.0)
         self._contact = contact or ""
+        self._notice = notice
 
         # ToS requirement: identify the application. The library composes its own
         # header (``app/version python-musicbrainzngs/x.y ( contact )``), so the
@@ -417,6 +448,14 @@ class MusicBrainzProvider(MetadataProvider):
     def user_agent(self) -> str:
         """The User-Agent this provider identifies itself with."""
         return user_agent(self._contact)
+
+    def _nudge(self) -> None:
+        """Once per session, if unconfigured, ask for a contact. Never blocks."""
+        if self._notice is None:
+            return
+        text = take_contact_nudge(self._contact)
+        if text:
+            self._notice(text)
 
     # -- network plumbing ---------------------------------------------------
     def _call(self, func: Callable, *args, **kwargs):
@@ -441,6 +480,7 @@ class MusicBrainzProvider(MetadataProvider):
         album = (album or "").strip()
         if not artist and not album:
             return []
+        self._nudge()
         fields: dict[str, str] = {}
         if artist:
             fields["artist"] = artist
@@ -459,6 +499,7 @@ class MusicBrainzProvider(MetadataProvider):
     def get_release(self, release_id: str, *, with_cover: bool = True) -> ReleaseDetail:
         if not release_id:
             raise MetadataResponseError("empty release id")
+        self._nudge()
         data = self._call(
             self._mb.get_release_by_id,
             release_id,

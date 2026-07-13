@@ -240,7 +240,10 @@ class MetadataPanel(QWidget):
                 if self._settings is not None
                 else ""
             )
-            self._provider = MusicBrainzProvider(contact=contact)
+            self._provider = MusicBrainzProvider(
+                contact=contact,
+                notice=self.statusMessage.emit,   # -> the host's log, once
+            )
         return self._provider
 
     # -- status helper -------------------------------------------------------
