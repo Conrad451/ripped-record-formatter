@@ -27,6 +27,8 @@ Terms of service
 MusicBrainz *requires* a descriptive ``User-Agent`` (application name, version,
 and contact) and rate-limits anonymous clients to one request per second. Both
 are enforced here (see :class:`MusicBrainzProvider`).
+
+The contact is the *user's*, not the maintainer's -- see :func:`user_agent`.
 """
 
 from __future__ import annotations
@@ -67,8 +69,83 @@ class MetadataResponseError(MetadataError):
 class MetadataConfigError(MetadataError):
     """The provider was used before it was configured correctly.
 
-    For MusicBrainz this means the required User-Agent was not set.
+    For MusicBrainz this means the client library rejected our User-Agent.
     """
+
+
+# ---------------------------------------------------------------------------
+# Identity -- who this traffic says it is.
+# ---------------------------------------------------------------------------
+#
+# MusicBrainz asks API clients to identify themselves with a contact address so
+# they can reach whoever is generating the traffic. That contact must therefore
+# be the *user's*, not the maintainer's: shipping the maintainer's URL as the
+# contact for every download of this app would name one person as responsible
+# for strangers' request volume, which is neither accurate nor fair.
+#
+# So: a configured contact is used verbatim (after sanitising). An unconfigured
+# one produces a string that is honest about being nobody -- the repository URL
+# stays, but only as *provenance* ("this is what the app is"), explicitly not as
+# a contact.
+
+APP_NAME = "RippedRecordFormatter"
+SOURCE_URL = "github.com/Conrad451/ripped-record-formatter"
+UNCONFIGURED_CONTACT = f"unconfigured; source: {SOURCE_URL}"
+
+#: Longest contact we will put in a header. A contact is an email or a URL; a
+#: kilobyte of one is a mistake or an attack, and either way it is not going out
+#: over the wire on the user's behalf.
+MAX_CONTACT_LENGTH = 120
+
+
+def sanitize_contact(contact: str, *, max_length: int = MAX_CONTACT_LENGTH) -> str:
+    """Reduce a user-supplied contact to something safe to put in a header.
+
+    This value comes from a config file and ends up inside an HTTP request
+    header, so a bare newline in it would be *header injection* -- the classic
+    ``foo\\r\\nX-Evil: 1`` splitting one header into two. We do not escape; we
+    drop. Anything outside printable ASCII goes (headers are latin-1 on the wire
+    and a control character has no business in a contact address), runs of
+    whitespace collapse to one space, and the result is capped.
+
+    Returns ``""`` for anything that sanitises down to nothing -- which callers
+    treat exactly like "not configured".
+    """
+    if not contact:
+        return ""
+    kept: list[str] = []
+    for ch in contact:
+        if ch in "\t\r\n":
+            kept.append(" ")          # a line break becomes a space, never a break
+        elif " " <= ch <= "~":        # printable ASCII survives
+            kept.append(ch)
+        # anything else -- C0/C1 controls, NUL, non-ASCII -- is dropped outright
+    collapsed = " ".join("".join(kept).split())
+    return collapsed[:max_length].strip()
+
+
+def user_agent(
+    contact: str = "",
+    *,
+    app_name: str = APP_NAME,
+    version: str = __version__,
+    max_length: int = MAX_CONTACT_LENGTH,
+) -> str:
+    """The ``User-Agent`` this app identifies itself with.
+
+    Configured::
+
+        RippedRecordFormatter/2.2.1 (you@example.com)
+
+    Unconfigured -- a deliberate non-identity, not a stand-in maintainer::
+
+        RippedRecordFormatter/2.2.1 (unconfigured; source: github.com/...)
+
+    The version is always :data:`core.version.__version__`; nothing here is
+    hardcoded to a release.
+    """
+    clean = sanitize_contact(contact, max_length=max_length) or UNCONFIGURED_CONTACT
+    return f"{app_name}/{version} ({clean})"
 
 
 # ---------------------------------------------------------------------------
@@ -294,15 +371,19 @@ class MusicBrainzProvider(MetadataProvider):
     clients) and requests are throttled to one per second -- both required by
     the MusicBrainz web-service terms of use. Every call is bounded by
     ``timeout`` seconds and raises only :class:`MetadataError` subclasses.
+
+    ``contact`` is the *user's* -- an email or URL they set in Settings. Left
+    empty the client still works, but identifies itself as having no contact
+    (see :func:`user_agent`).
     """
 
     name = "MusicBrainz"
 
     def __init__(
         self,
-        app_name: str = "RippedRecordFormatter",
+        app_name: str = APP_NAME,
         app_version: str = __version__,
-        contact: str = "https://github.com/Conrad451/ripped-record-formatter",
+        contact: str = "",
         *,
         timeout: float = 15.0,
         rate_limiter: RateLimiter | None = None,
@@ -314,19 +395,28 @@ class MusicBrainzProvider(MetadataProvider):
         self._mb = client
         self._timeout = float(timeout)
         self._limiter = rate_limiter or RateLimiter(1.0)
+        self._contact = contact or ""
 
-        if not contact:
-            raise MetadataConfigError(
-                "MusicBrainz requires a contact (URL or email) in the User-Agent."
-            )
-        # ToS requirement: identify the application. Raised as our error type so
-        # callers never see a musicbrainzngs-specific exception.
+        # ToS requirement: identify the application. The library composes its own
+        # header (``app/version python-musicbrainzngs/x.y ( contact )``), so the
+        # contact we hand it is what MusicBrainz sees. Raised as our error type
+        # so callers never see a musicbrainzngs-specific exception.
         try:
-            self._mb.set_useragent(app_name, app_version, contact)
+            self._mb.set_useragent(app_name, app_version, self._ua_contact)
         except self._mb.UsageError as exc:  # pragma: no cover - defensive
             raise MetadataConfigError(str(exc)) from exc
         # Belt-and-suspenders: also arm the library's own throttle at 1 req/s.
         self._mb.set_rate_limit(1.0, 1)
+
+    @property
+    def _ua_contact(self) -> str:
+        """The contact that goes on the wire: the user's, or an explicit none."""
+        return sanitize_contact(self._contact) or UNCONFIGURED_CONTACT
+
+    @property
+    def user_agent(self) -> str:
+        """The User-Agent this provider identifies itself with."""
+        return user_agent(self._contact)
 
     # -- network plumbing ---------------------------------------------------
     def _call(self, func: Callable, *args, **kwargs):

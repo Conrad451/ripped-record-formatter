@@ -12,15 +12,19 @@ from __future__ import annotations
 import pytest
 
 from core.metadata_lookup import (
+    MAX_CONTACT_LENGTH,
+    UNCONFIGURED_CONTACT,
     CoverArt,
-    MetadataConfigError,
     MetadataNetworkError,
     MetadataResponseError,
     MusicBrainzProvider,
     RateLimiter,
     ReleaseResult,
     _sniff_mime,
+    sanitize_contact,
+    user_agent,
 )
+from core.version import __version__
 
 
 # ---------------------------------------------------------------------------
@@ -155,10 +159,10 @@ class FakeMusicBrainz:
         return self._image
 
 
-def make_provider(mb):
+def make_provider(mb, **kwargs):
     """Provider wired to a fake client and a no-wait rate limiter."""
     limiter = RateLimiter(1.0, clock=lambda: 0.0, sleep=lambda s: None)
-    return MusicBrainzProvider(client=mb, rate_limiter=limiter)
+    return MusicBrainzProvider(client=mb, rate_limiter=limiter, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -168,16 +172,89 @@ def make_provider(mb):
 
 def test_sets_useragent_and_rate_limit_on_construction():
     mb = FakeMusicBrainz()
-    make_provider(mb)
+    make_provider(mb, contact="me@example.com")
     assert mb.useragent is not None
     app, version, contact = mb.useragent
     assert app and version and contact  # all three ToS fields present
+    assert contact == "me@example.com"  # the *user's*, not the maintainer's
     assert mb.rate_limit == (1.0, 1)
 
 
-def test_empty_contact_rejected():
-    with pytest.raises(MetadataConfigError):
-        MusicBrainzProvider(client=FakeMusicBrainz(), contact="")
+# ---------------------------------------------------------------------------
+# Identity: the User-Agent names the user, or explicitly names nobody.
+# ---------------------------------------------------------------------------
+
+
+def test_user_agent_carries_a_configured_contact():
+    assert user_agent("me@example.com") == f"RippedRecordFormatter/{__version__} (me@example.com)"
+
+
+def test_user_agent_unconfigured_declares_no_contact():
+    agent = user_agent("")
+    assert agent == (
+        f"RippedRecordFormatter/{__version__} "
+        "(unconfigured; source: github.com/Conrad451/ripped-record-formatter)"
+    )
+    # The repo URL is provenance, not an implied responsible party...
+    assert "unconfigured" in agent
+    # ...and the maintainer is never named as the contact.
+    assert "@" not in agent
+
+
+def test_user_agent_version_comes_from_core_version():
+    assert f"/{__version__}" in user_agent("me@example.com")
+
+
+def test_empty_contact_is_allowed_and_identifies_the_app_only():
+    mb = FakeMusicBrainz()
+    provider = make_provider(mb, contact="")     # no longer an error
+    _app, _version, contact = mb.useragent
+    assert contact == UNCONFIGURED_CONTACT
+    assert provider.search_releases("Miles", "Blue")  # and lookups still work
+
+
+def test_provider_useragent_contact_is_sanitized_before_the_library_sees_it():
+    mb = FakeMusicBrainz()
+    make_provider(mb, contact="me@example.com\r\nX-Evil: 1")
+    _app, _version, contact = mb.useragent
+    assert "\r" not in contact and "\n" not in contact
+
+
+# ---------------------------------------------------------------------------
+# Header safety: this value comes from a config file and lands in an HTTP header.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "hostile,expected",
+    [
+        ("foo\r\nX-Evil: 1", "foo X-Evil: 1"),      # CRLF injection -- the big one
+        ("foo\nBar: 2", "foo Bar: 2"),
+        ("foo\rBar: 2", "foo Bar: 2"),
+        ("a\x00b", "ab"),                            # NUL dropped
+        ("a\x07\x1bb", "ab"),                        # control characters dropped
+        ("caf\xe9@x.com", "caf@x.com"),              # non-ASCII dropped (headers are latin-1)
+        ("  spaced   out  ", "spaced out"),          # whitespace collapsed + trimmed
+        ("", ""),
+        ("\r\n\t  ", ""),                            # sanitises to nothing -> unset
+    ],
+)
+def test_sanitize_contact_strips_hostile_input(hostile, expected):
+    assert sanitize_contact(hostile) == expected
+
+
+def test_sanitize_contact_caps_absurd_length():
+    assert len(sanitize_contact("a" * 10_000)) == MAX_CONTACT_LENGTH
+
+
+def test_header_injection_cannot_reach_the_user_agent():
+    agent = user_agent("foo\r\nX-Evil: 1")
+    assert "\r" not in agent and "\n" not in agent
+    assert "X-Evil" in agent  # not escaped -- flattened; it is now inert text
+
+
+def test_contact_that_sanitizes_to_nothing_behaves_as_unset():
+    assert user_agent("\r\n\x00") == user_agent("")
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +423,8 @@ def test_with_cover_false_skips_the_image_request():
     mb = FakeMusicBrainz()
     make_provider(mb).get_release("mbid-vinyl", with_cover=False)
     assert not any(c[0] == "image" for c in mb.calls)
+
+
 
 
 # ---------------------------------------------------------------------------
