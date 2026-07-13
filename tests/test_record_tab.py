@@ -85,7 +85,8 @@ def test_meters_update_from_telemetry(qapp):
         elapsed_s=3.0, bytes_written=1024))
     tab._drain_telemetry()
 
-    assert "-6.0 dBFS" in tab.meters.max_label.text()
+    # The max is stated with the margin it leaves under full scale.
+    assert tab.meters.max_label.text() == "max −6.0 dBFS (6.0 dB headroom)"
     assert tab.meters.clip_runs == 0
     assert "no clipping" in tab.meters.clip_label.text()
 

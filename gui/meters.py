@@ -29,10 +29,43 @@ WARN_DBFS = -6.0
 #: How long a peak-hold tick lingers, in telemetry frames (~50 ms each).
 HOLD_FRAMES = 30            # ~1.5 s
 
+#: Headroom bands. Below -3 dBFS you are safe; from -3 to -0.5 you are spending
+#: the last of your margin; above -0.5 you are, for practical purposes, at the
+#: ceiling. These are the numbers the hint text tells the user to aim for, so
+#: they are the numbers the colour follows.
+SAFE_DBFS = -3.0
+DANGER_DBFS = -0.5
+
 _GREEN = QColor("#3aa655")
 _AMBER = QColor("#c07000")
 _RED = QColor("#c0392b")
 _TICK = QColor("#e8e8e8")
+
+_MINUS = "−"           # a real minus sign; a hyphen reads as a dash
+
+
+def headroom_colour(dbfs: float) -> QColor:
+    """Green with room to spare, amber spending the last of it, red at the wall."""
+    if dbfs is None or math.isnan(dbfs):
+        return _GREEN
+    if dbfs < SAFE_DBFS:
+        return _GREEN
+    if dbfs < DANGER_DBFS:
+        return _AMBER
+    return _RED
+
+
+def format_headroom(dbfs: float) -> str:
+    """``-4.2`` -> ``max -4.2 dBFS (4.2 dB headroom)``.
+
+    Headroom is the number the gain ritual is actually aiming at, so it is stated
+    as itself rather than left as an exercise in mental arithmetic.
+    """
+    if dbfs is None or math.isinf(dbfs) or math.isnan(dbfs):
+        return "max —"
+    margin = max(0.0, -dbfs)
+    sign = _MINUS if dbfs < 0 else ""
+    return f"max {sign}{abs(dbfs):.1f} dBFS ({margin:.1f} dB headroom)"
 
 
 def _fraction(dbfs: float) -> float:
@@ -120,6 +153,7 @@ class LevelMeters(QWidget):
 
         readout = QHBoxLayout()
         self.max_label = QLabel("max —")
+        self.max_label.setStyleSheet("QLabel { font-weight: bold; }")
         readout.addWidget(self.max_label)
         readout.addStretch(1)
 
@@ -141,10 +175,17 @@ class LevelMeters(QWidget):
             db = telemetry.peaks_dbfs[i] if i < len(telemetry.peaks_dbfs) else FLOOR_DBFS
             bar.set_level(db)
 
-        peak = telemetry.max_peak_dbfs
-        self.max_label.setText(
-            "max —" if peak is None or math.isinf(peak) else f"max {peak:+.1f} dBFS")
+        self.set_max_peak(telemetry.max_peak_dbfs)
         self.set_clip_runs(telemetry.clip_runs)
+
+    def set_max_peak(self, dbfs: float) -> None:
+        """The max, and the margin left under full scale, coloured by how much."""
+        self.max_label.setText(format_headroom(dbfs))
+        if dbfs is None or math.isinf(dbfs) or math.isnan(dbfs):
+            self.max_label.setStyleSheet("QLabel { font-weight: bold; }")
+            return
+        self.max_label.setStyleSheet(
+            f"QLabel {{ color: {headroom_colour(dbfs).name()}; font-weight: bold; }}")
 
     def set_clip_runs(self, runs: int) -> None:
         """Latch red once clipping has been seen; never clear it on our own."""
@@ -163,6 +204,6 @@ class LevelMeters(QWidget):
         self._clip_runs = 0
         for bar in self._bars:
             bar.reset()
-        self.max_label.setText("max —")
+        self.set_max_peak(float("-inf"))
         self.clip_label.setText("no clipping")
         self.clip_label.setStyleSheet("QLabel { color: palette(mid); }")
