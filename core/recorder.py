@@ -50,6 +50,22 @@ CLIP_RUN_LEN = 3
 #: repaint.
 TELEMETRY_INTERVAL_S = 0.05
 
+#: Peak and clip statistics ignore this much audio after a stream opens.
+#:
+#: Measured, not guessed. Opening an input stream on the headset mic from the bug
+#: report produces a burst of genuinely full-scale samples about **68 ms** in --
+#: on every host API (WASAPI, MME, DirectSound, WDM-KS), on every open, in a
+#: silent room. It is the device's capture pipeline priming itself, and it is a
+#: *run* of consecutive full-scale frames, so it latched ``max_peak`` at
+#: +0.0 dBFS and counted clip runs while the meters sat at idle. Note it is not
+#: in the first block -- block 0 is clean; the burst lands around block 3 -- so
+#: discarding one block would not have caught it.
+#:
+#: 150 ms because the measured burst ends by ~72 ms and a window that only just
+#: covers it is not a window. The audio itself is still recorded in full; only
+#: the *statistics* skip this opening slice.
+STATS_GRACE_S = 0.15
+
 _SUBTYPES = ("PCM_16", "PCM_24")
 
 
@@ -154,6 +170,69 @@ class _ClipCounter:
                 self._counted = False
 
 
+class _LevelStats:
+    """Peak and clip statistics for one open stream, with an open-transient guard.
+
+    Shared by :class:`Recorder` and :class:`LevelMonitor` so the guard cannot be
+    fixed in one and forgotten in the other -- the meters and the recording have
+    to agree about what the input is doing.
+
+    The guard is the whole point: for the first :data:`STATS_GRACE_S` of a stream
+    the frames are passed straight through to disk but contribute *nothing* to
+    the peak or the clip count. See :data:`STATS_GRACE_S` for the measurement.
+    """
+
+    def __init__(self, channels: int, samplerate: int,
+                 grace_s: float = STATS_GRACE_S) -> None:
+        self.channels = int(channels)
+        self._grace_frames = max(0, int(samplerate * grace_s))
+        self._frames_seen = 0
+        self.window_peak = np.zeros(self.channels, dtype=np.float64)
+        self.max_peak = 0.0
+        self.clips = _ClipCounter()
+
+    @property
+    def in_grace(self) -> bool:
+        """True while the opening slice is still being ignored."""
+        return self._frames_seen < self._grace_frames
+
+    def feed(self, block: np.ndarray) -> None:
+        """``block`` is (frames, channels) float. Grace frames are dropped here."""
+        frames = block.shape[0]
+        skip = min(frames, max(0, self._grace_frames - self._frames_seen))
+        self._frames_seen += frames
+        if skip:
+            block = block[skip:]                 # may straddle the boundary
+            if block.shape[0] == 0:
+                return
+
+        peaks = np.abs(block).max(axis=0)
+        if peaks.shape == self.window_peak.shape:
+            np.maximum(self.window_peak, peaks, out=self.window_peak)
+        block_peak = float(peaks.max()) if peaks.size else 0.0
+        if block_peak > self.max_peak:
+            self.max_peak = block_peak
+        self.clips.feed(block)
+
+    def take_window_peaks(self) -> list[float]:
+        """The per-channel peak since the last call, in dBFS. Resets the window,
+        so the bars fall back instead of only ever climbing."""
+        peaks = [_to_dbfs(float(p)) for p in self.window_peak]
+        self.window_peak.fill(0.0)
+        return peaks
+
+    def reset(self) -> None:
+        """Clear the running max and the clip latch -- what Reset means.
+
+        The grace window is deliberately *not* re-armed: this stream is long past
+        its opening transient, and re-arming would blind the meters for another
+        150 ms every time the user pressed a button.
+        """
+        self.max_peak = 0.0
+        self.clips = _ClipCounter()
+        self.window_peak.fill(0.0)
+
+
 class Recorder:
     """Streams one input device to a WAV on disk.
 
@@ -168,10 +247,12 @@ class Recorder:
         stream_factory: Callable | None = None,
         queue_blocks: int = 256,
         telemetry_interval_s: float = TELEMETRY_INTERVAL_S,
+        stats_grace_s: float = STATS_GRACE_S,
     ) -> None:
         self._on_telemetry = on_telemetry
         self._stream_factory = stream_factory
         self._telemetry_interval = telemetry_interval_s
+        self._stats_grace_s = stats_grace_s
 
         # Bounded: this is the whole point. ~256 blocks of 1024 frames is a few
         # seconds of slack for a disk hiccup, and a hard ceiling on memory.
@@ -193,9 +274,7 @@ class Recorder:
 
         self._frames_written = 0
         self._bytes_written = 0
-        self._max_peak = 0.0
-        self._clips = _ClipCounter()
-        self._window_peak: np.ndarray | None = None
+        self._stats = _LevelStats(0, 0, self._stats_grace_s)
         self._started_at = 0.0
         self._last_emit = 0.0
 
@@ -212,6 +291,12 @@ class Recorder:
     def device_error(self) -> str:
         """Non-empty when the device vanished mid-capture."""
         return self._device_error
+
+    # No reset_peaks() here, deliberately: the recorder's max and clip count are
+    # what :meth:`stop` reports *about the file*, and a file's peak is not
+    # something the user gets to clear halfway through. Reset is a monitor
+    # affordance (see :meth:`LevelMonitor.reset_peaks`); mid-capture the meters
+    # simply re-read the true running stats of the take.
 
     def _warn(self, message: str) -> None:
         with self._lock:
@@ -242,9 +327,7 @@ class Recorder:
 
         self._frames_written = 0
         self._bytes_written = 0
-        self._max_peak = 0.0
-        self._clips = _ClipCounter()
-        self._window_peak = np.zeros(self._channels, dtype=np.float64)
+        self._stats = _LevelStats(self._channels, self._samplerate, self._stats_grace_s)
         self._warnings = []
         self._dropped_blocks = 0
         self._device_error = ""
@@ -302,13 +385,9 @@ class Recorder:
             if block.ndim == 1:
                 block = block.reshape(-1, 1)
 
-            peaks = np.abs(block).max(axis=0)
-            if self._window_peak is not None and peaks.shape == self._window_peak.shape:
-                np.maximum(self._window_peak, peaks, out=self._window_peak)
-            block_peak = float(peaks.max()) if peaks.size else 0.0
-            if block_peak > self._max_peak:
-                self._max_peak = block_peak
-            self._clips.feed(block)
+            # Statistics only -- the block itself is queued for disk regardless,
+            # so the opening transient is *recorded*, just not *counted*.
+            self._stats.feed(block)
 
             try:
                 self._queue.put_nowait(block)
@@ -330,16 +409,11 @@ class Recorder:
             return
         self._last_emit = now
 
-        window = self._window_peak
-        peaks = [_to_dbfs(float(p)) for p in window] if window is not None else []
-        if window is not None:
-            window.fill(0.0)                     # peak-per-window, so meters fall back
-
         try:
             self._on_telemetry(Telemetry(
-                peaks_dbfs=peaks,
-                max_peak_dbfs=_to_dbfs(self._max_peak),
-                clip_runs=self._clips.runs,
+                peaks_dbfs=self._stats.take_window_peaks(),
+                max_peak_dbfs=_to_dbfs(self._stats.max_peak),
+                clip_runs=self._stats.clips.runs,
                 elapsed_s=now - self._started_at,
                 bytes_written=self._bytes_written,
             ))
@@ -414,8 +488,8 @@ class Recorder:
             duration=duration,
             samplerate=self._samplerate,
             subtype=self._subtype,
-            max_peak_dbfs=_to_dbfs(self._max_peak),
-            clip_runs=self._clips.runs,
+            max_peak_dbfs=_to_dbfs(self._stats.max_peak),
+            clip_runs=self._stats.clips.runs,
             warnings=list(self._warnings),
         )
 
@@ -457,15 +531,15 @@ class LevelMonitor:
         *,
         stream_factory: Callable | None = None,
         telemetry_interval_s: float = TELEMETRY_INTERVAL_S,
+        stats_grace_s: float = STATS_GRACE_S,
     ) -> None:
         self._on_telemetry = on_telemetry
         self._stream_factory = stream_factory
         self._telemetry_interval = telemetry_interval_s
+        self._stats_grace_s = stats_grace_s
         self._stream = None
         self._channels = 0
-        self._window_peak: np.ndarray | None = None
-        self._max_peak = 0.0
-        self._clips = _ClipCounter()
+        self._stats = _LevelStats(0, 0, stats_grace_s)
         self._started_at = 0.0
         self._last_emit = 0.0
         self.error = ""
@@ -476,15 +550,16 @@ class LevelMonitor:
 
     def reset_peaks(self) -> None:
         """Clear the running max and the latched clip count."""
-        self._max_peak = 0.0
-        self._clips = _ClipCounter()
+        self._stats.reset()
 
     def start(self, device: int, samplerate: int, channels: int = 2,
               *, blocksize: int = 1024) -> None:
         if self.running:
             self.stop()
         self._channels = int(channels)
-        self._window_peak = np.zeros(self._channels, dtype=np.float64)
+        # A new stream is a new measurement -- and a new opening transient to
+        # step over, which is why the stats are rebuilt rather than reused.
+        self._stats = _LevelStats(self._channels, int(samplerate), self._stats_grace_s)
         self.error = ""
         self._started_at = time.monotonic()
         self._last_emit = 0.0
@@ -509,13 +584,7 @@ class LevelMonitor:
             block = np.array(indata, dtype=np.float32, copy=True)
             if block.ndim == 1:
                 block = block.reshape(-1, 1)
-            peaks = np.abs(block).max(axis=0)
-            if self._window_peak is not None and peaks.shape == self._window_peak.shape:
-                np.maximum(self._window_peak, peaks, out=self._window_peak)
-            block_peak = float(peaks.max()) if peaks.size else 0.0
-            if block_peak > self._max_peak:
-                self._max_peak = block_peak
-            self._clips.feed(block)
+            self._stats.feed(block)
 
             if self._on_telemetry is None:
                 return
@@ -523,14 +592,10 @@ class LevelMonitor:
             if now - self._last_emit < self._telemetry_interval:
                 return
             self._last_emit = now
-            window = self._window_peak
-            peaks_db = [_to_dbfs(float(p)) for p in window] if window is not None else []
-            if window is not None:
-                window.fill(0.0)
             self._on_telemetry(Telemetry(
-                peaks_dbfs=peaks_db,
-                max_peak_dbfs=_to_dbfs(self._max_peak),
-                clip_runs=self._clips.runs,
+                peaks_dbfs=self._stats.take_window_peaks(),
+                max_peak_dbfs=_to_dbfs(self._stats.max_peak),
+                clip_runs=self._stats.clips.runs,
                 elapsed_s=now - self._started_at,
                 bytes_written=0,
             ))

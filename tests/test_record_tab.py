@@ -85,7 +85,8 @@ def test_meters_update_from_telemetry(qapp):
         elapsed_s=3.0, bytes_written=1024))
     tab._drain_telemetry()
 
-    assert "-6.0 dBFS" in tab.meters.max_label.text()
+    # The max is stated with the margin it leaves under full scale.
+    assert tab.meters.max_label.text() == "max −6.0 dBFS (6.0 dB headroom)"
     assert tab.meters.clip_runs == 0
     assert "no clipping" in tab.meters.clip_label.text()
 
@@ -112,6 +113,69 @@ def test_clip_indicator_latches_and_counts(qapp):
     tab.meters.reset()
     assert tab.meters.clip_runs == 0
     assert "no clipping" in tab.meters.clip_label.text()
+
+
+def test_the_history_strip_updates_from_the_same_telemetry(qapp):
+    """The strip runs off the monitor feed -- pre-roll, no recording required."""
+    from gui.main_window import MainWindow
+
+    tab = MainWindow().record_tab
+    for i in range(40):                          # 2 s of pre-roll telemetry
+        tab._on_monitor_telemetry(Telemetry(
+            peaks_dbfs=[-8.0, -11.0], max_peak_dbfs=-8.0, clip_runs=0,
+            elapsed_s=i * 0.05))
+        tab._drain_telemetry()
+
+    xs, ys = tab.history_strip._traces[0].getData()
+    assert len(xs) == 40                         # every snapshot is on the strip
+    assert ys[-1] == pytest.approx(-8.0)
+    assert tab.history_strip.clip_mark_count == 0
+
+
+def test_a_clip_run_is_marked_on_the_strip_as_well_as_latched(qapp):
+    """The latch says *whether*; the strip says *when*. Both, not either."""
+    from gui.main_window import MainWindow
+
+    tab = MainWindow().record_tab
+    tab._on_monitor_telemetry(Telemetry(peaks_dbfs=[-20.0, -20.0],
+                                        max_peak_dbfs=-20.0, elapsed_s=0.0))
+    tab._drain_telemetry()
+    tab._on_monitor_telemetry(Telemetry(peaks_dbfs=[0.0, 0.0], max_peak_dbfs=0.0,
+                                        clip_runs=1, elapsed_s=1.0))
+    tab._drain_telemetry()
+
+    assert tab.history_strip.clip_mark_count == 1     # marked in time...
+    assert "CLIPPING" in tab.meters.clip_label.text() # ...and still latched
+    assert tab.meters.clip_runs == 1
+
+
+def test_reset_clears_the_source_not_just_the_label(qapp):
+    """A reset that the next telemetry frame undoes is not a reset."""
+    from gui.main_window import MainWindow
+
+    tab = MainWindow().record_tab
+    tab._on_monitor_telemetry(Telemetry(peaks_dbfs=[-2.0, -2.0], max_peak_dbfs=-2.0,
+                                        clip_runs=1, elapsed_s=1.0))
+    tab._drain_telemetry()
+    assert "2.0 dB headroom" in tab.meters.max_label.text()
+
+    resets = []
+    tab._monitor.reset_peaks = lambda: resets.append(True)
+    tab.meters.reset_button.click()
+
+    assert resets == [True]                      # the monitor's running max, gone
+    assert tab.history_strip.clip_mark_count == 0    # and the strip with it
+    assert tab.meters.max_label.text() == "max —"
+
+
+def test_the_levels_hint_is_legible_and_says_the_useful_thing(qapp):
+    """It was dark-on-dark, and it named the wrong number."""
+    from gui.main_window import MainWindow
+
+    tab = MainWindow().record_tab
+    assert "palette(mid)" not in tab.hint.styleSheet()   # normal contrast
+    assert "loudest passage" in tab.hint.text()
+    assert "−3 dBFS" in tab.hint.text()                  # the number to aim under
 
 
 def test_device_is_remembered_by_name_not_index(qapp, no_hardware):
