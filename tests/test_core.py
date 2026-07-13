@@ -47,6 +47,14 @@ def test_config_round_trip(tmp_path):
     assert config.load(path) == cfg
 
 
+def test_metadata_contact_defaults_empty_and_round_trips(tmp_path):
+    path = tmp_path / "settings.json"
+    assert config.Config().metadata_contact == ""   # nobody's identity by default
+    cfg = config.Config(metadata_contact="me@example.com")
+    config.save(cfg, path)
+    assert config.load(path).metadata_contact == "me@example.com"
+
+
 def test_retag_same_path_guard(tmp_path):
     """Re-tagging must never delete a source that resolves to the destination."""
     configure_pydub()
