@@ -118,6 +118,7 @@ class RecordTab(QWidget):
         level_box = QGroupBox("Levels")
         level_layout = QVBoxLayout(level_box)
         self.meters = LevelMeters(channels=2)
+        self.meters.resetRequested.connect(self._reset_levels)
         level_layout.addWidget(self.meters)
 
         # The bars say what the input is doing *now*; the strip says what it has
@@ -126,11 +127,10 @@ class RecordTab(QWidget):
         self.history_strip = LevelHistoryStrip(channels=2)
         level_layout.addWidget(self.history_strip)
 
-        hint = QLabel("Meters run whenever this tab is open — set your input gain "
-                      "before you press Record. Aim for peaks around −6 dBFS.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("QLabel { color: palette(mid); }")
-        level_layout.addWidget(hint)
+        self.hint = QLabel("Play the loudest passage of the record and adjust input "
+                           "gain until peaks stay below −3 dBFS.")
+        self.hint.setWordWrap(True)
+        level_layout.addWidget(self.hint)
         root.addWidget(level_box)
 
         # --- destination + transport -------------------------------------------
@@ -285,6 +285,17 @@ class RecordTab(QWidget):
 
     def _on_monitor_telemetry(self, telemetry) -> None:
         self._latest = telemetry            # audio thread: just hand it over
+
+    def _reset_levels(self) -> None:
+        """Reset must reset the *source*, not just the label.
+
+        The meters are redrawn from telemetry every 50 ms, so clearing the label
+        alone would show a cleared max for one frame and then put the old one
+        straight back. Mid-capture there is nothing to clear: the recorder's max
+        is a fact about the file, and the file does not un-clip.
+        """
+        self._monitor.reset_peaks()
+        self.history_strip.reset()
 
     def _drain_telemetry(self) -> None:
         """GUI thread: repaint at most 20x/second, from the newest sample only."""

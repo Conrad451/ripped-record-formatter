@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import math
 
-from PySide6.QtCore import QRectF, Qt
+from PySide6.QtCore import QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -134,6 +134,11 @@ class PeakBar(QWidget):
 class LevelMeters(QWidget):
     """Stereo bars + numeric max + a latching clip indicator with a count."""
 
+    #: Reset was pressed. The host clears the *source* statistics too -- clearing
+    #: only the label would let the next telemetry frame put the old max straight
+    #: back, 50 ms later, which is not a reset at all.
+    resetRequested = Signal()
+
     def __init__(self, channels: int = 2) -> None:
         super().__init__()
         self._bars: list[PeakBar] = []
@@ -165,9 +170,13 @@ class LevelMeters(QWidget):
 
         self.reset_button = QPushButton("Reset")
         self.reset_button.setToolTip("Clear the peak hold, max reading and clip latch.")
-        self.reset_button.clicked.connect(self.reset)
+        self.reset_button.clicked.connect(self._on_reset_clicked)
         readout.addWidget(self.reset_button)
         root.addLayout(readout)
+
+    def _on_reset_clicked(self) -> None:
+        self.reset()
+        self.resetRequested.emit()
 
     # -- feed ---------------------------------------------------------------
     def update_from(self, telemetry) -> None:

@@ -149,6 +149,35 @@ def test_a_clip_run_is_marked_on_the_strip_as_well_as_latched(qapp):
     assert tab.meters.clip_runs == 1
 
 
+def test_reset_clears_the_source_not_just_the_label(qapp):
+    """A reset that the next telemetry frame undoes is not a reset."""
+    from gui.main_window import MainWindow
+
+    tab = MainWindow().record_tab
+    tab._on_monitor_telemetry(Telemetry(peaks_dbfs=[-2.0, -2.0], max_peak_dbfs=-2.0,
+                                        clip_runs=1, elapsed_s=1.0))
+    tab._drain_telemetry()
+    assert "2.0 dB headroom" in tab.meters.max_label.text()
+
+    resets = []
+    tab._monitor.reset_peaks = lambda: resets.append(True)
+    tab.meters.reset_button.click()
+
+    assert resets == [True]                      # the monitor's running max, gone
+    assert tab.history_strip.clip_mark_count == 0    # and the strip with it
+    assert tab.meters.max_label.text() == "max —"
+
+
+def test_the_levels_hint_is_legible_and_says_the_useful_thing(qapp):
+    """It was dark-on-dark, and it named the wrong number."""
+    from gui.main_window import MainWindow
+
+    tab = MainWindow().record_tab
+    assert "palette(mid)" not in tab.hint.styleSheet()   # normal contrast
+    assert "loudest passage" in tab.hint.text()
+    assert "−3 dBFS" in tab.hint.text()                  # the number to aim under
+
+
 def test_device_is_remembered_by_name_not_index(qapp, no_hardware):
     from gui.main_window import MainWindow
 
