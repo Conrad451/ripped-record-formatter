@@ -44,6 +44,13 @@ class Config:
     last_artist: str = ""
     last_album: str = ""
 
+    # --- metadata lookup ---
+    metadata_contact: str = ""
+    """Contact (email or URL) sent in the MusicBrainz User-Agent, so they can
+    reach *you* about your traffic. Empty (default) is allowed: lookups then
+    identify the app and explicitly claim no contact. See
+    :func:`core.metadata_lookup.user_agent`."""
+
     # --- output naming ---
     filename_side_letters: bool = False
     """Album jobs write every side into one flat output folder. Off (default):

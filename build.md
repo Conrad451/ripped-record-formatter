@@ -188,6 +188,61 @@ every subsystem *in the frozen environment* — Qt, pyqtgraph, SciPy, soundfile,
 noisereduce, mutagen, QtMultimedia, PortAudio, the bundled ffmpeg, and one full
 restore → split → encode. Eleven checks; all must pass.
 
+### Cutting a release
+
+Build from the **tagged** commit, so `SOURCE.txt` names the commit people can
+actually check out. Then zip, hash, and publish the hash *with* the asset.
+
+```powershell
+git checkout v2.2.0
+python scripts/fetch_ffmpeg.py
+python -m PyInstaller RippedRecordFormatter.spec --noconfirm
+
+# 1. zip the bundle (the folder *containing* the two exes and _internal\)
+Compress-Archive -Path dist\RippedRecordFormatter\* `
+                 -DestinationPath RippedRecordFormatter-2.2.0-win64.zip
+
+# 2. hash it
+Get-FileHash RippedRecordFormatter-2.2.0-win64.zip -Algorithm SHA256
+
+# 3. publish, with the hash in the notes
+gh release create v2.2.0 RippedRecordFormatter-2.2.0-win64.zip `
+   --title "v2.2.0 - Standalone Windows build" --notes-file notes.md
+```
+
+The zip is **not** committed (`*.zip` is gitignored) — it is a release asset,
+not source.
+
+**Publish the SHA-256 in the release notes, beside the download.** The build is
+unsigned, so a checksum is the only thing a downloader has to tell our bytes
+from someone else's. A hash nobody can find is a hash nobody checks: put it in
+the notes, not in a file next to it.
+
+Whoever downloads it verifies with either of these — no tools to install:
+
+```powershell
+Get-FileHash RippedRecordFormatter-2.2.0-win64.zip -Algorithm SHA256
+```
+
+```
+certutil -hashfile RippedRecordFormatter-2.2.0-win64.zip SHA256
+```
+
+`Get-FileHash` prints upper-case hex; `certutil` prints lower-case with spaces.
+Compare case-insensitively and ignore the spacing.
+
+#### v2.2.0 was published without a checksum
+
+It predates this section. The zip is on the machine that built it, not in the
+repo, so the hash is not fabricated here — run `Get-FileHash` on that zip and
+paste the result into the existing v2.2.0 release notes:
+
+```powershell
+Get-FileHash RippedRecordFormatter-2.2.0-win64.zip -Algorithm SHA256 |
+    ForEach-Object { "SHA-256: $($_.Hash)" }
+gh release edit v2.2.0 --notes-file updated-notes.md
+```
+
 ### Stakeholder checklist — what one machine cannot prove
 
 A dev machine has Python, ffmpeg and audio drivers already installed, so it

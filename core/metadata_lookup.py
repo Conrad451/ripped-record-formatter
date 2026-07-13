@@ -27,6 +27,8 @@ Terms of service
 MusicBrainz *requires* a descriptive ``User-Agent`` (application name, version,
 and contact) and rate-limits anonymous clients to one request per second. Both
 are enforced here (see :class:`MusicBrainzProvider`).
+
+The contact is the *user's*, not the maintainer's -- see :func:`user_agent`.
 """
 
 from __future__ import annotations
@@ -34,10 +36,13 @@ from __future__ import annotations
 import socket
 import threading
 import time
+import urllib.error
+import urllib.request
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable, Iterator, Sequence
+from urllib.parse import urlsplit
 
 from core.version import __version__
 
@@ -67,8 +72,121 @@ class MetadataResponseError(MetadataError):
 class MetadataConfigError(MetadataError):
     """The provider was used before it was configured correctly.
 
-    For MusicBrainz this means the required User-Agent was not set.
+    For MusicBrainz this means the client library rejected our User-Agent.
     """
+
+
+class MetadataSecurityError(MetadataError):
+    """A fetch was refused because the transport would have been unsafe.
+
+    Raised when a redirect tries to move us off HTTPS. Never swallowed: an
+    https -> http downgrade on the cover-art path is either an attacker or a
+    service regression, and both deserve to be seen.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Identity -- who this traffic says it is.
+# ---------------------------------------------------------------------------
+#
+# MusicBrainz asks API clients to identify themselves with a contact address so
+# they can reach whoever is generating the traffic. That contact must therefore
+# be the *user's*, not the maintainer's: shipping the maintainer's URL as the
+# contact for every download of this app would name one person as responsible
+# for strangers' request volume, which is neither accurate nor fair.
+#
+# So: a configured contact is used verbatim (after sanitising). An unconfigured
+# one produces a string that is honest about being nobody -- the repository URL
+# stays, but only as *provenance* ("this is what the app is"), explicitly not as
+# a contact.
+
+APP_NAME = "RippedRecordFormatter"
+SOURCE_URL = "github.com/Conrad451/ripped-record-formatter"
+UNCONFIGURED_CONTACT = f"unconfigured; source: {SOURCE_URL}"
+
+CONTACT_NUDGE = (
+    "Tip: set a MusicBrainz contact in Settings -- your lookups currently "
+    "identify only the app."
+)
+
+#: Longest contact we will put in a header. A contact is an email or a URL; a
+#: kilobyte of one is a mistake or an attack, and either way it is not going out
+#: over the wire on the user's behalf.
+MAX_CONTACT_LENGTH = 120
+
+
+def sanitize_contact(contact: str, *, max_length: int = MAX_CONTACT_LENGTH) -> str:
+    """Reduce a user-supplied contact to something safe to put in a header.
+
+    This value comes from a config file and ends up inside an HTTP request
+    header, so a bare newline in it would be *header injection* -- the classic
+    ``foo\\r\\nX-Evil: 1`` splitting one header into two. We do not escape; we
+    drop. Anything outside printable ASCII goes (headers are latin-1 on the wire
+    and a control character has no business in a contact address), runs of
+    whitespace collapse to one space, and the result is capped.
+
+    Returns ``""`` for anything that sanitises down to nothing -- which callers
+    treat exactly like "not configured".
+    """
+    if not contact:
+        return ""
+    kept: list[str] = []
+    for ch in contact:
+        if ch in "\t\r\n":
+            kept.append(" ")          # a line break becomes a space, never a break
+        elif " " <= ch <= "~":        # printable ASCII survives
+            kept.append(ch)
+        # anything else -- C0/C1 controls, NUL, non-ASCII -- is dropped outright
+    collapsed = " ".join("".join(kept).split())
+    return collapsed[:max_length].strip()
+
+
+def user_agent(
+    contact: str = "",
+    *,
+    app_name: str = APP_NAME,
+    version: str = __version__,
+    max_length: int = MAX_CONTACT_LENGTH,
+) -> str:
+    """The ``User-Agent`` this app identifies itself with.
+
+    Configured::
+
+        RippedRecordFormatter/2.2.1 (you@example.com)
+
+    Unconfigured -- a deliberate non-identity, not a stand-in maintainer::
+
+        RippedRecordFormatter/2.2.1 (unconfigured; source: github.com/...)
+
+    The version is always :data:`core.version.__version__`; nothing here is
+    hardcoded to a release.
+    """
+    clean = sanitize_contact(contact, max_length=max_length) or UNCONFIGURED_CONTACT
+    return f"{app_name}/{version} ({clean})"
+
+
+# One nudge per process. The user is told once that their lookups are anonymous;
+# telling them on every search would be nagging, and a dialog would be worse.
+_nudged = False
+
+
+def take_contact_nudge(contact: str) -> str | None:
+    """Return the nudge text the *first* time a lookup runs unconfigured.
+
+    ``None`` every other time -- because a contact is set, or because it has
+    already been said once this session.
+    """
+    global _nudged
+    if sanitize_contact(contact) or _nudged:
+        return None
+    _nudged = True
+    return CONTACT_NUDGE
+
+
+def reset_contact_nudge() -> None:
+    """Forget that the nudge was shown. For tests; a process is one session."""
+    global _nudged
+    _nudged = False
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +387,61 @@ def _sniff_mime(data: bytes) -> str:
     return "image/jpeg"
 
 
+# ---------------------------------------------------------------------------
+# Cover Art Archive fetch -- ours, so the transport is ours to pin.
+# ---------------------------------------------------------------------------
+#
+# The CAA does not serve image bytes itself: it answers with a redirect to the
+# Internet Archive, which redirects again to whichever node holds the file. Today
+# every hop is https (verified against the live service). But *nothing enforced
+# that*: urllib's HTTPRedirectHandler happily follows an https -> http Location,
+# so the guarantee was the servers' good behaviour, not our policy.
+#
+# musicbrainzngs builds its own opener internally, with no seam to pass a redirect
+# policy through -- so we make this one request ourselves. It costs us a small
+# amount of URL construction and buys an explicit refusal to be downgraded.
+
+CAA_BASE_URL = "https://coverartarchive.org"
+
+
+class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow redirects, but only ever to HTTPS."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        scheme = urlsplit(newurl).scheme.lower()
+        if scheme != "https":
+            raise MetadataSecurityError(
+                f"refusing to follow a {scheme or 'scheme-less'} redirect from "
+                f"{req.full_url} -- cover art must stay on HTTPS."
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def fetch_front_cover(release_id: str, agent: str, timeout: float) -> bytes:
+    """GET the front cover for ``release_id`` from the Cover Art Archive.
+
+    Returns the image bytes. Raises :class:`MetadataResponseError` when there is
+    no art (404) or the service refuses, :class:`MetadataNetworkError` on a
+    transport failure, and :class:`MetadataSecurityError` if a redirect tries to
+    take us off HTTPS.
+    """
+    url = f"{CAA_BASE_URL}/release/{release_id}/front"
+    if urlsplit(url).scheme != "https":  # pragma: no cover - guards the constant
+        raise MetadataSecurityError(f"cover-art URL is not HTTPS: {url!r}")
+    opener = urllib.request.build_opener(_HttpsOnlyRedirectHandler)
+    request = urllib.request.Request(url, headers={"User-Agent": agent})
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            return response.read()
+    except MetadataError:
+        raise
+    except urllib.error.HTTPError as exc:
+        # 404 is the common one: this release simply has no art.
+        raise MetadataResponseError(f"cover art unavailable (HTTP {exc.code})") from exc
+    except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as exc:
+        raise MetadataNetworkError(str(exc)) from exc
+
+
 @contextmanager
 def _socket_timeout(timeout: float) -> Iterator[None]:
     """Temporarily set the default socket timeout, then restore it.
@@ -294,19 +467,25 @@ class MusicBrainzProvider(MetadataProvider):
     clients) and requests are throttled to one per second -- both required by
     the MusicBrainz web-service terms of use. Every call is bounded by
     ``timeout`` seconds and raises only :class:`MetadataError` subclasses.
+
+    ``contact`` is the *user's* -- an email or URL they set in Settings. Left
+    empty the client still works, but identifies itself as having no contact
+    (see :func:`user_agent`) and asks, once, for one via ``notice``.
     """
 
     name = "MusicBrainz"
 
     def __init__(
         self,
-        app_name: str = "RippedRecordFormatter",
+        app_name: str = APP_NAME,
         app_version: str = __version__,
-        contact: str = "https://github.com/Conrad451/ripped-record-formatter",
+        contact: str = "",
         *,
         timeout: float = 15.0,
         rate_limiter: RateLimiter | None = None,
         client=None,
+        cover_fetcher: Callable[[str, str, float], bytes] | None = None,
+        notice: Callable[[str], None] | None = None,
     ) -> None:
         # ``client`` injection keeps the network library out of unit tests.
         if client is None:
@@ -314,19 +493,38 @@ class MusicBrainzProvider(MetadataProvider):
         self._mb = client
         self._timeout = float(timeout)
         self._limiter = rate_limiter or RateLimiter(1.0)
+        self._contact = contact or ""
+        self._cover_fetcher = cover_fetcher or fetch_front_cover
+        self._notice = notice
 
-        if not contact:
-            raise MetadataConfigError(
-                "MusicBrainz requires a contact (URL or email) in the User-Agent."
-            )
-        # ToS requirement: identify the application. Raised as our error type so
-        # callers never see a musicbrainzngs-specific exception.
+        # ToS requirement: identify the application. The library composes its own
+        # header (``app/version python-musicbrainzngs/x.y ( contact )``), so the
+        # contact we hand it is what MusicBrainz sees. Raised as our error type
+        # so callers never see a musicbrainzngs-specific exception.
         try:
-            self._mb.set_useragent(app_name, app_version, contact)
+            self._mb.set_useragent(app_name, app_version, self._ua_contact)
         except self._mb.UsageError as exc:  # pragma: no cover - defensive
             raise MetadataConfigError(str(exc)) from exc
         # Belt-and-suspenders: also arm the library's own throttle at 1 req/s.
         self._mb.set_rate_limit(1.0, 1)
+
+    @property
+    def _ua_contact(self) -> str:
+        """The contact that goes on the wire: the user's, or an explicit none."""
+        return sanitize_contact(self._contact) or UNCONFIGURED_CONTACT
+
+    @property
+    def user_agent(self) -> str:
+        """The User-Agent used for the cover-art fetch we make ourselves."""
+        return user_agent(self._contact)
+
+    def _nudge(self) -> None:
+        """Once per session, if unconfigured, ask for a contact. Never blocks."""
+        if self._notice is None:
+            return
+        text = take_contact_nudge(self._contact)
+        if text:
+            self._notice(text)
 
     # -- network plumbing ---------------------------------------------------
     def _call(self, func: Callable, *args, **kwargs):
@@ -351,6 +549,7 @@ class MusicBrainzProvider(MetadataProvider):
         album = (album or "").strip()
         if not artist and not album:
             return []
+        self._nudge()
         fields: dict[str, str] = {}
         if artist:
             fields["artist"] = artist
@@ -369,6 +568,7 @@ class MusicBrainzProvider(MetadataProvider):
     def get_release(self, release_id: str, *, with_cover: bool = True) -> ReleaseDetail:
         if not release_id:
             raise MetadataResponseError("empty release id")
+        self._nudge()
         data = self._call(
             self._mb.get_release_by_id,
             release_id,
@@ -383,13 +583,17 @@ class MusicBrainzProvider(MetadataProvider):
     def _fetch_cover(self, release_id: str) -> CoverArt | None:
         """Fetch the front cover, returning ``None`` when there is no art.
 
-        A missing image surfaces from musicbrainzngs as a ``ResponseError``
-        (HTTP 404); that is an expected, non-fatal outcome -- not every release
-        has cover art -- so we swallow it and return ``None``. Network failures
-        still propagate as :class:`MetadataNetworkError`.
+        A release with no art answers 404, which the fetcher reports as a
+        :class:`MetadataResponseError`; that is an expected, non-fatal outcome
+        -- not every release has cover art -- so we swallow it and return
+        ``None``. Network failures still propagate as
+        :class:`MetadataNetworkError`, and a refused transport as
+        :class:`MetadataSecurityError`; neither is silently turned into
+        "no cover".
         """
         try:
-            data = self._call(self._mb.get_image_front, release_id)
+            data = self._call(self._cover_fetcher, release_id,
+                              self.user_agent, self._timeout)
         except MetadataResponseError:
             return None
         if not data:

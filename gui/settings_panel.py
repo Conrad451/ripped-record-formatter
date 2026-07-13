@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QScrollArea,
     QSlider,
     QSpinBox,
@@ -28,6 +29,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from core.metadata_lookup import MAX_CONTACT_LENGTH, sanitize_contact
 
 
 class CollapsibleBox(QWidget):
@@ -114,6 +117,26 @@ class SettingsPanel(QWidget):
             "filename_side_letters", cfg.filename_side_letters))
         root.addWidget(basic_box)
 
+        # ---------------- Metadata lookup ----------------
+        lookup_box = QGroupBox("Metadata lookup")
+        lookup = QFormLayout(lookup_box)
+        self.contact_edit = QLineEdit(cfg.metadata_contact)
+        self.contact_edit.setPlaceholderText("you@example.com")
+        self.contact_edit.setMaxLength(MAX_CONTACT_LENGTH)
+        # Saved as you leave the field, not per keystroke -- a half-typed address
+        # is not worth a config write, and it would be the one on the wire if you
+        # searched mid-edit.
+        self.contact_edit.editingFinished.connect(self._save_contact)
+        lookup.addRow("MusicBrainz contact (email or URL):", self.contact_edit)
+        hint = QLabel(
+            "MusicBrainz asks API users to provide a contact so they can reach "
+            "you about traffic issues. Optional, but courteous."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("QLabel { color: palette(mid); }")
+        lookup.addRow(hint)
+        root.addWidget(lookup_box)
+
         # ---------------- Advanced ----------------
         advanced = CollapsibleBox("Advanced", expanded=False)
         adv = QFormLayout()
@@ -159,6 +182,19 @@ class SettingsPanel(QWidget):
     def _save(self, **fields) -> None:
         self.settings.set(**fields)
         self.changed.emit()
+
+    def _save_contact(self) -> None:
+        """Persist the contact as it will actually be sent -- sanitised.
+
+        Storing the raw text and cleaning it only on the way out would leave the
+        field showing something the app never sends. What you see here is the
+        string that goes in the header.
+        """
+        clean = sanitize_contact(self.contact_edit.text())
+        if clean != self.contact_edit.text():
+            self.contact_edit.setText(clean)
+        if clean != self.settings.config.metadata_contact:
+            self._save(metadata_contact=clean)
 
     def _check(self, label: str, field: str, value: bool) -> QCheckBox:
         box = QCheckBox(label)

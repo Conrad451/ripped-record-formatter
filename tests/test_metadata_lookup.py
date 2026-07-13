@@ -9,18 +9,31 @@ and error mapping without ever touching the network.
 
 from __future__ import annotations
 
+import urllib.error
+import urllib.request
+
 import pytest
 
 from core.metadata_lookup import (
+    CAA_BASE_URL,
+    CONTACT_NUDGE,
+    MAX_CONTACT_LENGTH,
+    UNCONFIGURED_CONTACT,
     CoverArt,
-    MetadataConfigError,
     MetadataNetworkError,
     MetadataResponseError,
+    MetadataSecurityError,
     MusicBrainzProvider,
     RateLimiter,
     ReleaseResult,
+    _HttpsOnlyRedirectHandler,
     _sniff_mime,
+    fetch_front_cover,
+    reset_contact_nudge,
+    sanitize_contact,
+    user_agent,
 )
+from core.version import __version__
 
 
 # ---------------------------------------------------------------------------
@@ -149,16 +162,19 @@ class FakeMusicBrainz:
         self._maybe_raise("detail")
         return self._detail
 
-    def get_image_front(self, rid, size=None):
+    def fetch_cover(self, rid, agent, timeout):
+        """Stands in for the real Cover Art Archive fetcher."""
         self.calls.append(("image", rid))
+        self.cover_agent = agent
         self._maybe_raise("image")
         return self._image
 
 
-def make_provider(mb):
-    """Provider wired to a fake client and a no-wait rate limiter."""
+def make_provider(mb, **kwargs):
+    """Provider wired to a fake client, a fake CAA, and a no-wait rate limiter."""
     limiter = RateLimiter(1.0, clock=lambda: 0.0, sleep=lambda s: None)
-    return MusicBrainzProvider(client=mb, rate_limiter=limiter)
+    kwargs.setdefault("cover_fetcher", mb.fetch_cover)
+    return MusicBrainzProvider(client=mb, rate_limiter=limiter, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -168,16 +184,139 @@ def make_provider(mb):
 
 def test_sets_useragent_and_rate_limit_on_construction():
     mb = FakeMusicBrainz()
-    make_provider(mb)
+    make_provider(mb, contact="me@example.com")
     assert mb.useragent is not None
     app, version, contact = mb.useragent
     assert app and version and contact  # all three ToS fields present
+    assert contact == "me@example.com"  # the *user's*, not the maintainer's
     assert mb.rate_limit == (1.0, 1)
 
 
-def test_empty_contact_rejected():
-    with pytest.raises(MetadataConfigError):
-        MusicBrainzProvider(client=FakeMusicBrainz(), contact="")
+# ---------------------------------------------------------------------------
+# Identity: the User-Agent names the user, or explicitly names nobody.
+# ---------------------------------------------------------------------------
+
+
+def test_user_agent_carries_a_configured_contact():
+    assert user_agent("me@example.com") == f"RippedRecordFormatter/{__version__} (me@example.com)"
+
+
+def test_user_agent_unconfigured_declares_no_contact():
+    agent = user_agent("")
+    assert agent == (
+        f"RippedRecordFormatter/{__version__} "
+        "(unconfigured; source: github.com/Conrad451/ripped-record-formatter)"
+    )
+    # The repo URL is provenance, not an implied responsible party...
+    assert "unconfigured" in agent
+    # ...and the maintainer is never named as the contact.
+    assert "@" not in agent
+
+
+def test_user_agent_version_comes_from_core_version():
+    assert f"/{__version__}" in user_agent("me@example.com")
+
+
+def test_empty_contact_is_allowed_and_identifies_the_app_only():
+    mb = FakeMusicBrainz()
+    provider = make_provider(mb, contact="")     # no longer an error
+    _app, _version, contact = mb.useragent
+    assert contact == UNCONFIGURED_CONTACT
+    assert provider.search_releases("Miles", "Blue")  # and lookups still work
+
+
+def test_provider_useragent_contact_is_sanitized_before_the_library_sees_it():
+    mb = FakeMusicBrainz()
+    make_provider(mb, contact="me@example.com\r\nX-Evil: 1")
+    _app, _version, contact = mb.useragent
+    assert "\r" not in contact and "\n" not in contact
+
+
+# ---------------------------------------------------------------------------
+# Header safety: this value comes from a config file and lands in an HTTP header.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "hostile,expected",
+    [
+        ("foo\r\nX-Evil: 1", "foo X-Evil: 1"),      # CRLF injection -- the big one
+        ("foo\nBar: 2", "foo Bar: 2"),
+        ("foo\rBar: 2", "foo Bar: 2"),
+        ("a\x00b", "ab"),                            # NUL dropped
+        ("a\x07\x1bb", "ab"),                        # control characters dropped
+        ("caf\xe9@x.com", "caf@x.com"),              # non-ASCII dropped (headers are latin-1)
+        ("  spaced   out  ", "spaced out"),          # whitespace collapsed + trimmed
+        ("", ""),
+        ("\r\n\t  ", ""),                            # sanitises to nothing -> unset
+    ],
+)
+def test_sanitize_contact_strips_hostile_input(hostile, expected):
+    assert sanitize_contact(hostile) == expected
+
+
+def test_sanitize_contact_caps_absurd_length():
+    assert len(sanitize_contact("a" * 10_000)) == MAX_CONTACT_LENGTH
+
+
+def test_header_injection_cannot_reach_the_user_agent():
+    agent = user_agent("foo\r\nX-Evil: 1")
+    assert "\r" not in agent and "\n" not in agent
+    assert "X-Evil" in agent  # not escaped -- flattened; it is now inert text
+
+
+def test_contact_that_sanitizes_to_nothing_behaves_as_unset():
+    assert user_agent("\r\n\x00") == user_agent("")
+
+
+# ---------------------------------------------------------------------------
+# The nudge: once per session, only when unconfigured, never blocking.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _fresh_session():
+    reset_contact_nudge()
+    yield
+    reset_contact_nudge()
+
+
+def test_nudge_fires_once_per_session_when_unconfigured():
+    seen: list[str] = []
+    mb = FakeMusicBrainz()
+    provider = make_provider(mb, contact="", notice=seen.append)
+
+    provider.search_releases("Miles", "Blue")
+    assert seen == [CONTACT_NUDGE]
+
+    provider.search_releases("Miles", "Blue")   # second lookup, same session
+    provider.get_release("mbid-vinyl")
+    assert seen == [CONTACT_NUDGE]              # still exactly one
+
+
+def test_nudge_is_silent_when_a_contact_is_configured():
+    seen: list[str] = []
+    provider = make_provider(FakeMusicBrainz(), contact="me@example.com",
+                             notice=seen.append)
+    provider.search_releases("Miles", "Blue")
+    provider.get_release("mbid-vinyl")
+    assert seen == []
+
+
+def test_lookup_works_identically_with_no_notice_sink():
+    # Nobody listening for the nudge must not change what a lookup returns.
+    with_sink = make_provider(FakeMusicBrainz(), contact="", notice=lambda _m: None)
+    reset_contact_nudge()
+    without = make_provider(FakeMusicBrainz(), contact="")
+    assert (with_sink.search_releases("Miles", "Blue")
+            == without.search_releases("Miles", "Blue"))
+
+
+def test_nudge_is_shared_across_providers_in_one_session():
+    seen: list[str] = []
+    make_provider(FakeMusicBrainz(), contact="", notice=seen.append).search_releases("a", "b")
+    make_provider(FakeMusicBrainz(), contact="", notice=seen.append).search_releases("a", "b")
+    assert seen == [CONTACT_NUDGE]  # a second panel does not re-nag
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +487,90 @@ def test_with_cover_false_skips_the_image_request():
     assert not any(c[0] == "image" for c in mb.calls)
 
 
+def test_cover_fetch_carries_the_apps_user_agent():
+    mb = FakeMusicBrainz()
+    make_provider(mb, contact="me@example.com").get_release("mbid-vinyl")
+    assert mb.cover_agent == user_agent("me@example.com")
+
+
+# ---------------------------------------------------------------------------
+# Cover Art Archive transport: HTTPS end to end, including redirects.
+#
+# The CAA does not serve the bytes -- it 307s to archive.org, which 302s again to
+# a storage node. urllib's stock redirect handler will follow an https -> http
+# Location without complaint, so "it happens to be HTTPS today" was the only
+# thing keeping this path secure. These tests pin the policy instead.
+# ---------------------------------------------------------------------------
+
+
+def _redirect_to(handler, newurl, origin=f"{CAA_BASE_URL}/release/x/front"):
+    """Ask a redirect handler to follow ``newurl``; return the new request."""
+    request = urllib.request.Request(origin)
+    return handler.redirect_request(request, None, 302, "Found", {}, newurl)
+
+
+def test_https_redirect_is_followed():
+    handler = _HttpsOnlyRedirectHandler()
+    new = _redirect_to(handler, "https://archive.org/download/mbid-x/cover.jpg")
+    assert new.full_url == "https://archive.org/download/mbid-x/cover.jpg"
+
+
+@pytest.mark.parametrize(
+    "downgrade",
+    [
+        "http://archive.org/download/mbid-x/cover.jpg",   # the plain-HTTP downgrade
+        "ftp://archive.org/cover.jpg",                    # urllib would follow this too
+        "//archive.org/cover.jpg",                        # scheme-less
+    ],
+)
+def test_redirect_off_https_is_refused(downgrade):
+    handler = _HttpsOnlyRedirectHandler()
+    with pytest.raises(MetadataSecurityError):
+        _redirect_to(handler, downgrade)
+
+
+def test_stock_urllib_would_have_followed_the_downgrade():
+    # The reason the handler above exists. If this ever starts raising, urllib
+    # grew its own downgrade protection and ours became belt-and-braces.
+    stock = urllib.request.HTTPRedirectHandler()
+    new = _redirect_to(stock, "http://evil.example/plain.jpg")
+    assert new.full_url == "http://evil.example/plain.jpg"
+
+
+def test_cover_url_is_https():
+    assert CAA_BASE_URL.startswith("https://")
+
+
+def test_fetch_front_cover_maps_a_404_to_a_response_error(monkeypatch):
+    def fake_open(_self, _req, timeout=None):
+        raise urllib.error.HTTPError(f"{CAA_BASE_URL}/release/x/front", 404,
+                                     "Not Found", {}, None)
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", fake_open)
+    with pytest.raises(MetadataResponseError):
+        fetch_front_cover("mbid-x", user_agent(""), 5.0)
+
+
+def test_fetch_front_cover_maps_a_transport_failure_to_a_network_error(monkeypatch):
+    def fake_open(_self, _req, timeout=None):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", fake_open)
+    with pytest.raises(MetadataNetworkError):
+        fetch_front_cover("mbid-x", user_agent(""), 5.0)
+
+
+def test_security_refusal_is_not_swallowed_as_no_cover():
+    # A downgrade attempt must not look like "this release has no art".
+    def refuse(_rid, _agent, _timeout):
+        raise MetadataSecurityError("http redirect refused")
+
+    mb = FakeMusicBrainz()
+    provider = make_provider(mb, cover_fetcher=refuse)
+    with pytest.raises(MetadataSecurityError):
+        provider.get_release("mbid-vinyl")
+
+
 # ---------------------------------------------------------------------------
 # Error mapping / offline resilience.
 # ---------------------------------------------------------------------------
@@ -407,7 +630,9 @@ def test_rate_limiter_is_used_between_search_and_cover():
         now["t"] += s
 
     limiter = RateLimiter(1.0, clock=lambda: now["t"], sleep=sleep)
-    provider = MusicBrainzProvider(client=FakeMusicBrainz(), rate_limiter=limiter)
+    mb = FakeMusicBrainz()
+    provider = MusicBrainzProvider(client=mb, rate_limiter=limiter,
+                                   cover_fetcher=mb.fetch_cover)
     # detail fetch makes two network calls (release + cover) -> one throttle wait.
     provider.get_release("mbid-vinyl")
     assert slept == [1.0]
