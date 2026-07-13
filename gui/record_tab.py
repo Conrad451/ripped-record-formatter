@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 
 from core.recorder import LevelMonitor, Recorder, list_input_devices
 from core.timefmt import format_timestamp
+from gui.level_history import LevelHistoryStrip
 from gui.meters import LevelMeters
 
 #: Offered regardless of what the device claims natively -- a Realtek line input
@@ -118,6 +119,13 @@ class RecordTab(QWidget):
         level_layout = QVBoxLayout(level_box)
         self.meters = LevelMeters(channels=2)
         level_layout.addWidget(self.meters)
+
+        # The bars say what the input is doing *now*; the strip says what it has
+        # been doing for the last half minute -- which is the question you are
+        # actually asking while you set gain.
+        self.history_strip = LevelHistoryStrip(channels=2)
+        level_layout.addWidget(self.history_strip)
+
         hint = QLabel("Meters run whenever this tab is open — set your input gain "
                       "before you press Record. Aim for peaks around −6 dBFS.")
         hint.setWordWrap(True)
@@ -270,6 +278,7 @@ class RecordTab(QWidget):
         rate = int(self.rate_combo.currentData() or dev.samplerate)
         channels = min(2, dev.max_channels) or 1
         self._monitor.start(dev.index, rate, channels)
+        self.history_strip.reset()          # a new stream is a new history
         if self._monitor.error:
             self._log(f"Record: cannot monitor levels on this device "
                       f"({self._monitor.error}).")
@@ -284,6 +293,7 @@ class RecordTab(QWidget):
             return
         self._latest = None
         self.meters.update_from(telemetry)
+        self.history_strip.update_from(telemetry)
         if self.recording:
             self.elapsed_label.setText(format_timestamp(telemetry.elapsed_s))
             self.size_label.setText(f"{telemetry.bytes_written / 1_048_576:.1f} MB")
@@ -323,6 +333,7 @@ class RecordTab(QWidget):
 
         self._monitor.stop()                # hand the device to the recorder
         self.meters.reset()
+        self.history_strip.reset()          # the take starts with a clean strip
 
         rate = int(self.rate_combo.currentData() or dev.samplerate)
         subtype = str(self.depth_combo.currentData() or "PCM_16")

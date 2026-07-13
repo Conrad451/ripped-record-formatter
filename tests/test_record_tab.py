@@ -114,6 +114,40 @@ def test_clip_indicator_latches_and_counts(qapp):
     assert "no clipping" in tab.meters.clip_label.text()
 
 
+def test_the_history_strip_updates_from_the_same_telemetry(qapp):
+    """The strip runs off the monitor feed -- pre-roll, no recording required."""
+    from gui.main_window import MainWindow
+
+    tab = MainWindow().record_tab
+    for i in range(40):                          # 2 s of pre-roll telemetry
+        tab._on_monitor_telemetry(Telemetry(
+            peaks_dbfs=[-8.0, -11.0], max_peak_dbfs=-8.0, clip_runs=0,
+            elapsed_s=i * 0.05))
+        tab._drain_telemetry()
+
+    xs, ys = tab.history_strip._traces[0].getData()
+    assert len(xs) == 40                         # every snapshot is on the strip
+    assert ys[-1] == pytest.approx(-8.0)
+    assert tab.history_strip.clip_mark_count == 0
+
+
+def test_a_clip_run_is_marked_on_the_strip_as_well_as_latched(qapp):
+    """The latch says *whether*; the strip says *when*. Both, not either."""
+    from gui.main_window import MainWindow
+
+    tab = MainWindow().record_tab
+    tab._on_monitor_telemetry(Telemetry(peaks_dbfs=[-20.0, -20.0],
+                                        max_peak_dbfs=-20.0, elapsed_s=0.0))
+    tab._drain_telemetry()
+    tab._on_monitor_telemetry(Telemetry(peaks_dbfs=[0.0, 0.0], max_peak_dbfs=0.0,
+                                        clip_runs=1, elapsed_s=1.0))
+    tab._drain_telemetry()
+
+    assert tab.history_strip.clip_mark_count == 1     # marked in time...
+    assert "CLIPPING" in tab.meters.clip_label.text() # ...and still latched
+    assert tab.meters.clip_runs == 1
+
+
 def test_device_is_remembered_by_name_not_index(qapp, no_hardware):
     from gui.main_window import MainWindow
 
