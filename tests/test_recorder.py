@@ -14,9 +14,16 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from core.recorder import CLIP_LEVEL, Recorder, RecordingResult
+from core.recorder import (
+    CLIP_LEVEL,
+    STATS_GRACE_S,
+    LevelMonitor,
+    Recorder,
+    RecordingResult,
+)
 
 SR = 44100
+GRACE_FRAMES = int(SR * STATS_GRACE_S)
 
 
 class FakeStream:
@@ -72,6 +79,20 @@ def _tone(frames, channels=2, amp=0.25):
     t = np.arange(frames) / SR
     mono = amp * np.sin(2 * np.pi * 440 * t)
     return np.repeat(mono[:, None], channels, axis=1).astype(np.float32)
+
+
+def _silence(frames, channels=2):
+    return np.zeros((frames, channels), dtype=np.float32)
+
+
+def _prime(stream, channels=2):
+    """Push the opening grace window through as silence.
+
+    Every stats assertion below is about audio the user actually played, so the
+    tests have to get past the open-transient guard the same way production does
+    -- by feeding it frames. Silence, so it contributes nothing of its own.
+    """
+    stream.push(_silence(GRACE_FRAMES + 1, channels))
 
 
 def _recorder(tmp_path, **kw):
@@ -134,6 +155,7 @@ def test_counts_injected_full_scale_runs(tmp_path):
     dest = tmp_path / "SideA.wav"
     rec.start(device=0, path=dest, samplerate=SR, channels=2)
     stream = made["stream"]
+    _prime(stream)
 
     block = _tone(1024)
     block[100:110] = 1.0                     # run 1: 10 frames at full scale
@@ -152,6 +174,7 @@ def test_a_clip_run_spanning_two_blocks_counts_once(tmp_path):
     rec, made = _recorder(tmp_path)
     rec.start(device=0, path=tmp_path / "a.wav", samplerate=SR, channels=2)
     stream = made["stream"]
+    _prime(stream)
 
     a = _tone(1024)
     a[-5:] = 1.0                             # run starts at the end of block 1...
@@ -166,11 +189,180 @@ def test_a_clip_run_spanning_two_blocks_counts_once(tmp_path):
 def test_a_clean_capture_reports_no_clipping(tmp_path):
     rec, made = _recorder(tmp_path)
     rec.start(device=0, path=tmp_path / "a.wav", samplerate=SR, channels=2)
+    _prime(made["stream"])
     made["stream"].push(_tone(1024, amp=0.5))
     result = rec.stop()
     assert result.clip_runs == 0
     assert result.clipped is False
-    assert result.max_peak_dbfs < -3.0
+    assert result.max_peak_dbfs == pytest.approx(-6.0, abs=0.2)   # 0.5 -> -6 dBFS
+
+
+# --------------------------------------------------------------------------- #
+# The open transient: a device's first ~100 ms is not a level reading
+#
+# Measured on the headset mic from the bug report: every stream open emits a run
+# of genuinely full-scale samples about 68 ms in -- not in the first block, which
+# is clean -- which latched max peak at +0.0 dBFS and counted clip runs while the
+# input was idle. These tests inject that artifact and demand it be ignored.
+# --------------------------------------------------------------------------- #
+def _open_transient(channels=2, at_frame=3000, length=64):
+    """The artifact as measured: a full-scale burst ~68 ms into the stream."""
+    block = _silence(GRACE_FRAMES, channels)
+    block[at_frame:at_frame + length] = -1.0
+    return block
+
+
+def test_the_open_transient_does_not_latch_the_max_peak(tmp_path):
+    """The bug, exactly: idle input, full-scale burst at open, max reads +0.0."""
+    rec, made = _recorder(tmp_path)
+    rec.start(device=0, path=tmp_path / "a.wav", samplerate=SR, channels=2)
+    stream = made["stream"]
+
+    stream.push(_open_transient())            # the device priming itself
+    stream.push(_tone(1024, amp=0.01))        # ...and then a quiet room
+
+    result = rec.stop()
+    assert result.max_peak_dbfs == pytest.approx(-40.0, abs=0.5)   # the room
+    assert result.max_peak_dbfs < -3.0                             # NOT +0.0 dBFS
+
+
+def test_the_open_transient_does_not_count_as_clipping(tmp_path):
+    """Same artifact, the other statistic: the screenshot's phantom '3 run(s)'."""
+    rec, made = _recorder(tmp_path)
+    rec.start(device=0, path=tmp_path / "a.wav", samplerate=SR, channels=2)
+    stream = made["stream"]
+
+    stream.push(_open_transient())
+    stream.push(_tone(1024, amp=0.01))
+
+    result = rec.stop()
+    assert result.clip_runs == 0
+    assert result.clipped is False
+
+
+def test_the_transient_is_still_written_to_the_file(tmp_path):
+    """Discarded from the *statistics*, never from the *audio*."""
+    rec, made = _recorder(tmp_path)
+    dest = tmp_path / "a.wav"
+    rec.start(device=0, path=dest, samplerate=SR, channels=2)
+    made["stream"].push(_open_transient())
+
+    result = rec.stop()
+    assert sf.info(str(dest)).frames == GRACE_FRAMES      # every frame kept
+    data, _ = sf.read(str(dest))
+    assert np.abs(data).max() >= CLIP_LEVEL               # including the burst
+    assert result.max_peak_dbfs < -3.0                    # but not counted
+
+
+def test_real_clipping_after_the_grace_window_is_still_caught(tmp_path):
+    """The guard must not become a blindfold: clipping the user *caused* counts."""
+    rec, made = _recorder(tmp_path)
+    rec.start(device=0, path=tmp_path / "a.wav", samplerate=SR, channels=2)
+    stream = made["stream"]
+
+    stream.push(_open_transient())            # ignored...
+    hot = _tone(1024)
+    hot[200:260] = 1.0                        # ...but this is the record, too loud
+    stream.push(hot)
+
+    result = rec.stop()
+    assert result.clip_runs == 1
+    assert result.max_peak_dbfs == pytest.approx(0.0, abs=0.01)
+
+
+def test_the_grace_window_can_straddle_a_block_boundary(tmp_path):
+    """The window is a frame count, not a block count: blocks may land anywhere."""
+    rec, made = _recorder(tmp_path)
+    rec.start(device=0, path=tmp_path / "a.wav", samplerate=SR, channels=2)
+    stream = made["stream"]
+
+    # One block that begins inside the grace window and ends outside it, with a
+    # full-scale burst on each side of the boundary. The window is a count of
+    # frames, so the split has to happen *within* the block.
+    stream.push(_silence(GRACE_FRAMES - 1024))    # 1024 frames of grace remain
+    straddle = _silence(2048)
+    straddle[:10] = 1.0                           # inside grace  -> ignored
+    straddle[1030:1090] = 0.5                     # outside grace -> counted
+    stream.push(straddle)
+
+    result = rec.stop()
+    assert result.clip_runs == 0                  # the pre-boundary burst: ignored
+    # ...and the post-boundary audio is genuinely being watched.
+    assert result.max_peak_dbfs == pytest.approx(-6.0, abs=0.2)   # 0.5, not 1.0
+
+
+def test_the_monitor_ignores_the_open_transient_too(tmp_path):
+    """The meters and the recorder must agree about what the input is doing."""
+    seen = []
+    made = {}
+
+    def factory(**kwargs):
+        made["stream"] = FakeStream(**kwargs)
+        return made["stream"]
+
+    mon = LevelMonitor(on_telemetry=seen.append, stream_factory=factory,
+                       telemetry_interval_s=0.0)
+    mon.start(device=0, samplerate=SR, channels=2)
+    made["stream"].push(_open_transient())
+    made["stream"].push(_tone(1024, amp=0.01))
+    mon.stop()
+
+    assert seen, "no telemetry emitted"
+    assert seen[-1].clip_runs == 0
+    assert seen[-1].max_peak_dbfs == pytest.approx(-40.0, abs=0.5)
+
+
+def test_restarting_the_monitor_re_arms_the_grace_window(tmp_path):
+    """Every open has its own transient -- switching device must step over it."""
+    seen = []
+    made = {}
+
+    def factory(**kwargs):
+        made["stream"] = FakeStream(**kwargs)
+        return made["stream"]
+
+    mon = LevelMonitor(on_telemetry=seen.append, stream_factory=factory,
+                       telemetry_interval_s=0.0)
+    mon.start(device=0, samplerate=SR, channels=2)
+    _prime(made["stream"])
+    made["stream"].push(_tone(1024, amp=0.5))       # a real -6 dBFS on device 0
+    assert seen[-1].max_peak_dbfs == pytest.approx(-6.0, abs=0.2)
+    mon.stop()
+
+    mon.start(device=1, samplerate=SR, channels=2)  # now a different device
+    made["stream"].push(_open_transient())          # with its own opening burst
+    made["stream"].push(_tone(1024, amp=0.01))
+    mon.stop()
+
+    # Device 1's transient is ignored, and device 0's max did not follow us here.
+    assert seen[-1].clip_runs == 0
+    assert seen[-1].max_peak_dbfs == pytest.approx(-40.0, abs=0.5)
+
+
+def test_monitor_reset_clears_the_max_without_re_arming_grace(tmp_path):
+    """Reset must actually reset -- and must not blind the meters for 150 ms."""
+    seen = []
+    made = {}
+
+    def factory(**kwargs):
+        made["stream"] = FakeStream(**kwargs)
+        return made["stream"]
+
+    mon = LevelMonitor(on_telemetry=seen.append, stream_factory=factory,
+                       telemetry_interval_s=0.0)
+    mon.start(device=0, samplerate=SR, channels=2)
+    stream = made["stream"]
+    _prime(stream)
+    stream.push(_tone(1024, amp=0.5))               # a loud passage: -6 dBFS
+    assert seen[-1].max_peak_dbfs == pytest.approx(-6.0, abs=0.2)
+
+    mon.reset_peaks()
+    stream.push(_tone(1024, amp=0.01))              # now quiet
+    mon.stop()
+
+    # The old max is gone, and the new quiet reading is visible IMMEDIATELY --
+    # a Reset that re-armed the grace window would report -inf here instead.
+    assert seen[-1].max_peak_dbfs == pytest.approx(-40.0, abs=0.5)
 
 
 # --------------------------------------------------------------------------- #
@@ -299,6 +491,7 @@ def test_telemetry_reports_peaks_clips_and_elapsed(tmp_path):
     rec._on_telemetry = seen.append
 
     rec.start(device=0, path=tmp_path / "a.wav", samplerate=SR, channels=2)
+    _prime(made["stream"])
     block = _tone(1024, amp=0.5)
     block[10:20] = 1.0
     made["stream"].push(block)
