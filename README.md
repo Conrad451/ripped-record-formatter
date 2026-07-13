@@ -28,6 +28,8 @@ You play a record into it and get a finished album back. Ripped Record Formatter
 
 The build is not code-signed, so Windows SmartScreen will warn you the first time: click *More info* → *Run anyway*. The download is around 470 MB, most of which is ffmpeg and Qt.
 
+It is unsigned because code-signing economics are absurd for a personal tool — a certificate costs more per year than this project will ever cost to run. Verify your download against the **SHA-256 published with each release** instead: `Get-FileHash RippedRecordFormatter-<version>-win64.zip -Algorithm SHA256`, and check it matches the hash in the release notes.
+
 **Or run it from source.** Requires **Python 3.14**.
 
 ```bash
@@ -105,4 +107,4 @@ Written as FLAC Vorbis comments. **A field that is absent writes no tag at all**
 
 ## Acknowledgments
 
-Release metadata comes from [MusicBrainz](https://musicbrainz.org/) and cover art from the [Cover Art Archive](https://coverartarchive.org/); please respect their terms of use and rate limits. Audio decoding and click removal lean on [ffmpeg](https://ffmpeg.org/). The app stands on [PySide6](https://doc.qt.io/qtforpython/) (Qt), [NumPy](https://numpy.org/), [SciPy](https://scipy.org/), [soundfile](https://python-soundfile.readthedocs.io/), [noisereduce](https://github.com/timsainb/noisereduce), [mutagen](https://mutagen.readthedocs.io/), [pydub](https://github.com/jiaaro/pydub), [musicbrainzngs](https://python-musicbrainzngs.readthedocs.io/), and [pyqtgraph](https://www.pyqtgraph.org/).
+Release metadata comes from [MusicBrainz](https://musicbrainz.org/) and cover art from the [Cover Art Archive](https://coverartarchive.org/). Lookups use MusicBrainz's free service under [its terms of use](https://musicbrainz.org/doc/MusicBrainz_API), which ask that clients identify themselves and stay within one request per second — this app throttles itself accordingly. **If you do a lot of lookups, set your own contact in Settings** ("MusicBrainz contact"): it tells MusicBrainz who to reach about your traffic, rather than leaving it anonymous, and it is the courteous thing to do when you are leaning on somebody's free service. Audio decoding and click removal lean on [ffmpeg](https://ffmpeg.org/). The app stands on [PySide6](https://doc.qt.io/qtforpython/) (Qt), [NumPy](https://numpy.org/), [SciPy](https://scipy.org/), [soundfile](https://python-soundfile.readthedocs.io/), [noisereduce](https://github.com/timsainb/noisereduce), [mutagen](https://mutagen.readthedocs.io/), [pydub](https://github.com/jiaaro/pydub), [musicbrainzngs](https://python-musicbrainzngs.readthedocs.io/), and [pyqtgraph](https://www.pyqtgraph.org/).
