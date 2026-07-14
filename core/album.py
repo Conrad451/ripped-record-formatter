@@ -369,6 +369,43 @@ class AlbumController:
         self._analysis_pool.submit(self._run_analysis, side)
         return True
 
+    def admit_side(self, side: SideJob) -> bool:
+        """Admit a late-arriving side into a still-running job's analysis queue.
+
+        The live-session case: an album is analysing side A when side B's
+        recording lands mapped. Rather than make the user restart, B joins the
+        running job -- it queues for analysis like any other side, and the
+        enlarged job now waits for it before concluding.
+
+        Admission is open only while the job is *non-finished*. A concluded album
+        is concluded: this returns ``False`` and the caller maps the side normally
+        (the user re-runs to include it per the 8.4 semantics). It also returns
+        ``False`` if the album is being cancelled, or if a side with this index is
+        already in the job. On success the side is appended, given a cancel event
+        (so ``cancel_all`` covers it), set ``QUEUED``, and submitted for analysis;
+        it is counted in the final summary automatically.
+
+        The finished-flag check, the append, and the cancel-event registration all
+        happen together under the lock -- serialised against ``_claim_finish``,
+        which also locks and re-reads ``self.sides`` -- so a last existing side
+        going terminal can never conclude the album in the window between our
+        admitting this side and queueing it.
+        """
+        with self._lock:
+            if self._finished:
+                return False
+            if self._cancel_all.is_set():
+                return False
+            if any(s.index == side.index for s in self.sides):
+                return False
+            self._side_cancel[side.index] = threading.Event()
+            self.sides.append(side)
+        # Outside the lock: _set_state locks internally (non-reentrant Lock), and a
+        # pool submit must never run under it.
+        self._set_state(side, SideState.QUEUED)
+        self._analysis_pool.submit(self._run_analysis, side)
+        return True
+
     def start(self) -> None:
         """Queue every mapped side for analysis. Unmapped sides go to ERROR."""
         for side in self.sides:
