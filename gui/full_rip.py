@@ -862,13 +862,23 @@ class FullRipTab(QWidget):
             self._rebuild_mapping_table()
             self._log(f"Source: {Path(path).name}")
 
-    def add_recorded_wav(self, path) -> bool:
+    def add_recorded_wav(self, path, *, warnings=()) -> bool:
         """A recording just landed. Fold it into the mapping table if it belongs.
 
         This is the record-to-rip handoff. If the Record tab is writing into the
         same folder this tab is pointed at, a finished side appears here on its
         own -- record side A, flip, record side B, and the album job is mapped
         without the user touching the mapping table at all.
+
+        And if an album is *already running* (side A analysing while B records),
+        the newly-mapped side is admitted straight into that job's analysis queue
+        rather than waiting for a restart -- the record-to-analyse pipeline. A job
+        that has already concluded is left concluded (map only; re-run to include
+        it), and with no job running this only maps, never auto-starting one.
+
+        ``warnings`` are the completed recording's warnings (dropouts, clipping);
+        they never block admission, but they are carried forward into the side's
+        log line so a flagged capture stays visible after the handoff.
 
         Returns whether the file was adopted. A recording into some *other*
         folder is none of this tab's business and is left alone.
@@ -887,10 +897,55 @@ class FullRipTab(QWidget):
         self._album_wavs = sorted({*self._album_wavs, path})
         self._rebuild_mapping_table()
         mapped = self._album_mapping[self._album_wavs.index(path)]
-        where = (f"mapped to Side {side_letter(mapped)}" if mapped is not None
+        warn_note = (f" Heads up: this recording carried {len(warnings)} "
+                     f"warning(s) -- see the log." if warnings else "")
+
+        # Live session: a job is running and this side mapped. Try to admit it.
+        if self._album is not None and mapped is not None:
+            if self._admit_recorded_side(mapped, path):
+                self._log(f"Full Rip: '{path.name}' mapped to Side "
+                          f"{side_letter(mapped)} and joined the running album -- "
+                          f"analysing now.{warn_note}")
+            else:
+                # The job already concluded (8.4): finished is finished.
+                self._log(f"Full Rip: '{path.name}' mapped to Side "
+                          f"{side_letter(mapped)}. The album already finished -- "
+                          f"press Start album to run it again including this "
+                          f"side.{warn_note}")
+            return True
+
+        # No running job: map only, and never auto-start one the user didn't.
+        where = (f"mapped to Side {side_letter(mapped)} -- press Start album when "
+                 "ready" if mapped is not None
                  else "added, left on skip (name it SideX.wav to auto-map)")
-        self._log(f"Full Rip: recording '{path.name}' {where}.")
+        self._log(f"Full Rip: recording '{path.name}' {where}.{warn_note}")
         return True
+
+    def _admit_recorded_side(self, side_index: int, wav_path) -> bool:
+        """Build a SideJob for a just-recorded side and admit it to the live job.
+
+        Mirrors the SideJob the initial :meth:`_start_album` builds (titles and
+        durations pulled from the flat release lists by the side's track_indices),
+        adds it to the side list so its queued->analysing transitions show, then
+        admits it. If the controller refuses (the album has concluded), the list
+        row is undone and this returns False.
+        """
+        spec = next((s for s in self._sides if s.index == side_index), None)
+        if spec is None or self._album is None:
+            return False
+        titles = [self._flat_titles[i] for i in spec.track_indices] if self._flat_titles else []
+        durations = ([self._flat_durations_ms[i] for i in spec.track_indices]
+                     if self._flat_durations_ms else [])
+        side = SideJob(index=side_index, label=f"Side {side_letter(side_index)}",
+                       wav_path=Path(wav_path), titles=titles, durations_ms=durations)
+
+        item = QListWidgetItem(f"{side.label} - {side.state.value}")
+        item.setData(Qt.ItemDataRole.UserRole, side.index)
+        self.side_list.addItem(item)
+        if self._album.admit_side(side):
+            return True
+        self.side_list.takeItem(self.side_list.row(item))   # concluded: undo the row
+        return False
 
     def _rebuild_mapping_table(self) -> None:
         """One row per scanned WAV; the side dropdown defaults to skip.

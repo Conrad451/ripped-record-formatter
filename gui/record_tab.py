@@ -70,8 +70,10 @@ class RecordTab(QWidget):
     """Thin over :mod:`core.recorder`."""
 
     logMessage = Signal(str)
-    #: A capture finished and landed at this path. Full Rip listens for this.
-    recordingFinished = Signal(object)          # Path
+    #: A capture finished and landed. Carries the full RecordingResult (path plus
+    #: warnings/clipping) so Full Rip can carry a flagged capture forward when it
+    #: admits the side into a running album. Full Rip listens for this.
+    recordingFinished = Signal(object)          # RecordingResult
     #: Recording started/stopped -- the window makes the state unmissable.
     recordingStateChanged = Signal(bool)
 
@@ -390,7 +392,7 @@ class RecordTab(QWidget):
         self.settings.set(record_next_file=advanced)
 
         self.meters.set_clip_runs(result.clip_runs)
-        self.recordingFinished.emit(result.path)
+        self.recordingFinished.emit(result)
         self._restart_monitor()
 
     def _report(self, result) -> None:

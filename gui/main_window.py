@@ -330,9 +330,17 @@ class MainWindow(QMainWindow):
                   "Use Metadata to pull tracklists + cover art.")
 
     # --- metadata wiring ---------------------------------------------------
-    def _on_recording_finished(self, path) -> None:
-        """Hand the capture to Full Rip, if it is working in the same folder."""
-        if self.full_rip.add_recorded_wav(path):
+    def _on_recording_finished(self, result) -> None:
+        """Hand the capture to Full Rip, if it is working in the same folder.
+
+        Carries the recording's warnings (dropouts, clipping) forward so a flagged
+        capture stays visible when Full Rip admits the side into a live album.
+        """
+        path = result.path
+        warnings = list(result.warnings)
+        if getattr(result, "clipped", False):
+            warnings.append(f"clipping detected ({result.clip_runs} run(s))")
+        if self.full_rip.add_recorded_wav(path, warnings=warnings):
             self._log(f"Recorded side '{Path(path).name}' added to the Full Rip mapping.")
         else:
             self._log(f"Recorded '{Path(path).name}'. Select its folder in Full Rip "
