@@ -184,3 +184,129 @@ def test_cancelling_also_concludes_and_re_arms(qapp, tmp_path, monkeypatch):
     fr._cancel_album()
     assert _drain(qapp, lambda: fr._album is None)
     assert fr.start_album_btn.isEnabled()
+
+
+# --------------------------------------------------------------------------- #
+# Destination: captured at Start, and visibly so
+# --------------------------------------------------------------------------- #
+def test_the_destination_is_frozen_while_the_album_runs(qapp, tmp_path, monkeypatch):
+    fr, out = _tab(qapp, tmp_path, monkeypatch)
+
+    assert fr.output_edit.isEnabled()
+    assert not fr.destination_label.isVisible()
+
+    fr._start_album()
+
+    # Frozen, and the captured destination is on screen -- the field and the
+    # encode can no longer disagree, because the field cannot move.
+    assert not fr.output_edit.isEnabled()
+    assert "fixed while an album is running" in fr.output_edit.toolTip()
+    assert str(out) in fr.destination_label.text()
+    assert fr._album_output_root == str(out)
+
+    fr._cancel_album()
+    assert _drain(qapp, lambda: fr._album is None)
+    assert fr.output_edit.isEnabled()              # released again on completion
+
+
+def test_the_encode_uses_the_captured_root_not_the_live_field(qapp, tmp_path,
+                                                              monkeypatch):
+    """Editing the field mid-run cannot redirect a side. It is disabled -- but
+    even forced, the encode reads the captured root."""
+    seen: list[str] = []
+
+    def encode(self, side, cancel):
+        seen.append(self._album_output_root)
+
+    fr, out = _tab(qapp, tmp_path, monkeypatch, encode=encode)
+    fr._start_album()
+
+    # Force the field to somewhere else, as a user could not.
+    fr.output_edit.setText(str(tmp_path / "elsewhere"))
+
+    sides = list(fr._album.sides)
+    accepted = set()
+
+    def done():
+        album = fr._album
+        if album is not None:
+            for s in album.sides:
+                if s.state == SideState.READY and s.index not in accepted:
+                    album.accept_side(s.index, [1.0], list(s.titles))
+                    accepted.add(s.index)
+        return fr._album is None
+
+    assert _drain(qapp, done), [(s.label, s.state) for s in sides]
+    assert seen == [str(out), str(out)]           # both sides: the captured root
+
+
+# --------------------------------------------------------------------------- #
+# Overwrite: refuse by default, ask once, at album granularity
+# --------------------------------------------------------------------------- #
+def test_existing_files_prompt_once_and_cancel_refuses_to_start(qapp, tmp_path,
+                                                                monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    fr, out = _tab(qapp, tmp_path, monkeypatch)
+    (out / "[01] - So What.flac").write_bytes(b"old")
+    (out / "[03] - Blue in Green.flac").write_bytes(b"old")
+
+    asked: list[str] = []
+    logged: list[str] = []
+    fr.logMessage.connect(logged.append)
+
+    def refuse(parent, title, text, *a, **k):
+        asked.append(text)
+        return QMessageBox.StandardButton.Cancel
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(refuse))
+
+    fr._start_album()
+
+    assert len(asked) == 1                        # once per job, not per file
+    assert "2 file(s) already exist" in asked[0]
+    assert fr._album is None                      # refused: nothing started
+    assert (out / "[01] - So What.flac").read_bytes() == b"old"   # untouched
+    assert any("were left alone" in m for m in logged)
+
+
+def test_confirming_the_prompt_starts_the_album(qapp, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    fr, out = _tab(qapp, tmp_path, monkeypatch)
+    (out / "[01] - So What.flac").write_bytes(b"old")
+
+    monkeypatch.setattr(QMessageBox, "question",
+                        staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
+    logged: list[str] = []
+    fr.logMessage.connect(logged.append)
+
+    fr._start_album()
+
+    assert fr._album is not None
+    assert any("overwriting 1 existing file(s)" in m for m in logged)
+
+
+def test_an_empty_destination_never_prompts(qapp, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    fr, _out = _tab(qapp, tmp_path, monkeypatch)
+    asked: list[int] = []
+    monkeypatch.setattr(QMessageBox, "question",
+                        staticmethod(lambda *a, **k: asked.append(1)))
+
+    fr._start_album()
+
+    assert asked == []                            # nothing to overwrite, no question
+    assert fr._album is not None
+
+
+def test_planned_filenames_match_what_the_encoder_writes(qapp, tmp_path, monkeypatch):
+    """The prompt must describe the files that would actually land."""
+    fr, _out = _tab(qapp, tmp_path, monkeypatch)
+
+    assert fr._planned_filenames() == [
+        "[01] - So What.flac",
+        "[02] - Freddie Freeloader.flac",
+        "[03] - Blue in Green.flac",
+        "[04] - Flamenco Sketches.flac",
+    ]

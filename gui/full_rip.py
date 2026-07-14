@@ -62,6 +62,7 @@ from core.album import (
 from core.side_partition import Side
 from core.split_review import detect_progressive_drift, segment_deviations, wrong_side_suspected
 from core.timefmt import format_timestamp
+from core.tracks import track_filename
 from gui.playback import AuditionPlayer
 from gui.release_preview import NO_COVER_TEXT, ReleasePreview
 from gui.side_editor import SideEditorDialog, side_letter
@@ -264,6 +265,15 @@ class FullRipTab(QWidget):
 
         self.output_edit = QLineEdit(settings.config.output_dir)
         form.addRow("Output folder:", self._path_row(self.output_edit, self._browse_output))
+
+        # The destination the encode will *actually* use. An album job captures
+        # the output folder at Start and every side encodes into that captured
+        # path -- so while a job runs, this label, not the field above it, is the
+        # truth. It is only shown during a run, when the two could disagree.
+        self.destination_label = QLabel("")
+        self.destination_label.setWordWrap(True)
+        self.destination_label.setVisible(False)
+        form.addRow("", self.destination_label)
         root.addLayout(form)
 
         # --- 4. Review: only meaningful once a side is ready --------------------
@@ -970,6 +980,11 @@ class FullRipTab(QWidget):
             return
         cfg = self.settings.config
 
+        # Refuse to overwrite silently. Asked once per job, album-level: a
+        # 12-track prompt-per-file is not a safety feature, it is an ordeal.
+        if not self._confirm_overwrite(Path(output)):
+            return
+
         # A fresh job starts un-cancelled, even if the previous one was cancelled.
         self._cancel.clear()
         self._album_output_root = output
@@ -1003,9 +1018,92 @@ class FullRipTab(QWidget):
             self.side_list.addItem(item)
         self.cancel_album_btn.setEnabled(True)
         self.start_album_btn.setEnabled(False)
+        self._lock_destination(True)
         self._album.start()
         self._log(f"Album: started ({len(sides)} sides, {cfg.album_analysis_workers} "
                   f"analysis worker(s)) -> {self._album_output_root}")
+
+    # -- destination ---------------------------------------------------------
+    def _lock_destination(self, running: bool) -> None:
+        """Freeze the output folder for the life of a job, and say where it is.
+
+        The encode has always used the folder captured at Start (see
+        :meth:`_album_encode`), while the field above it stayed editable -- so
+        editing it mid-album changed nothing, silently. Rather than make the field
+        live (which would let one album's sides land in two different folders --
+        an album is one artifact and belongs in one place), the field is disabled
+        while a job runs and the captured destination is shown next to it. The
+        rule becomes trivially reasonable: *the destination is whatever it was
+        when you pressed Start, and there it is on screen.*
+        """
+        self.output_edit.setEnabled(not running)
+        self.output_edit.setToolTip(
+            "The destination is fixed while an album is running — every side "
+            "encodes into the folder captured when you pressed Start album. "
+            "Cancel or let it finish, then change it and start again."
+            if running else "")
+        self.destination_label.setVisible(running)
+        if running:
+            self.destination_label.setText(f"Encoding to: {self._album_output_root}")
+            self.destination_label.setToolTip(
+                "Where this album's FLACs are being written.")
+
+    def _planned_filenames(self) -> list[str]:
+        """The FLAC names this job is about to write, before it writes any.
+
+        Derived from the same :func:`track_filename` the encoder uses, so the
+        overwrite warning cannot describe different files from the ones that
+        actually land. It is a best effort by nature: the reviewer may add or
+        remove a split and change the track count. Under-reporting is acceptable
+        here -- the prompt exists to catch the "I pointed it at the wrong folder"
+        case, where the names are exactly the ones a previous run wrote.
+        """
+        cfg = self.settings.config
+        names: list[str] = []
+        for spec in self._sides:
+            if not spec.track_indices:
+                continue
+            file_start = spec.track_indices[0] + 1
+            for n, flat in enumerate(spec.track_indices):
+                title = (self._flat_titles[flat]
+                         if self._flat_titles and flat < len(self._flat_titles) else "")
+                if not title:
+                    continue          # no title -> cannot predict; do not guess
+                names.append(track_filename(
+                    title, n + 1,
+                    file_index=file_start + n,
+                    side_letter=side_letter(spec.index),
+                    use_side_letters=cfg.filename_side_letters,
+                ))
+        return names
+
+    def _confirm_overwrite(self, out_dir: Path) -> bool:
+        """Ask once, per job, before writing over files already in the destination.
+
+        The Record tab refuses to overwrite a side outright; an album cannot, and
+        should not -- a genuine re-run into the same folder is exactly what the
+        user means to do. So: refuse *by default*, ask once, and name the number.
+        """
+        try:
+            existing = [n for n in self._planned_filenames() if (out_dir / n).exists()]
+        except OSError:
+            return True                     # unreadable destination: the encode will say so
+        if not existing:
+            return True
+        answer = QMessageBox.question(
+            self, "Overwrite existing files?",
+            f"{len(existing)} file(s) already exist in {out_dir}.\n\n"
+            "Starting this album will overwrite them. Overwrite?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,          # refuse by default
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self._log(f"Album: not started - {len(existing)} existing file(s) in "
+                      f"{out_dir} were left alone. Choose a different output folder, "
+                      "or start again and confirm the overwrite.")
+            return False
+        self._log(f"Album: overwriting {len(existing)} existing file(s) in {out_dir}.")
+        return True
 
     def _cancel_album(self) -> None:
         if self._album is not None:
@@ -1066,6 +1164,7 @@ class FullRipTab(QWidget):
 
         self._album_review_index = None
         self.cancel_album_btn.setEnabled(False)
+        self._lock_destination(False)
         self._set_busy(False)               # re-arms Start (it checks _album is None)
         self.start_album_btn.setEnabled(not self._busy)
         self._update_retry_enabled()
@@ -1387,7 +1486,10 @@ class FullRipTab(QWidget):
         side = self._album_side(index)
         if side is None or side.analysis is None:
             return
-        if not self.output_edit.text().strip():
+        # Check the destination the encode will *actually* use -- the one captured
+        # at Start -- not the live field. Validating one value and encoding into
+        # another is how "I fixed the output folder" came to mean nothing.
+        if not self._album_output_root:
             self._log("Album: choose an output folder first.")
             return
 
