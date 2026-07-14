@@ -84,6 +84,10 @@ class _StateRelay(QObject):
     """Marshals AlbumController state callbacks (worker threads) to the GUI."""
 
     changed = Signal(object)
+    #: The album reached a terminal state. Carries an AlbumSummary. Marshalled
+    #: like `changed`, because the last side to finish announces it from whichever
+    #: pool thread it happened to be on -- and the handler touches widgets.
+    finished = Signal(object)
 
 
 # --------------------------------------------------------------------------- #
@@ -150,6 +154,7 @@ class FullRipTab(QWidget):
         self._album_review_index: int | None = None
         self._relay = _StateRelay()
         self._relay.changed.connect(self._on_side_state)
+        self._relay.finished.connect(self._on_album_finished)
 
         root = QVBoxLayout(self)
 
@@ -938,6 +943,14 @@ class FullRipTab(QWidget):
         return next((s for s in self._album.sides if s.index == index), None) if self._album else None
 
     def _start_album(self) -> None:
+        """Start a *fresh* job. Pressing this again after one finishes re-runs it.
+
+        Re-running is deliberately start-over: every mapped side is analysed
+        again from its WAV, including sides that were done last time. The WAVs may
+        have been re-recorded between runs and we assume nothing about them, so
+        there is no partial re-run and no per-side re-encode -- one button, one
+        meaning.
+        """
         if self._album is not None:
             self._log("Album: already running.")
             return
@@ -956,11 +969,18 @@ class FullRipTab(QWidget):
                       "(everything is on skip).")
             return
         cfg = self.settings.config
+
+        # A fresh job starts un-cancelled, even if the previous one was cancelled.
+        self._cancel.clear()
         self._album_output_root = output
         self._album_meta = {
             "artist": self._release.artist if self._release else cfg.last_artist,
             "album": self._release.title if self._release else cfg.last_album,
         }
+        # A re-run gets its own staging. Drop the previous run's, or a long
+        # session of re-runs quietly fills %TEMP% with whole restored sides.
+        if self._album_work_dir is not None:
+            shutil.rmtree(self._album_work_dir, ignore_errors=True)
         self._album_work_dir = Path(tempfile.mkdtemp(prefix="rrf_album_"))
         sides = []
         for s in self._sides:
@@ -974,6 +994,7 @@ class FullRipTab(QWidget):
         self._album = AlbumController(
             sides, self._album_analyze, self._album_encode,
             on_state_change=lambda side: self._relay.changed.emit(side),
+            on_finished=lambda summary: self._relay.finished.emit(summary),
             max_analysis_workers=cfg.album_analysis_workers, max_encode_workers=1)
         self.side_list.clear()
         for side in sides:
@@ -983,7 +1004,8 @@ class FullRipTab(QWidget):
         self.cancel_album_btn.setEnabled(True)
         self.start_album_btn.setEnabled(False)
         self._album.start()
-        self._log(f"Album: started ({len(sides)} sides, {cfg.album_analysis_workers} analysis worker(s)).")
+        self._log(f"Album: started ({len(sides)} sides, {cfg.album_analysis_workers} "
+                  f"analysis worker(s)) -> {self._album_output_root}")
 
     def _cancel_album(self) -> None:
         if self._album is not None:
@@ -1026,10 +1048,35 @@ class FullRipTab(QWidget):
             self._log(f"Album: {side.label} done.")
         if self._album_review_index is None:
             self._set_empty_state(self._pending_review_message())
-        if self._album and all(s.state in (SideState.DONE, SideState.ERROR, SideState.CANCELLED)
-                               for s in self._album.sides):
-            self.cancel_album_btn.setEnabled(False)
-            self.start_album_btn.setEnabled(True)
+        # Completion is the controller's to announce (on_finished), not something
+        # re-derived here. This used to re-enable Start on the last terminal side
+        # while leaving self._album set -- so the button came back enabled and
+        # then answered "Album: already running." to anyone who pressed it.
+
+    def _on_album_finished(self, summary) -> None:
+        """The album concluded. Release it, and arm Start for a fresh run.
+
+        Cancel already implied this arming; completion has to mean it too. The
+        controller is dropped entirely -- pools shut down, state released -- so a
+        second Start builds a genuinely new job rather than reviving a spent one.
+        """
+        album, self._album = self._album, None
+        if album is not None:
+            album.shutdown(wait=False)
+
+        self._album_review_index = None
+        self.cancel_album_btn.setEnabled(False)
+        self._set_busy(False)               # re-arms Start (it checks _album is None)
+        self.start_album_btn.setEnabled(not self._busy)
+        self._update_retry_enabled()
+
+        self._log(summary.describe())
+        if summary.done:
+            self._log(f"  -> {self._album_output_root}")
+        self._log("Album: press 'Start album' to run this mapping again "
+                  "(every side is analysed afresh).")
+        if self._album_review_index is None:
+            self._set_empty_state(self._pending_review_message())
 
     def _on_side_list_click(self, item) -> None:
         if self._album is None:

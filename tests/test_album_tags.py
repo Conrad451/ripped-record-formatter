@@ -118,6 +118,9 @@ def _run_album(qapp, tmp_path, edit=None):
 
     fr._start_album()
     assert fr._album is not None
+    # Hold our own reference: the tab now *releases* the controller when the
+    # album concludes, so that a second Start is a clean new job.
+    sides = list(fr._album.sides)
 
     # Review + accept every side as it becomes ready, through the real GUI path:
     # load it into the review area, then Accept -- which snapshots the table and
@@ -125,7 +128,7 @@ def _run_album(qapp, tmp_path, edit=None):
     accepted = set()
 
     def pump():
-        for side in fr._album.sides:
+        for side in sides:
             if side.state == SideState.READY and side.index not in accepted:
                 fr._load_side_for_review(side)
                 if edit is not None:
@@ -133,10 +136,10 @@ def _run_album(qapp, tmp_path, edit=None):
                 fr._accept_album_side()
                 accepted.add(side.index)
         return all(s.state in (SideState.DONE, SideState.ERROR, SideState.CANCELLED)
-                   for s in fr._album.sides)
+                   for s in sides)
 
-    assert _wait(pump), [(s.label, s.state, s.error) for s in fr._album.sides]
-    errors = [(s.label, s.error) for s in fr._album.sides if s.state == SideState.ERROR]
+    assert _wait(pump), [(s.label, s.state, s.error) for s in sides]
+    errors = [(s.label, s.error) for s in sides if s.state == SideState.ERROR]
     assert not errors, errors
     return out
 
