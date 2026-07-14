@@ -50,6 +50,28 @@ def format_timestamp(seconds: float, decimals: int = 0) -> str:
     return f"{minutes}:{secs:02d}{frac}"
 
 
+def format_size(num_bytes: int) -> str:
+    """Format a byte count for display: ``512 B``, ``1.5 KB``, ``24.3 MB``.
+
+    Binary units (1 KB = 1024 B); one decimal past bytes. Negatives clamp to
+    zero. A display helper only -- like :func:`format_timestamp`, the underlying
+    value stays a raw integer everywhere else.
+
+        >>> format_size(512)
+        '512 B'
+        >>> format_size(1536)
+        '1.5 KB'
+        >>> format_size(25_500_000)
+        '24.3 MB'
+    """
+    size = float(max(0, int(num_bytes)))
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{int(size)} B" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
 def tick_decimals_for_span(span_seconds: float) -> int:
     """How many fractional-second digits an axis covering ``span_seconds`` needs.
 

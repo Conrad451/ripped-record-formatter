@@ -11,7 +11,9 @@ from core.album import (
     AlbumSummary,
     SideJob,
     SideState,
+    SideSummary,
     guess_side_index,
+    measure_outputs,
     propose_wav_side_map,
     sides_from_proposal,
 )
@@ -478,3 +480,56 @@ def test_summary_describes_a_single_side_in_the_singular():
     assert AlbumSummary().describe() == "Album complete: no sides."
     assert AlbumSummary(done=1, cancelled=2).describe() == (
         "Album complete: 1 done, 2 cancelled.")
+
+
+# --------------------------------------------------------------------------- #
+# The richer summary: per-side receipts, roll-up sizes/warnings, honest errors
+# --------------------------------------------------------------------------- #
+def test_summary_carries_sizes_and_warnings_with_an_error_side():
+    sides = [SideJob(index=0, label="Side A", wav_path=Path("a.wav")),
+             SideJob(index=1, label="Side B", wav_path=Path("b.wav"))]
+    album = AlbumController(sides, analyze_fn=lambda s, c: object(),
+                            encode_fn=lambda s, c: None)
+    try:
+        # Side A finished, wrote two tracks (one carried a warning); B failed.
+        sides[0].state = SideState.DONE
+        sides[0].result = SideSummary(
+            index=0, label="Side A", state=SideState.ENCODING,   # placeholder state
+            track_count=2, output_paths=(Path("out/[01].flac"), Path("out/[02].flac")),
+            total_bytes=2048, duration_s=185.0,
+            warnings=("Could not embed cover art: boom",), warned_tracks=1)
+        sides[1].state = SideState.ERROR
+
+        summary = album.summary()
+
+        assert (summary.done, summary.error, summary.cancelled) == (1, 1, 0)
+        assert summary.total_bytes == 2048
+        assert summary.warnings == ("Could not embed cover art: boom",)
+        assert summary.warned_tracks == 1
+
+        by_index = {s.index: s for s in summary.sides}
+        a = by_index[0]
+        assert a.state == SideState.DONE          # re-stamped from the side, not ENCODING
+        assert a.track_count == 2 and a.total_bytes == 2048 and a.duration_s == 185.0
+        # An error side still appears, honestly, carrying nothing it never wrote.
+        b = by_index[1]
+        assert b.state == SideState.ERROR
+        assert b.track_count == 0 and b.total_bytes == 0 and b.warnings == ()
+    finally:
+        album.shutdown(wait=False)
+
+
+def test_measure_outputs_totals_bytes_and_duration(tmp_path):
+    import numpy as np
+    import soundfile as sf
+
+    one_sec = tmp_path / "a.wav"
+    half_sec = tmp_path / "b.wav"
+    sf.write(str(one_sec), np.zeros(44100, dtype="float32"), 44100)
+    sf.write(str(half_sec), np.zeros(22050, dtype="float32"), 44100)
+
+    # A missing path is skipped, not fatal.
+    total_bytes, duration_s = measure_outputs([one_sec, half_sec, tmp_path / "gone.wav"])
+
+    assert total_bytes == one_sec.stat().st_size + half_sec.stat().st_size
+    assert abs(duration_s - 1.5) < 0.01
