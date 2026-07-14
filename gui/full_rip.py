@@ -24,7 +24,7 @@ import shutil
 import tempfile
 import threading
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal
@@ -100,6 +100,11 @@ class AnalyzeResult:
     proposal: object
     envelope: object
     restored_path: Path
+    # The actual restoration Stage objects applied to this side's audio, kept so
+    # the encode step can stamp provenance (RRF_RESTORATION) from what really ran
+    # -- not from config, which may change between analysis and encode. Empty
+    # when no stages were enabled (encoded without restoration).
+    stages: list = field(default_factory=list)
 
 
 class _Signals(QObject):
@@ -1537,7 +1542,7 @@ class FullRipTab(QWidget):
             proposal = propose_splits(restored, params=params)
 
         envelope = load_peak_envelope(restored)
-        analysis = AnalyzeResult(result, proposal, envelope, restored)
+        analysis = AnalyzeResult(result, proposal, envelope, restored, stages)
 
         # The sanity guard used to raise here, which the controller turned into
         # ERROR -- throwing away a perfectly good proposal and leaving Retry as
@@ -1598,7 +1603,8 @@ class FullRipTab(QWidget):
                       "and no cover art. Use 'Look up release...' for full metadata.")
         batch = convert_wavs_to_flacs(tracks, out_dir, configure=False, cover=self._cover,
                                       max_workers=self.settings.config.encode_workers,
-                                      should_cancel=should_cancel)
+                                      should_cancel=should_cancel,
+                                      restoration_stages=side.analysis.stages)
         for warning in batch.warnings:
             self._log(f"  ! {side.label}: {warning}")
 
