@@ -91,7 +91,11 @@ Written as FLAC Vorbis comments. **A field that is absent writes no tag at all**
 | `MUSICBRAINZ_ARTISTID` | Track artist MBID, falling back to the release artist MBID | |
 | `MUSICBRAINZ_RECORDINGID` | Recording MBID | |
 | `MUSICBRAINZ_TRACKID` | Release-track MBID | |
+| `RRF_VERSION` | App version (`core/version.py`) at encode time | Provenance: records which build wrote the file |
+| `RRF_RESTORATION` | Stable, parseable summary of the restoration applied to the audio, or `none` | Provenance: records how the audio was restored; format is documented as stable in `core/restoration.format_restoration` |
 | Front cover image | Cover Art Archive | Embedded as a FLAC picture block, type 3 (front cover) |
+
+The two `RRF_*` fields are written only when the app *encodes* the audio (Full Rip, plain Convert) — re-tagging carries forward whatever the original encode stamped and never rewrites them, so a re-tag cannot erase or falsify provenance.
 
 ## Roadmap & known limits
 
