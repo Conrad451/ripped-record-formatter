@@ -139,6 +139,30 @@ def test_the_completed_album_logs_one_summary_line(qapp, tmp_path, monkeypatch):
     assert sum(1 for m in logged if m.startswith("Album complete:")) == 1
 
 
+def test_a_finished_album_shows_the_summary_card_and_start_dismisses_it(
+        qapp, tmp_path, monkeypatch):
+    """The receipt occupies the idle review space alone, and a fresh Start
+    steps it aside without being blocked by it."""
+    fr, _out = _tab(qapp, tmp_path, monkeypatch)
+
+    _run_to_completion(qapp, fr)
+    qapp.processEvents()
+
+    # Up, and the sole occupant of the review space.
+    assert fr.summary_card.isVisibleTo(fr)
+    assert not fr.empty_state.isVisibleTo(fr)
+    assert not fr.review_box.isVisibleTo(fr)
+    assert "Kind of Blue" in fr.summary_card.title_label.text()
+
+    # A re-run is not blocked by the card, and dismisses it.
+    fr._start_album()
+    assert fr._album is not None
+    assert not fr.summary_card.isVisibleTo(fr)
+
+    fr._cancel_album()
+    assert _drain(qapp, lambda: fr._album is None)
+
+
 def test_pressing_start_again_runs_a_fresh_job_not_already_running(qapp, tmp_path,
                                                                    monkeypatch):
     """The bug, exactly: a finished album used to answer 'already running.'"""

@@ -56,6 +56,8 @@ from core.album import (
     NeedsAttention,
     SideJob,
     SideState,
+    SideSummary,
+    measure_outputs,
     propose_wav_side_map,
     sides_from_proposal,
 )
@@ -66,6 +68,7 @@ from core.tracks import track_filename
 from gui.playback import AuditionPlayer
 from gui.release_preview import NO_COVER_TEXT, ReleasePreview
 from gui.side_editor import SideEditorDialog, side_letter
+from gui.summary_card import AlbumSummaryCard
 from gui.track_model import Row, TrackTableModel, TrackTableView
 from gui.waveform import WaveformView
 
@@ -289,6 +292,14 @@ class FullRipTab(QWidget):
         review.setContentsMargins(0, 0, 0, 0)
         root.addWidget(self.review_box, 1)
         self.review_box.setVisible(False)
+
+        # A finished album's receipt, shown in this same idle space. It is a third
+        # mutually-exclusive occupant alongside empty_state and review_box; the
+        # visibility helpers below keep exactly one showing. It holds no job state,
+        # so it never blocks a fresh Start.
+        self.summary_card = AlbumSummaryCard()
+        root.addWidget(self.summary_card, 1)
+        self.summary_card.setVisible(False)
 
         self.waveform = WaveformView()
         self.waveform.markersChanged.connect(self._on_markers_changed)
@@ -790,6 +801,7 @@ class FullRipTab(QWidget):
     def _show_review(self) -> None:
         """Swap the empty state out for the review controls."""
         self.empty_state.setVisible(False)
+        self.summary_card.setVisible(False)
         self.review_box.setVisible(True)
 
     def _set_empty_state(self, message: str) -> None:
@@ -798,6 +810,7 @@ class FullRipTab(QWidget):
         Dead, greyed-out controls tell the user nothing; a sentence saying what
         the tab is waiting for tells them what to do next.
         """
+        self.summary_card.setVisible(False)
         self.empty_state.setText(message)
         self.empty_state.setVisible(True)
         self.review_box.setVisible(False)
@@ -987,6 +1000,7 @@ class FullRipTab(QWidget):
 
         # A fresh job starts un-cancelled, even if the previous one was cancelled.
         self._cancel.clear()
+        self.summary_card.setVisible(False)   # the previous run's receipt steps aside
         self._album_output_root = output
         self._album_meta = {
             "artist": self._release.artist if self._release else cfg.last_artist,
@@ -1174,6 +1188,32 @@ class FullRipTab(QWidget):
             self._log(f"  -> {self._album_output_root}")
         self._log("Album: press 'Start album' to run this mapping again "
                   "(every side is analysed afresh).")
+
+        # The moment deserves a receipt, not just a log line: render the summary
+        # card into the now-idle review space. A run with no sides at all has
+        # nothing to show, so it falls back to the plain empty state.
+        if summary.total and self._album_review_index is None:
+            self._show_summary_card(summary)
+        elif self._album_review_index is None:
+            self._set_empty_state(self._pending_review_message())
+
+    def _show_summary_card(self, summary) -> None:
+        """Populate and reveal the finished-album card (hiding the other two)."""
+        self.summary_card.render(
+            summary,
+            cover=self._cover,
+            artist=self._album_meta.get("artist", ""),
+            album=self._album_meta.get("album", ""),
+            destination=Path(self._album_output_root) if self._album_output_root else None,
+            on_dismiss=self._dismiss_summary_card,
+        )
+        self.empty_state.setVisible(False)
+        self.review_box.setVisible(False)
+        self.summary_card.setVisible(True)
+
+    def _dismiss_summary_card(self) -> None:
+        """The × on the card: fall back to the normal idle message."""
+        self.summary_card.setVisible(False)
         if self._album_review_index is None:
             self._set_empty_state(self._pending_review_message())
 
@@ -1601,6 +1641,20 @@ class FullRipTab(QWidget):
                                       should_cancel=should_cancel)
         for warning in batch.warnings:
             self._log(f"  ! {side.label}: {warning}")
+
+        # Capture the side's receipt now, while the files are fresh -- the summary
+        # card reads this, it never re-walks the output folder. The controller
+        # re-stamps the final state (this side may still be cancelled). state here
+        # is a placeholder; measure_outputs sizes the just-written FLACs.
+        output_paths = tuple(o.output_path for o in batch.outcomes)
+        total_bytes, duration_s = measure_outputs(output_paths)
+        side.result = SideSummary(
+            index=side.index, label=side.label, state=side.state,
+            track_count=len(output_paths), output_paths=output_paths,
+            total_bytes=total_bytes, duration_s=duration_s,
+            warnings=tuple(batch.warnings),
+            warned_tracks=sum(1 for o in batch.outcomes if o.warnings),
+        )
 
     def _cleanup_work_dir(self) -> None:
         if self._work_dir is not None:
