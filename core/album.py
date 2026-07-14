@@ -62,6 +62,39 @@ _TERMINAL = {SideState.DONE, SideState.ERROR, SideState.CANCELLED}
 _RETRYABLE = {SideState.ERROR, SideState.NEEDS_ATTENTION}
 
 
+@dataclass(frozen=True)
+class AlbumSummary:
+    """How an album ended. Every side is counted exactly once."""
+
+    done: int = 0
+    error: int = 0
+    cancelled: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.done + self.error + self.cancelled
+
+    def describe(self) -> str:
+        """One line for the log. Says what happened, not merely that it stopped.
+
+        A clean run reads "2 sides done."; anything else itemises, because
+        "finished" over a failed side is a lie of omission.
+        """
+        if self.total == 0:
+            return "Album complete: no sides."
+        if self.error == 0 and self.cancelled == 0:
+            noun = "side" if self.done == 1 else "sides"
+            return f"Album complete: {self.done} {noun} done."
+        parts = []
+        if self.done:
+            parts.append(f"{self.done} done")
+        if self.error:
+            parts.append(f"{self.error} error")
+        if self.cancelled:
+            parts.append(f"{self.cancelled} cancelled")
+        return f"Album complete: {', '.join(parts)}."
+
+
 class NeedsAttention(Exception):
     """Raised by ``analyze_fn`` when a sanity guard trips on a *usable* result.
 
@@ -204,6 +237,7 @@ AnalyzeFn = Callable[[SideJob, Callable[[], bool]], object]
 # encode_fn(side, should_cancel) -> None (or raises)
 EncodeFn = Callable[[SideJob, Callable[[], bool]], None]
 StateCallback = Callable[[SideJob], None]
+FinishedCallback = Callable[["AlbumSummary"], None]
 
 
 class AlbumController:
@@ -216,6 +250,7 @@ class AlbumController:
         encode_fn: EncodeFn,
         on_state_change: StateCallback | None = None,
         *,
+        on_finished: FinishedCallback | None = None,
         max_analysis_workers: int = 1,
         max_encode_workers: int = 1,
     ) -> None:
@@ -223,11 +258,51 @@ class AlbumController:
         self._analyze_fn = analyze_fn
         self._encode_fn = encode_fn
         self._on_state_change = on_state_change
+        self._on_finished = on_finished
         self._lock = threading.Lock()
         self._cancel_all = threading.Event()
         self._side_cancel = {s.index: threading.Event() for s in sides}
         self._analysis_pool = ThreadPoolExecutor(max_workers=max(1, max_analysis_workers))
         self._encode_pool = ThreadPoolExecutor(max_workers=max(1, max_encode_workers))
+        self._finished = False
+
+    # -- completion ---------------------------------------------------------
+    @property
+    def finished(self) -> bool:
+        """Every side has reached a terminal state. The job is over.
+
+        An album that never concludes cannot be run again, which is the whole
+        point of this: a controller with no terminal state left the GUI holding a
+        spent object forever, so a completed album answered "already running" to
+        a second Start.
+        """
+        with self._lock:
+            return self._finished
+
+    def summary(self) -> AlbumSummary:
+        with self._lock:
+            states = [s.state for s in self.sides]
+        return AlbumSummary(
+            done=sum(1 for s in states if s == SideState.DONE),
+            error=sum(1 for s in states if s == SideState.ERROR),
+            cancelled=sum(1 for s in states if s == SideState.CANCELLED),
+        )
+
+    def _claim_finish(self) -> bool:
+        """True exactly once: for the caller that saw the last side go terminal.
+
+        Sides finish on two different pools, so two threads can observe the final
+        state at the same instant. The flag is claimed under the lock so the
+        completion callback -- which re-arms Start and releases the pools -- runs
+        once and not twice.
+        """
+        with self._lock:
+            if self._finished:
+                return False
+            if not all(s.state in _TERMINAL for s in self.sides):
+                return False
+            self._finished = True
+            return True
 
     # -- state helpers ------------------------------------------------------
     def _set_state(self, side: SideJob, state: SideState, error: str = "",
@@ -240,6 +315,8 @@ class AlbumController:
                 side.error_detail = detail
         if self._on_state_change is not None:
             self._on_state_change(side)
+        if state in _TERMINAL and self._claim_finish() and self._on_finished is not None:
+            self._on_finished(self.summary())
 
     @staticmethod
     def _describe(exc: BaseException) -> str:
@@ -281,6 +358,10 @@ class AlbumController:
                 return False
             if side.wav_path is None:
                 return False          # nothing to retry; it was never mapped
+            # Retrying re-opens a job that may already have concluded (every side
+            # terminal, one of them ERROR). It has to be able to conclude again,
+            # or the second completion would never be announced.
+            self._finished = False
         side.clear_error()
         side.analysis = None
         self._side_cancel[index].clear()

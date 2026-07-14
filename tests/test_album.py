@@ -8,6 +8,7 @@ from pathlib import Path
 
 from core.album import (
     AlbumController,
+    AlbumSummary,
     SideJob,
     SideState,
     guess_side_index,
@@ -346,3 +347,134 @@ def test_guard_threshold_is_a_parameter():
     # Raising it toward 1.0 means being told less often.
     assert wrong_side_suspected(6, 4, frac=0.9) is False
     assert wrong_side_suspected(6, 5, frac=0.9) is True
+
+
+# --------------------------------------------------------------------------- #
+# The album concludes
+#
+# Every side reaching a terminal state used to mean nothing at the album level:
+# the controller had no notion of being over, so the GUI held a spent object
+# forever and a completed album answered "already running" to a second Start.
+# --------------------------------------------------------------------------- #
+def _finishing_controller(n=2, encode=None, on_finished=None, **kw):
+    sides = [SideJob(index=i, label=f"Side {i}", wav_path=Path(f"s{i}.wav"))
+             for i in range(n)]
+    return AlbumController(
+        sides,
+        analyze_fn=lambda side, cancel: object(),
+        encode_fn=encode or (lambda side, cancel: None),
+        on_finished=on_finished,
+        **kw,
+    ), sides
+
+
+def test_album_is_not_finished_while_a_side_is_still_working():
+    album, sides = _finishing_controller()
+    assert album.finished is False
+    album.start()
+    _wait_until(lambda: all(s.state == SideState.READY for s in sides))
+    # Analysis is done, but nobody has accepted anything: the album is not over.
+    assert album.finished is False
+
+
+def test_every_side_done_finishes_the_album_and_summarises():
+    seen = []
+    album, sides = _finishing_controller(on_finished=seen.append)
+    album.start()
+    _wait_until(lambda: all(s.state == SideState.READY for s in sides))
+    for s in sides:
+        album.accept_side(s.index, [1.0])
+
+    assert _wait_until(lambda: album.finished), "album never concluded"
+    assert _wait_until(lambda: len(seen) == 1), "on_finished did not fire"
+    assert all(s.state == SideState.DONE for s in sides)
+
+    summary = seen[0]
+    assert (summary.done, summary.error, summary.cancelled) == (2, 0, 0)
+    assert summary.describe() == "Album complete: 2 sides done."
+
+
+def test_finish_fires_exactly_once_even_when_sides_race():
+    """Two pools can observe the last terminal state at the same instant."""
+    seen = []
+    album, sides = _finishing_controller(n=4, on_finished=seen.append,
+                                         max_encode_workers=4)
+    album.start()
+    _wait_until(lambda: all(s.state == SideState.READY for s in sides))
+    for s in sides:
+        album.accept_side(s.index, [1.0])
+
+    assert _wait_until(lambda: album.finished)
+    time.sleep(0.15)                     # let any second firing land
+    assert len(seen) == 1                # claimed once, not once per side
+
+
+def test_a_failed_side_still_finishes_the_album_and_is_counted():
+    def encode(side, cancel):
+        if side.index == 1:
+            raise RuntimeError("ffmpeg fell over")
+
+    seen = []
+    album, sides = _finishing_controller(encode=encode, on_finished=seen.append)
+    album.start()
+    _wait_until(lambda: all(s.state == SideState.READY for s in sides))
+    for s in sides:
+        album.accept_side(s.index, [1.0])
+
+    assert _wait_until(lambda: album.finished)
+    assert seen[0].describe() == "Album complete: 1 done, 1 error."
+    # "Finished" over a failed side would be a lie of omission.
+    assert seen[0].done == 1 and seen[0].error == 1
+
+
+def test_cancelling_everything_also_finishes_the_album():
+    album, sides = _finishing_controller()
+    seen = []
+    album._on_finished = seen.append
+    album.cancel_all()                   # before anything starts: all waiting
+
+    assert _wait_until(lambda: album.finished)
+    assert seen[0].describe() == "Album complete: 2 cancelled."
+
+
+def test_unmapped_sides_finish_the_album_immediately():
+    seen = []
+    sides = [SideJob(index=0, label="Side A", wav_path=None)]
+    album = AlbumController(sides, lambda s, c: object(), lambda s, c: None,
+                            on_finished=seen.append)
+    album.start()                        # ERROR on setup, and that is terminal
+    assert album.finished
+    assert seen[0].describe() == "Album complete: 1 error."
+
+
+def test_retrying_after_the_album_finished_lets_it_finish_again():
+    """A retry re-opens a concluded job; it has to be able to conclude twice."""
+    calls = []
+
+    def encode(side, cancel):
+        calls.append(side.index)
+        if len(calls) == 1:
+            raise RuntimeError("transient")
+
+    seen = []
+    album, sides = _finishing_controller(n=1, encode=encode, on_finished=seen.append)
+    album.start()
+    _wait_until(lambda: sides[0].state == SideState.READY)
+    album.accept_side(0, [1.0])
+    assert _wait_until(lambda: album.finished)
+    assert seen[0].error == 1
+
+    assert album.retry_side(0) is True
+    assert album.finished is False        # re-opened
+    _wait_until(lambda: sides[0].state == SideState.READY)
+    album.accept_side(0, [1.0])
+    assert _wait_until(lambda: album.finished)
+    assert len(seen) == 2 and seen[1].done == 1
+
+
+def test_summary_describes_a_single_side_in_the_singular():
+    assert AlbumSummary(done=1).describe() == "Album complete: 1 side done."
+    assert AlbumSummary(done=3).describe() == "Album complete: 3 sides done."
+    assert AlbumSummary().describe() == "Album complete: no sides."
+    assert AlbumSummary(done=1, cancelled=2).describe() == (
+        "Album complete: 1 done, 2 cancelled.")

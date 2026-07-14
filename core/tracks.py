@@ -21,6 +21,44 @@ from pathlib import Path
 _INVALID_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|]')
 
 
+def track_filename(track_name: str, track_num: int, *, file_index: int | None = None,
+                   side_letter: str = "", use_side_letters: bool = False) -> str:
+    """``[NN] - name.flac``, with 2-digit zero padding.
+
+    Three numbering styles, chosen by the arguments given -- all of them
+    *filename-only*, none of them visible in the tags:
+
+    * ``use_side_letters`` + a ``side_letter`` -> ``[A01]``, ``[B01]`` -- the
+      per-side number, prefixed by its side. Unique across an album because the
+      letter disambiguates.
+    * ``file_index`` set -> ``[01]``..``[NN]`` continuing across sides. This is
+      what album jobs use: every side lands in one flat folder, so the number has
+      to be album-wide even though TRACKNUMBER stays per-side.
+    * neither -> ``[NN]`` from ``track_num``. The single-side default.
+
+    A free function rather than only a method, because an album job has to know
+    what it is about to write *before* it has cut any segments -- that is how it
+    can say "6 files already exist in the destination" instead of finding out by
+    overwriting them.
+
+    The title is sanitized for the filesystem (so a pasted title like
+    ``"Intro / Outro"`` cannot produce an invalid path); the *tags* keep the
+    original, unsanitized title. Falls back to ``Track NN`` if sanitizing leaves
+    nothing.
+    """
+    name = sanitize_filename_component(track_name)
+    if not name:
+        name = f"Track {int(track_num):02d}"
+
+    if use_side_letters and side_letter:
+        number = f"{side_letter}{int(track_num):02d}"
+    elif file_index is not None:
+        number = f"{int(file_index):02d}"
+    else:
+        number = f"{int(track_num):02d}"
+    return f"[{number}] - {name}.flac"
+
+
 def sanitize_filename_component(name: str) -> str:
     """Make ``name`` safe as a Windows filename component.
 
@@ -77,34 +115,17 @@ class Tracks:
     def filename(self) -> str:
         """Output filename: ``[NN] - name.flac`` with 2-digit zero padding.
 
-        Three numbering styles, chosen by the fields set on this track -- all of
-        them *filename-only*, none of them visible in the tags:
-
-        * ``use_side_letters`` + a ``side_letter`` -> ``[A01]``, ``[B01]`` --
-          the per-side number, prefixed by its side. Unique across an album
-          because the letter disambiguates.
-        * ``file_index`` set -> ``[01]``..``[NN]`` continuing across sides. This
-          is what album jobs use: every side lands in one flat folder, so the
-          number has to be album-wide even though TRACKNUMBER stays per-side.
-        * neither -> ``[NN]`` from :attr:`track_num`. The single-side default,
-          unchanged.
-
-        The title is sanitized for the filesystem (so a pasted title like
-        ``"Intro / Outro"`` cannot produce an invalid path); the *tags* keep the
-        original, unsanitized title. Falls back to ``Track NN`` if sanitizing
-        leaves nothing.
+        See :func:`track_filename` for the numbering styles. This is a thin
+        delegation on purpose: an album job needs to know what filenames it is
+        *about* to write before it has cut a single segment (to warn about
+        overwriting), and a second implementation of this would drift.
         """
-        name = sanitize_filename_component(self.track_name)
-        if not name:
-            name = f"Track {self.track_num:02d}"
-
-        if self.use_side_letters and self.side_letter:
-            number = f"{self.side_letter}{self.track_num:02d}"
-        elif self.file_index is not None:
-            number = f"{self.file_index:02d}"
-        else:
-            number = f"{self.track_num:02d}"
-        return f"[{number}] - {name}.flac"
+        return track_filename(
+            self.track_name, self.track_num,
+            file_index=self.file_index,
+            side_letter=self.side_letter,
+            use_side_letters=self.use_side_letters,
+        )
 
     def tags(self) -> dict[str, str]:
         """Metadata tags for the encoder.
