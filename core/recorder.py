@@ -1,10 +1,12 @@
 """Capture from an input device straight to disk. GUI-free.
 
 The appliance frame: the only decisions a user makes are *which input* (once) and
-*press Record*. There is no monitoring here (Windows' own "Listen to this device"
-does that better), no live waveform, no editing. What this module owes the caller
-is a WAV that is honest -- correct length, correct format, and loud about any way
-in which it might be damaged.
+*press Record*. Capture shows no live waveform and does no editing. Optional
+software monitoring -- hearing the input on an output device -- lives in
+:class:`Passthrough`, deliberately a separate object from :class:`Recorder` with
+its own streams and buffer, so a monitor glitch can never touch a capture. What
+this module owes the caller is a WAV that is honest -- correct length, correct
+format, and loud about any way in which it might be damaged.
 
 Three things it is careful about:
 
@@ -30,6 +32,7 @@ import shutil
 import tempfile
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -141,6 +144,30 @@ def list_input_devices() -> list[DeviceInfo]:
             hostapi=str(hostapis[dev["hostapi"]]["name"]),
             samplerate=int(dev["default_samplerate"]),
             max_channels=int(dev["max_input_channels"]),
+        ))
+    devices.sort(key=lambda d: (not d.is_wasapi, d.name.lower()))
+    return devices
+
+
+def list_output_devices() -> list[DeviceInfo]:
+    """Every output device, WASAPI first on Windows -- for software monitoring.
+
+    Mirror of :func:`list_input_devices`, filtered to devices with an output
+    channel. ``max_channels`` here is the output channel count.
+    """
+    import sounddevice as sd
+
+    hostapis = sd.query_hostapis()
+    devices: list[DeviceInfo] = []
+    for index, dev in enumerate(sd.query_devices()):
+        if dev["max_output_channels"] < 1:
+            continue
+        devices.append(DeviceInfo(
+            index=index,
+            name=str(dev["name"]),
+            hostapi=str(hostapis[dev["hostapi"]]["name"]),
+            samplerate=int(dev["default_samplerate"]),
+            max_channels=int(dev["max_output_channels"]),
         ))
     devices.sort(key=lambda d: (not d.is_wasapi, d.name.lower()))
     return devices
@@ -611,3 +638,145 @@ class LevelMonitor:
             stream.close()
         except Exception as exc:
             self.error = self.error or f"{type(exc).__name__}: {exc}"
+
+
+class Passthrough:
+    """Software monitoring: pass an input device through to an output device, so
+    you can hear what you are capturing without Windows' "Listen to this device".
+
+    Wholly independent of :class:`Recorder` -- its own input stream, its own output
+    stream, its own buffer. It never touches a recording's stats, queue, or file,
+    so a monitor glitch (an output underrun, a vanished speaker) is *structurally*
+    unable to affect a capture: the worst it can do is fall silent.
+
+    The bridge is a small bounded ring of blocks. The input callback appends a copy
+    and returns -- it never blocks; a full ring drops its oldest block, which bounds
+    latency. The output callback pops a block, or fills silence on underrun -- it
+    never waits. Input and output run at the same samplerate, channel count and
+    blocksize, so the ring is a plain block FIFO. Streams are injectable
+    (``input_factory``/``output_factory``) so tests need no real audio device.
+    """
+
+    def __init__(
+        self,
+        *,
+        input_factory: Callable | None = None,
+        output_factory: Callable | None = None,
+        blocksize: int = 1024,
+        ring_blocks: int = 3,
+    ) -> None:
+        self._input_factory = input_factory
+        self._output_factory = output_factory
+        self._blocksize = int(blocksize)
+        self._ring: deque = deque(maxlen=max(1, int(ring_blocks)))
+        self._channels = 0
+        self._in_stream = None
+        self._out_stream = None
+        self.error = ""
+        self.underruns = 0      # output callbacks that found the ring empty
+        self.dropped = 0        # input blocks dropped because the ring was full
+        self.latency_s = 0.0    # PortAudio-reported round-trip + ring depth, at start()
+
+    @property
+    def running(self) -> bool:
+        return self._in_stream is not None or self._out_stream is not None
+
+    def start(self, input_device: int, output_device: int, samplerate: int,
+              channels: int = 2) -> None:
+        """Open the streams and begin passing audio through.
+
+        Refuses (sets :attr:`error`, opens nothing) when input and output are the
+        same endpoint -- monitoring a device back into itself is a feedback trap.
+        A failure to open either stream is captured in :attr:`error`, never raised,
+        and leaves nothing half-open.
+        """
+        if self.running:
+            self.stop()
+        self.error = ""
+        self.underruns = 0
+        self.dropped = 0
+        self._ring.clear()
+        self._channels = max(1, int(channels))
+        if input_device == output_device:
+            self.error = "input and output are the same device (feedback risk)"
+            return
+
+        in_factory = self._input_factory
+        out_factory = self._output_factory
+        if in_factory is None or out_factory is None:
+            import sounddevice as sd
+
+            in_factory = in_factory or sd.InputStream
+            out_factory = out_factory or sd.OutputStream
+        try:
+            self._in_stream = in_factory(
+                device=input_device, channels=self._channels,
+                samplerate=int(samplerate), dtype="float32",
+                blocksize=self._blocksize, callback=self._input_callback,
+            )
+            self._out_stream = out_factory(
+                device=output_device, channels=self._channels,
+                samplerate=int(samplerate), dtype="float32",
+                blocksize=self._blocksize, callback=self._output_callback,
+            )
+            self._out_stream.start()
+            self._in_stream.start()
+            rate = float(samplerate) or 1.0
+            self.latency_s = (
+                float(getattr(self._in_stream, "latency", 0.0) or 0.0)
+                + float(getattr(self._out_stream, "latency", 0.0) or 0.0)
+                + self._ring.maxlen * self._blocksize / rate)
+        except Exception as exc:
+            self.error = f"{type(exc).__name__}: {exc}"
+            self.stop()
+
+    def _input_callback(self, indata, frames, time_info, status) -> None:
+        """Realtime input thread: copy the block into the ring and return.
+
+        Never blocks; a full ring drops its oldest block (deque maxlen), bounding
+        latency at the cost of a click when the output cannot keep up.
+        """
+        try:
+            if len(self._ring) == self._ring.maxlen:
+                self.dropped += 1
+            block = np.array(indata, dtype=np.float32, copy=True)
+            if block.ndim == 1:
+                block = block.reshape(-1, 1)
+            self._ring.append(block)
+        except Exception as exc:               # a raise here would kill the stream
+            self.error = f"{type(exc).__name__}: {exc}"
+
+    def _output_callback(self, outdata, frames, time_info, status) -> None:
+        """Realtime output thread: fill from the ring, or silence on underrun."""
+        try:
+            block = self._ring.popleft()
+        except IndexError:
+            outdata.fill(0)
+            self.underruns += 1
+            return
+        except Exception as exc:
+            outdata.fill(0)
+            self.error = f"{type(exc).__name__}: {exc}"
+            return
+        if block.shape == outdata.shape:
+            outdata[:] = block
+        else:
+            # Defensive: a size mismatch fills what fits and zeros the rest rather
+            # than raise on the realtime thread.
+            outdata.fill(0)
+            rows = min(block.shape[0], outdata.shape[0])
+            cols = min(block.shape[1], outdata.shape[1])
+            outdata[:rows, :cols] = block[:rows, :cols]
+
+    def stop(self) -> None:
+        for attr in ("_in_stream", "_out_stream"):
+            stream = getattr(self, attr)
+            setattr(self, attr, None)
+            if stream is None:
+                continue
+            try:
+                stream.stop()
+                stream.close()
+            except Exception as exc:
+                self.error = self.error or f"{type(exc).__name__}: {exc}"
+        self._ring.clear()

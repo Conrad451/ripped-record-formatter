@@ -116,6 +116,15 @@ class Config:
     record_output_dir: str = ""
     record_next_file: str = "SideA.wav"
 
+    # --- software monitoring (input passthrough to an output device) ---
+    monitor_enabled: bool = False
+    """Opt-in: pass the input through to an output device so you can hear the
+    record without Windows' 'Listen to this device'. The interface's own
+    headphone jack is still the zero-latency option."""
+
+    monitor_device: str = ""
+    """Output device for passthrough, remembered by NAME (like record_device)."""
+
     # --- audition playback ---
     preview_lead_in_s: float = 5.0
     """Preview a cut by playing from this many seconds before it, straight
