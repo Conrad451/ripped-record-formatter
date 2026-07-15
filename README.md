@@ -26,7 +26,7 @@ You play a record into it and get a finished album back. Ripped Record Formatter
 
 **Download it.** Grab the release zip, extract it anywhere, and run `RippedRecordFormatter.exe`. No Python, no ffmpeg, no installer — ffmpeg is bundled inside, and nothing is written outside the folder you extract.
 
-The build is not code-signed, so Windows SmartScreen will warn you the first time: click *More info* → *Run anyway*. The download is around 470 MB, most of which is ffmpeg and Qt.
+The build is not code-signed, so Windows SmartScreen will warn you the first time: click *More info* → *Run anyway*. The download is around 188 MB and extracts to about 470 MB, most of which is ffmpeg and Qt.
 
 It is unsigned because code-signing economics are absurd for a personal tool — a certificate costs more per year than this project will ever cost to run. Verify your download against the **SHA-256 published with each release** instead: `Get-FileHash RippedRecordFormatter-<version>-win64.zip -Algorithm SHA256`, and check it matches the hash in the release notes.
 
@@ -57,6 +57,15 @@ The happy path — start at **Record** if you are playing the record now, or at 
 A single WAV is just a one-row mapping table — use **Add single WAV…** instead of selecting a folder; everything after that is identical.
 
 **Convert** and **Re-tag** are the simpler tabs for WAVs that are already one-file-per-track, or FLACs that just need their tags rewritten.
+
+## Setting up your turntable
+
+Getting a record into the computer needs one amplifier between the turntable and the PC — **exactly one**, and that is the thing people most often get wrong.
+
+- **One preamp, not two.** A record needle puts out a tiny "phono" signal that has to be boosted to normal "line" level before recording. That boost must happen *once* — either inside the turntable (many have a PHONO/LINE switch on the back), or in the little USB box you plug into, or in a separate phono preamp — but never two in a row. Two boosts make the sound painfully loud and distorted; none makes it far too quiet. If your turntable has the switch and your USB box also amplifies, set the turntable to **LINE** so only one of them is boosting.
+- **A simple USB box works well.** A Behringer **UCA202** or **UFO202** is an inexpensive, well-behaved way to get a turntable into a computer over USB. The UFO202 has a built-in phono preamp and a headphone jack, so it can be the "one preamp" on its own.
+- **Set the rate to 44,100 Hz, once.** Windows often reports a line input at 48,000 or even 192,000 Hz; for vinyl you want 44,100. On the Record tab, **Check my setup** flags this and offers a one-click fix, and it is remembered after that.
+- **Then set the volume.** Play the loudest song on the record and adjust the volume until the moving level line stays below the dashed one — then you're ready to record.
 
 ## Recording
 
