@@ -213,7 +213,10 @@ class BatchPanel(QWidget):
 
         max_workers = self.settings.config.encode_workers
         if self.kind == "convert":
-            kwargs = {"max_workers": max_workers}
+            # A plain Convert encodes without restoration, so provenance is
+            # known: RRF_RESTORATION is `none` (an empty stage list), RRF_VERSION
+            # is stamped. Re-tag, below, never touches RRF fields.
+            kwargs = {"max_workers": max_workers, "restoration_stages": []}
             if self._cover is not None:
                 kwargs["cover"] = self._cover
             return converter.convert_wavs_to_flacs, tracks, Path(output), kwargs

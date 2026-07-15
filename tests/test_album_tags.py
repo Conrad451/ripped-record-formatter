@@ -27,6 +27,7 @@ from mutagen.flac import FLAC
 
 from core.album import SideState
 from core.metadata_lookup import CoverArt, MediumInfo, ReleaseDetail, TrackInfo
+from core.version import __version__
 
 SR = 44100
 
@@ -87,8 +88,12 @@ def _wait(predicate, timeout=90.0):
     return False
 
 
-def _run_album(qapp, tmp_path, edit=None):
-    """Drive a full two-side album job and return the output dir."""
+def _run_album(qapp, tmp_path, edit=None, config_hook=None):
+    """Drive a full two-side album job and return the output dir.
+
+    ``config_hook(cfg)`` runs after the defaults below, so a test can re-enable
+    specific restoration stages to exercise provenance through the real seam.
+    """
     from gui.main_window import MainWindow
 
     fr = MainWindow().full_rip
@@ -102,6 +107,8 @@ def _run_album(qapp, tmp_path, edit=None):
     # asserts on rather than inheriting whatever the developer has set.
     cfg.filename_side_letters = False
     cfg.encode_workers = 2
+    if config_hook is not None:
+        config_hook(cfg)
 
     fr._apply_release(_release())
 
@@ -189,12 +196,34 @@ def test_album_path_writes_full_tags_and_cover(qapp, tmp_path):
         assert f["musicbrainz_recordingid"] == [want["recording"]], name
         assert f["musicbrainz_trackid"] == [want["track"]], name
 
+        # --- provenance: stamped at encode; stages are off here, so `none` ---
+        assert f["rrf_version"] == [__version__], name
+        assert f["rrf_restoration"] == ["none"], name
+
         # --- embedded front cover ---
         assert f.pictures, f"{name}: no embedded picture"
         pic = f.pictures[0]
         assert pic.type == 3, name          # front cover
         assert pic.mime == "image/jpeg", name
         assert pic.data == COVER_BYTES, name
+
+
+def test_album_path_stamps_actual_restoration_provenance(qapp, tmp_path):
+    """RRF_RESTORATION reflects the real Stage objects the side was restored
+    with -- threaded from _album_analyze through to the converter -- not config
+    or a placeholder. Rumble + hum here (fast, ffmpeg-free numpy filters)."""
+    def enable(cfg):
+        cfg.rumble_enabled = True
+        cfg.hum_enabled = True                    # noise/declick stay off: fast, no ffmpeg
+
+    out = _run_album(qapp, tmp_path, config_hook=enable)
+
+    produced = sorted(p.name for p in out.glob("*.flac"))
+    assert len(produced) == 4, produced
+    for name in produced:
+        f = FLAC(str(out / name))
+        assert f["rrf_version"] == [__version__], name
+        assert f["rrf_restoration"] == ["rumble(25Hz,o4);hum(60Hz,h4)"], name
 
 
 def test_album_encode_warnings_are_surfaced(qapp, tmp_path, monkeypatch):

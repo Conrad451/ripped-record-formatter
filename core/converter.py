@@ -67,6 +67,54 @@ def _write_vorbis_tags(flac_path: Path, tags: dict) -> None:
     flac.save()
 
 
+def _rrf_tags(restoration_stages) -> dict:
+    """Provenance Vorbis comments for a freshly *encoded* FLAC.
+
+    Every FLAC the app encodes carries a signature of how it was made:
+
+    * ``RRF_VERSION`` -- the app version that did the encoding.
+    * ``RRF_RESTORATION`` -- a stable, parseable summary of the restoration
+      actually applied to the audio (:func:`core.restoration.format_restoration`),
+      or the literal ``none`` when it was encoded without restoration.
+
+    ``restoration_stages`` is the actual list of restoration ``Stage`` objects
+    applied to this audio -- an empty list means "encoded, no restoration"
+    (renders ``none``). ``None`` means the caller genuinely does not know how the
+    audio was made, so nothing is written -- the same absent-writes-nothing rule
+    as every other field.
+    """
+    if restoration_stages is None:
+        return {}
+    from core.restoration import format_restoration
+    from core.version import __version__
+
+    return {
+        "rrf_version": __version__,
+        "rrf_restoration": format_restoration(restoration_stages),
+    }
+
+
+def _read_rrf(flac_path: Path) -> dict:
+    """Existing ``RRF_*`` provenance on a FLAC, lower-cased key -> value.
+
+    Re-tagging edits metadata; it does not re-process audio, so it must never
+    touch provenance -- whatever the original encode stamped has to survive a
+    re-tag untouched (:func:`_write_vorbis_tags` clears all comments before
+    rewriting, so the re-tag path reads these first and carries them forward).
+    Returns ``{}`` for a file with no RRF fields (e.g. a pre-app rip), so
+    re-tagging such a file adds none and leaves it honestly un-stamped.
+    """
+    from mutagen.flac import FLAC
+
+    flac = FLAC(str(flac_path))
+    preserved = {}
+    for key in flac.keys():
+        if key.lower().startswith("rrf_"):
+            values = flac[key]
+            preserved[key.lower()] = values[0] if values else ""
+    return preserved
+
+
 @dataclass
 class TrackOutcome:
     """What happened to a single track during a batch operation."""
@@ -159,6 +207,7 @@ def convert_wavs_to_flacs(
     cover: "CoverArt | None" = None,
     max_workers: int = 1,
     should_cancel=None,
+    restoration_stages=None,
 ) -> BatchResult:
     """Convert each track's source WAV to a tagged FLAC in ``output_dir``.
 
@@ -168,6 +217,11 @@ def convert_wavs_to_flacs(
     configured pydub. If ``cover`` is given it is embedded as the front cover of
     every track; a failure to embed becomes a per-track warning and never fails
     the batch. ``should_cancel`` is polled before each track is submitted.
+
+    ``restoration_stages`` carries provenance (see :func:`_rrf_tags`): the actual
+    ``Stage`` objects applied to this audio (empty list -> ``RRF_RESTORATION`` is
+    ``none``), or ``None`` (the default) to write no ``RRF_*`` fields at all. All
+    tracks in one call share the same restoration, so it is formatted once.
     """
     if configure:
         from core.ffmpeg_locator import configure_pydub
@@ -176,6 +230,7 @@ def convert_wavs_to_flacs(
     from pydub import AudioSegment
 
     out_dir = _prepare_output_dir(output_dir)
+    rrf = _rrf_tags(restoration_stages)
 
     def work(track):
         dest = out_dir / track.filename()
@@ -183,7 +238,7 @@ def convert_wavs_to_flacs(
         audio.export(str(dest), format="flac", tags=track.tags())
         outcome = TrackOutcome(track=track, output_path=dest)
         try:
-            _write_vorbis_tags(dest, track.vorbis_tags())
+            _write_vorbis_tags(dest, {**track.vorbis_tags(), **rrf})
         except Exception as exc:
             outcome.warnings.append(f"Could not write tags: {exc}")
         if cover is not None:
@@ -217,6 +272,11 @@ def retag_flacs(
     as the front cover; embed failures become per-track warnings, never batch
     failures. ``max_workers``/``should_cancel`` behave as in
     :func:`convert_wavs_to_flacs`.
+
+    Re-tagging never touches ``RRF_*`` provenance: it does not re-process audio,
+    so any ``RRF_VERSION``/``RRF_RESTORATION`` the original encode wrote is read
+    from the source and carried forward unchanged. A source with no RRF fields
+    stays un-stamped.
     """
     if configure:
         from core.ffmpeg_locator import configure_pydub
@@ -229,11 +289,18 @@ def retag_flacs(
     def work(track):
         source = Path(track.track_wav_loc)
         dest = out_dir / track.filename()
+        # Read provenance from the source *before* export overwrites it (dest may
+        # resolve to the same path). Best-effort: a read failure just means no
+        # RRF is carried, never a failed re-tag.
+        try:
+            preserved_rrf = _read_rrf(source)
+        except Exception:
+            preserved_rrf = {}
         audio = AudioSegment.from_file(str(source), "flac")
         audio.export(str(dest), format="flac", tags=track.tags())
         outcome = TrackOutcome(track=track, output_path=dest)
         try:
-            _write_vorbis_tags(dest, track.vorbis_tags())
+            _write_vorbis_tags(dest, {**track.vorbis_tags(), **preserved_rrf})
         except Exception as exc:
             outcome.warnings.append(f"Could not write tags: {exc}")
         if cover is not None:

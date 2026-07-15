@@ -250,6 +250,74 @@ class Declick(Stage):
 
 
 # --------------------------------------------------------------------------- #
+# Provenance -- a stable, parseable summary of the restoration applied
+# --------------------------------------------------------------------------- #
+def _fmt_g(value: float) -> str:
+    """Shortest stable form: integer when whole (``25``), else minimal decimal
+    (``0.5``, ``22.5``). Used for frequencies (Hz) and noise strength."""
+    return f"{float(value):g}"
+
+
+def _fmt_secs(value: float) -> str:
+    """Seconds, always one decimal place (``0.0``, ``2.0``) -- fixed so a
+    profile window renders identically every run."""
+    return f"{float(value):.1f}"
+
+
+def _format_stage(stage: Stage) -> str:
+    if isinstance(stage, RumbleFilter):
+        return f"rumble({_fmt_g(stage.cutoff_hz)}Hz,o{int(stage.order)})"
+    if isinstance(stage, HumRemoval):
+        return f"hum({_fmt_g(stage.base_freq)}Hz,h{int(stage.harmonics)})"
+    if isinstance(stage, NoiseReduction):
+        return (f"noise({_fmt_g(stage.strength)},"
+                f"profile={_fmt_secs(stage.profile_start)}+"
+                f"{_fmt_secs(stage.profile_duration)}s)")
+    if isinstance(stage, Declick):
+        return "declick"
+    # Unknown/future stage: a param-less, whitespace-free slug of its name so the
+    # field never crashes an encode. The four stages above are the documented set.
+    return "".join(str(getattr(stage, "name", "stage")).lower().split())
+
+
+def format_restoration(stages: list[Stage]) -> str:
+    """A compact, stable, human-readable summary of restoration provenance.
+
+    This describes *how the audio in a file was made* so a future reader can
+    parse it back years later. It is derived from the actual :class:`Stage`
+    objects that processed the audio -- never from config, which may have changed
+    between analysis and encode.
+
+    STABLE FORMAT (v1) -- do not reorder fields, rename tokens, or change
+    separators/number formatting without introducing a new version. Parsers
+    depend on it.
+
+    * The value is either the literal string ``none`` (the audio was encoded
+      without restoration) or one or more *stage tokens* joined by ``;``
+      (semicolon), in the order the stages were applied. There are no spaces
+      anywhere in the value.
+    * Each stage token is ``name`` or ``name(params)``:
+
+        - ``rumble(<cutoff>Hz,o<order>)``                e.g. ``rumble(25Hz,o4)``
+        - ``hum(<freq>Hz,h<harmonics>)``                 e.g. ``hum(60Hz,h4)``
+        - ``noise(<strength>,profile=<start>+<duration>s)``
+                                            e.g. ``noise(0.5,profile=0.0+2.0s)``
+        - ``declick``                                    (no params)
+
+    * Number formatting is fixed: frequencies (Hz) and strength use the shortest
+      form -- an integer when whole (``25``, ``60``), else a minimal decimal
+      (``0.5``, ``22.5``); profile times (seconds) always carry one decimal place
+      (``0.0``, ``2.0``); orders and harmonic counts are plain integers.
+    * A full default chain renders as::
+
+        rumble(25Hz,o4);hum(60Hz,h4);noise(0.5,profile=0.0+2.0s);declick
+    """
+    if not stages:
+        return "none"
+    return ";".join(_format_stage(stage) for stage in stages)
+
+
+# --------------------------------------------------------------------------- #
 # Orchestrator
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
