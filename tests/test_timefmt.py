@@ -2,7 +2,7 @@
 
 import pytest
 
-from core.timefmt import format_timestamp, tick_decimals_for_span
+from core.timefmt import format_size, format_timestamp, tick_decimals_for_span
 
 
 @pytest.mark.parametrize(
@@ -67,3 +67,24 @@ def test_tight_zoom_produces_distinct_labels():
     fine = [format_timestamp(t, decimals) for t in ticks]
     assert len(set(fine)) == len(ticks)            # distinct again
     assert fine == ["0:12.00", "0:12.10", "0:12.20", "0:12.30"]
+
+
+# --------------------------------------------------------------------------- #
+# File-size formatting for the summary card
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "num_bytes,expected",
+    [
+        (0, "0 B"),
+        (512, "512 B"),
+        (1023, "1023 B"),
+        (1024, "1.0 KB"),
+        (1536, "1.5 KB"),
+        (25_500_000, "24.3 MB"),
+        (5 * 1024**3, "5.0 GB"),
+        (3 * 1024**4, "3.0 TB"),
+        (-10, "0 B"),            # clamps
+    ],
+)
+def test_format_size(num_bytes, expected):
+    assert format_size(num_bytes) == expected

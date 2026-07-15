@@ -30,7 +30,7 @@ import re
 import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Callable
@@ -63,16 +63,57 @@ _RETRYABLE = {SideState.ERROR, SideState.NEEDS_ATTENTION}
 
 
 @dataclass(frozen=True)
+class SideSummary:
+    """A finished side's receipt -- what was written, how big, how long, and any
+    warnings. Captured once at side completion (see :func:`measure_outputs`), so
+    the GUI card is a pure view and never re-walks the output folder. Qt-free.
+
+    An errored/cancelled side that never wrote anything still gets a
+    :class:`SideSummary`, carrying only its ``index``/``label``/``state`` -- the
+    card shows it honestly rather than omitting it.
+    """
+
+    index: int
+    label: str
+    state: "SideState"
+    track_count: int = 0
+    output_paths: tuple[Path, ...] = ()
+    total_bytes: int = 0
+    duration_s: float = 0.0
+    warnings: tuple[str, ...] = ()
+    warned_tracks: int = 0
+    """How many *tracks* carried at least one warning (not the warning count)."""
+
+
+@dataclass(frozen=True)
 class AlbumSummary:
-    """How an album ended. Every side is counted exactly once."""
+    """How an album ended. Every side is counted exactly once.
+
+    The three integer counts and :meth:`describe` are the original contract (the
+    one-line log). :attr:`sides` adds the per-side receipts the summary card
+    renders; the roll-up properties derive album totals from them.
+    """
 
     done: int = 0
     error: int = 0
     cancelled: int = 0
+    sides: tuple[SideSummary, ...] = ()
 
     @property
     def total(self) -> int:
         return self.done + self.error + self.cancelled
+
+    @property
+    def total_bytes(self) -> int:
+        return sum(s.total_bytes for s in self.sides)
+
+    @property
+    def warnings(self) -> tuple[str, ...]:
+        return tuple(w for s in self.sides for w in s.warnings)
+
+    @property
+    def warned_tracks(self) -> int:
+        return sum(s.warned_tracks for s in self.sides)
 
     def describe(self) -> str:
         """One line for the log. Says what happened, not merely that it stopped.
@@ -93,6 +134,34 @@ class AlbumSummary:
         if self.cancelled:
             parts.append(f"{self.cancelled} cancelled")
         return f"Album complete: {', '.join(parts)}."
+
+
+def measure_outputs(paths) -> tuple[int, float]:
+    """Total size on disk (bytes) and total audio duration (seconds) for ``paths``.
+
+    Measured once, at side completion, while the files are fresh -- so the
+    summary card reads captured numbers rather than re-walking the output folder.
+    A missing or unreadable file is skipped, never fatal: a finished-album receipt
+    must not crash on one quirky file. ``soundfile`` is imported lazily so the
+    controller module stays cheap to import.
+    """
+    total_bytes = 0
+    total_s = 0.0
+    for path in paths:
+        path = Path(path)
+        try:
+            total_bytes += path.stat().st_size
+        except OSError:
+            pass
+        try:
+            import soundfile as sf
+
+            info = sf.info(str(path))
+            if info.samplerate:
+                total_s += float(info.frames) / info.samplerate
+        except Exception:
+            pass
+    return total_bytes, total_s
 
 
 class NeedsAttention(Exception):
@@ -125,6 +194,13 @@ class SideJob:
     """Per-track artists as the reviewer left them. Snapshotted at accept time
     alongside :attr:`titles`, so the review area can be handed to the next side
     immediately without the pending edits living on in the UI."""
+
+    result: "SideSummary | None" = None
+    """The side's encode receipt (output paths, sizes, duration, warnings),
+    populated by the encode callback at completion. ``None`` until it finishes,
+    and stays ``None`` for a side that errored or was cancelled before writing.
+    :meth:`AlbumController.summary` re-stamps its ``state`` from the authoritative
+    :attr:`state` at finish time."""
 
     # --- failure detail -----------------------------------------------------
     # An ERROR state that only says "error" is useless. Every failure records
@@ -281,11 +357,21 @@ class AlbumController:
 
     def summary(self) -> AlbumSummary:
         with self._lock:
-            states = [s.state for s in self.sides]
+            snapshot = [(s.index, s.label, s.state, s.result) for s in self.sides]
+        side_summaries = []
+        for index, label, state, result in snapshot:
+            if result is not None:
+                # Re-stamp the authoritative final state onto the receipt: the
+                # side may have been cancelled after it captured partial output.
+                side_summaries.append(replace(result, state=state))
+            else:
+                side_summaries.append(SideSummary(index=index, label=label, state=state))
+        states = [state for _, _, state, _ in snapshot]
         return AlbumSummary(
             done=sum(1 for s in states if s == SideState.DONE),
             error=sum(1 for s in states if s == SideState.ERROR),
             cancelled=sum(1 for s in states if s == SideState.CANCELLED),
+            sides=tuple(side_summaries),
         )
 
     def _claim_finish(self) -> bool:
