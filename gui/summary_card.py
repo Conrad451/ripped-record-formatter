@@ -63,12 +63,14 @@ class AlbumSummaryCard(QFrame):
         self._root = QVBoxLayout(self)
         self._destination: Path | None = None
         self._on_dismiss = None
+        self._on_rerun = None
 
         # Rebuilt on every render(); exposed for tests and callers.
         self.title_label: QLabel | None = None
         self.side_labels: list[QLabel] = []
         self.open_button: QPushButton | None = None
         self.dismiss_button: QPushButton | None = None
+        self.rerun_button: QPushButton | None = None
         self.warnings_button: QPushButton | None = None
         self.warnings_list: QLabel | None = None
 
@@ -82,10 +84,12 @@ class AlbumSummaryCard(QFrame):
         album: str = "",
         destination: Path | str | None = None,
         on_dismiss=None,
+        on_rerun=None,
     ) -> None:
         """Populate the card from ``summary``. Safe to call repeatedly."""
         self._destination = Path(destination) if destination else None
         self._on_dismiss = on_dismiss
+        self._on_rerun = on_rerun
         _clear_layout(self._root)
         self.side_labels = []
 
@@ -112,6 +116,17 @@ class AlbumSummaryCard(QFrame):
         subtitle.setStyleSheet("QLabel { color: palette(mid); }")
         titles.addWidget(subtitle)
         header.addLayout(titles, 1)
+
+        # Run again: the one-click do-over for the album you just finished, which
+        # is what makes the clean-slate reset safe. Only shown when a callback is
+        # wired (the tab has a snapshot to restore).
+        self.rerun_button = None
+        if self._on_rerun is not None:
+            self.rerun_button = QPushButton("Run this album again")
+            self.rerun_button.setToolTip(
+                "Restore this album's mapping and release so you can run it again.")
+            self.rerun_button.clicked.connect(self._rerun)
+            header.addWidget(self.rerun_button, 0, Qt.AlignmentFlag.AlignTop)
 
         self.dismiss_button = QPushButton("×")   # ×
         self.dismiss_button.setFixedSize(24, 24)
@@ -181,3 +196,7 @@ class AlbumSummaryCard(QFrame):
         self.setVisible(False)
         if self._on_dismiss is not None:
             self._on_dismiss()
+
+    def _rerun(self) -> None:
+        if self._on_rerun is not None:
+            self._on_rerun()

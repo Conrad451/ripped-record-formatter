@@ -13,15 +13,19 @@ are deliberately *not* exposed.
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
+from pathlib import Path
+
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QPushButton,
     QScrollArea,
     QSlider,
     QSpinBox,
@@ -31,6 +35,11 @@ from PySide6.QtWidgets import (
 )
 
 from core.metadata_lookup import MAX_CONTACT_LENGTH, sanitize_contact
+
+#: Post-album folder policy choices, mirrored from core.config.
+_POLICY_CHOICES = (("Keep last used", "keep"),
+                   ("Reset to default", "reset"),
+                   ("Clear", "clear"))
 
 
 class CollapsibleBox(QWidget):
@@ -117,6 +126,26 @@ class SettingsPanel(QWidget):
             "filename_side_letters", cfg.filename_side_letters))
         root.addWidget(basic_box)
 
+        # ---------------- Default folders ----------------
+        folders_box = QGroupBox("Default folders")
+        folders = QFormLayout(folders_box)
+        folders.addRow("Default source folder:",
+                       self._folder_row("default_source_dir", cfg.default_source_dir))
+        folders.addRow("When an album finishes, the source folder:",
+                       self._policy_combo("source_post_album_policy", cfg.source_post_album_policy))
+        folders.addRow("Default output folder:",
+                       self._folder_row("default_output_dir", cfg.default_output_dir))
+        folders.addRow("When an album finishes, the output folder:",
+                       self._policy_combo("output_post_album_policy", cfg.output_post_album_policy))
+        folders_hint = QLabel(
+            "The Artist/Album and the looked-up release are always cleared when an "
+            "album finishes -- no default is safe for identity. Only these folders "
+            "follow a policy.")
+        folders_hint.setWordWrap(True)
+        folders_hint.setStyleSheet("QLabel { color: palette(mid); }")
+        folders.addRow(folders_hint)
+        root.addWidget(folders_box)
+
         # ---------------- Metadata lookup ----------------
         lookup_box = QGroupBox("Metadata lookup")
         lookup = QFormLayout(lookup_box)
@@ -177,6 +206,40 @@ class SettingsPanel(QWidget):
         advanced.content_layout(adv)
         root.addWidget(advanced)
         root.addStretch(1)
+
+    # -- default-folder controls --------------------------------------------
+    def _folder_row(self, field: str, value: str) -> QWidget:
+        """A path line-edit + Browse button, both saving to ``field``."""
+        edit = QLineEdit(value)
+        edit.setPlaceholderText("(none)")
+        edit.editingFinished.connect(
+            lambda e=edit, f=field: self._save(**{f: e.text().strip()}))
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(lambda _=False, e=edit, f=field: self._browse_folder(e, f))
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(edit, 1)
+        row.addWidget(browse)
+        wrapper = QWidget()
+        wrapper.setLayout(row)
+        return wrapper
+
+    def _browse_folder(self, edit: QLineEdit, field: str) -> None:
+        start = edit.text().strip() or str(Path.home())
+        chosen = QFileDialog.getExistingDirectory(self, "Select a default folder", start)
+        if chosen:
+            edit.setText(chosen)
+            self._save(**{field: chosen})
+
+    def _policy_combo(self, field: str, value: str) -> QComboBox:
+        """keep / reset / clear, mirroring :data:`_POLICY_CHOICES`."""
+        combo = QComboBox()
+        for label, data in _POLICY_CHOICES:
+            combo.addItem(label, data)
+        combo.setCurrentIndex(max(0, combo.findData(value or "keep")))
+        combo.currentIndexChanged.connect(
+            lambda _i, f=field, c=combo: self._save(**{f: c.currentData()}))
+        return combo
 
     # -- persistence helpers -------------------------------------------------
     def _save(self, **fields) -> None:

@@ -144,17 +144,22 @@ def test_no_running_job_maps_only_and_starts_nothing(qapp, tmp_path, monkeypatch
     assert any("press Start album when ready" in m for m in logged)
 
 
-def test_a_finished_album_maps_the_late_side_without_admitting(qapp, tmp_path, monkeypatch):
+def test_a_late_side_recorded_at_conclusion_lands_via_the_defer(qapp, tmp_path, monkeypatch):
+    """A side still recording when the album concludes lands via the clean-slate
+    defer (9.7): the reset waits, so the WAV maps into the kept table rather than
+    being orphaned. The job already finished, so it maps -- it is not admitted."""
     fr, src = _tab(qapp, tmp_path, monkeypatch)
     _start_with_side_a(qapp, fr, src)
 
-    # Drive side A to completion so the album concludes and the tab releases it.
+    # Side B is being recorded when side A completes and the album concludes.
+    fr.set_recording_active(True)
     fr._album.accept_side(0, [1.0], ["So What"])
     assert _drain(qapp, lambda: fr._album is None)
+    assert fr.mapping_table.rowCount() == 1             # reset deferred: table kept
 
     logged: list[str] = []
     fr.logMessage.connect(logged.append)
     assert fr.add_recorded_wav(_wav(src / "SideB.wav")) is True
 
     assert fr._album is None                            # not restarted
-    assert fr.mapping_table.rowCount() == 2             # mapped only
+    assert fr.mapping_table.rowCount() == 2             # late side mapped into the table
