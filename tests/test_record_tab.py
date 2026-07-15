@@ -261,6 +261,7 @@ def test_a_recording_into_another_folder_is_not_adopted(qapp, tmp_path):
 
 def test_the_window_wires_the_handoff_end_to_end(qapp, tmp_path):
     """recordingFinished -> Full Rip mapping table, through MainWindow."""
+    from core.recorder import RecordingResult
     from gui.main_window import MainWindow
 
     w = MainWindow()
@@ -269,7 +270,9 @@ def test_the_window_wires_the_handoff_end_to_end(qapp, tmp_path):
     fr._rebuild_mapping_table()
 
     side_b = _side_wav(tmp_path / "SideB.wav")
-    w.record_tab.recordingFinished.emit(side_b)      # as a real stop would
+    result = RecordingResult(path=side_b, duration=1.0, samplerate=44100,
+                             subtype="PCM_16", max_peak_dbfs=-3.0, clip_runs=0)
+    w.record_tab.recordingFinished.emit(result)      # as a real stop would
     qapp.processEvents()
 
     assert fr.mapping_table.rowCount() == 2

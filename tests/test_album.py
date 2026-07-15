@@ -173,6 +173,96 @@ def test_pipelining_overlaps_analysis_with_review():
 
 
 # --------------------------------------------------------------------------- #
+# Admission: a late-arriving side joins a still-running job (record pipelining)
+# --------------------------------------------------------------------------- #
+def test_admit_side_queues_a_late_side_into_a_running_job():
+    a = SideJob(0, "Side A", Path("a.wav"))
+    gate = threading.Event()                      # hold analysis so the job stays open
+    ctrl = _controller([a], lambda s, c: (gate.wait(2), "ok")[1], lambda s, c: None,
+                       max_analysis_workers=2)
+    ctrl.start()
+    assert _wait_until(lambda: a.state == SideState.ANALYZING)
+
+    b = SideJob(1, "Side B", Path("b.wav"))
+    assert ctrl.admit_side(b) is True
+    assert b in ctrl.sides                        # appended to the live list
+    assert _wait_until(lambda: b.state == SideState.ANALYZING)   # it started analysing
+
+    gate.set()
+    assert _wait_until(lambda: a.state == SideState.READY and b.state == SideState.READY)
+    ctrl.shutdown(wait=True)
+
+
+def test_admit_side_is_refused_once_the_album_has_concluded():
+    """A finished album is finished: the late side is not admitted (map + re-run)."""
+    a = SideJob(0, "Side A", Path("a.wav"))
+    ctrl = _controller([a], lambda s, c: "ok", lambda s, c: None)
+    ctrl.start()
+    assert _wait_until(lambda: a.state == SideState.READY)
+    ctrl.accept_side(0, [1.0])
+    assert _wait_until(lambda: ctrl.finished)     # single side done -> concluded
+
+    b = SideJob(1, "Side B", Path("b.wav"))
+    assert ctrl.admit_side(b) is False
+    assert b not in ctrl.sides
+    ctrl.shutdown(wait=True)
+
+
+def test_admitting_before_conclusion_defers_the_finish_to_include_the_late_side():
+    """The design seam: a job whose existing sides all finish must not conclude
+    while a side admitted before conclusion is still in flight."""
+    a = SideJob(0, "Side A", Path("a.wav"))
+    finished: list = []
+    ctrl = AlbumController([a], lambda s, c: "ok", lambda s, c: None,
+                           on_finished=finished.append)
+    ctrl.start()
+    assert _wait_until(lambda: a.state == SideState.READY)
+
+    b = SideJob(1, "Side B", Path("b.wav"))
+    assert ctrl.admit_side(b) is True
+
+    ctrl.accept_side(0, [1.0])                     # A completes...
+    assert _wait_until(lambda: a.state == SideState.DONE)
+    # ...but B is still in flight, so the album has NOT concluded.
+    assert finished == []
+    assert not ctrl.finished
+
+    assert _wait_until(lambda: b.state == SideState.READY)
+    ctrl.accept_side(1, [1.0])
+    assert _wait_until(lambda: ctrl.finished)
+    assert len(finished) == 1                      # concluded exactly once...
+    assert finished[0].total == 2                  # ...counting both sides
+    ctrl.shutdown(wait=True)
+
+
+def test_cancel_all_covers_an_admitted_side():
+    a = SideJob(0, "Side A", Path("a.wav"))
+    gate = threading.Event()
+    ctrl = _controller([a], lambda s, c: (gate.wait(2), "ok")[1], lambda s, c: None,
+                       max_analysis_workers=2)
+    ctrl.start()
+    assert _wait_until(lambda: a.state == SideState.ANALYZING)
+    b = SideJob(1, "Side B", Path("b.wav"))
+    assert ctrl.admit_side(b) is True
+
+    ctrl.cancel_all()
+    gate.set()
+    assert _wait_until(lambda: all(s.state == SideState.CANCELLED for s in ctrl.sides))
+    assert b.state == SideState.CANCELLED          # the late side was cancelled too
+    ctrl.shutdown(wait=True)
+
+
+def test_admit_side_is_refused_when_the_index_is_already_present():
+    a = SideJob(0, "Side A", Path("a.wav"))
+    ctrl = _controller([a], lambda s, c: "ok", lambda s, c: None)
+    ctrl.start()
+    dup = SideJob(0, "Side A again", Path("a2.wav"))
+    assert ctrl.admit_side(dup) is False
+    assert dup not in ctrl.sides
+    ctrl.shutdown(wait=True)
+
+
+# --------------------------------------------------------------------------- #
 # Failures must say why -- and be retryable
 # --------------------------------------------------------------------------- #
 def test_analysis_failure_records_cause_phase_and_traceback():
