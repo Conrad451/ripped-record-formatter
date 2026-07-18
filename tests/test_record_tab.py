@@ -470,3 +470,18 @@ def test_setup_check_never_gates_recording(qapp, no_hardware, tmp_path):
     tab.device_combo.setCurrentIndex(_idx_by_name(tab.device_combo, "Line In"))
     tab._run_setup_check()                        # flags 192k
     assert tab.record_button.isEnabled()          # still recordable
+
+
+def test_monitor_and_setup_check_coexist_on_the_tab(qapp, no_hardware):
+    """v2.3.1 merge seam: the monitor toggle (9.4) and Check my setup (9.5) both
+    render on the Record tab, neither displaced by the other."""
+    from gui.main_window import MainWindow
+
+    tab = MainWindow().record_tab
+    # Monitoring controls (feature/monitor).
+    assert tab.monitor_check.isVisibleTo(tab)
+    assert tab.monitor_combo.isVisibleTo(tab)
+    # Setup-check controls (feature/first-run).
+    assert tab.check_button.isVisibleTo(tab)
+    assert tab.check_results is not None
+    assert tab.monitor_hint.isVisibleTo(tab)     # the hardware-jack hint, kept in the merge
