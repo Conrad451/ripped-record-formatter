@@ -21,6 +21,7 @@ from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -41,8 +42,10 @@ from core.recorder import (
 )
 from core.setup_check import INFO, OK, WARN, CheckResult, check_sample_rate, check_signal
 from core.timefmt import format_timestamp
+from core.tracks import safe_part
 from gui.level_history import LevelHistoryStrip
 from gui.meters import LevelMeters
+from gui.release_preview import ReleasePreview
 
 #: Offered regardless of what the device claims natively -- a Realtek line input
 #: reports 192000 under WASAPI even when the whole chain is 44.1k.
@@ -53,13 +56,41 @@ _SIDE_RE = re.compile(r"^(?P<stem>.*?Side)(?P<letter>[A-Z])(?P<tail>.*)\.wav$",
                       re.IGNORECASE)
 
 
-def next_side_name(filename: str) -> str:
+def side_labels(release) -> list[str]:
+    """The release's *own* labels for its sides, where it has any.
+
+    MusicBrainz media usually carry no title for a vinyl side, in which case
+    this is a list of empty strings and naming falls back to plain lettering.
+    Only a medium that actually names itself gets to name a file.
+    """
+    if release is None:
+        return []
+    return [(getattr(m, "title", "") or "").strip() for m in release.media]
+
+
+def next_side_name(filename: str, labels: "list[str] | None" = None) -> str:
     """``SideA.wav`` -> ``SideB.wav``. Anything else gets a ``_2`` suffix bump.
 
     Naming is half the point of the tab: after a stop the field must already hold
     the name of the *next* thing you are about to record, because the physical
     act between them is flipping the record, not typing.
+
+    ``labels`` are the selected release's side labels, honoured where they exist.
+    They are advisory and never a limit: the release's side count says nothing
+    about how many sides are really on the platter (CD collapses and pressing
+    differences make it wrong often enough to distrust), so running past the end
+    of the list simply falls through to lettering rather than stopping or
+    complaining. See task 9.10's ruling: MusicBrainz content is trustworthy,
+    MusicBrainz shape is advisory.
     """
+    named = [lbl for lbl in (labels or []) if lbl]
+    if named:
+        stem = Path(filename).stem
+        for i, label in enumerate(named[:-1]):
+            if stem.lower() == safe_part(label).lower():
+                return f"{safe_part(named[i + 1])}.wav"
+        # Past the release's last named side: fall through, never cap.
+
     match = _SIDE_RE.match(filename)
     if match:
         letter = match.group("letter")
@@ -84,6 +115,9 @@ class RecordTab(QWidget):
     recordingFinished = Signal(object)          # RecordingResult
     #: Recording started/stopped -- the window makes the state unmissable.
     recordingStateChanged = Signal(bool)
+    #: "Done recording -- process this album": the user says the album is
+    #: finished. A bridge to the Full Rip tab, never a trigger for processing.
+    processAlbumRequested = Signal()
 
     def __init__(self, settings) -> None:
         super().__init__()
@@ -102,6 +136,21 @@ class RecordTab(QWidget):
         self._pending_check: list = []
         self._check_window_ms = 3000
         self._checked_device = None             # device we last auto-checked
+
+        # -- session/album state (9.10) ---------------------------------------
+        # The album the user has declared, if any. Optional throughout: an
+        # anonymous session is a first-class flow, not a degraded one.
+        self._release = None
+        #: Did the user type this folder themselves? A suggestion must never
+        #: overwrite a hand-entered path, so we only ever fill a field the user
+        #: has left alone.
+        self._folder_hand_edited = False
+        #: Completed recordings that actually landed in Full Rip's mapping this
+        #: session -- what arms the "process this album" bridge.
+        self._landed = 0
+        #: (side label, album name or None) for the most recent handoff, so the
+        #: post-stop summary line can say where the side went.
+        self._last_mapping = None
 
         root = QVBoxLayout(self)
 
@@ -206,11 +255,38 @@ class RecordTab(QWidget):
         out_box = QGroupBox("Destination")
         out_form = QFormLayout(out_box)
 
+        # --- album (optional) --------------------------------------------------
+        # Saying what is on the platter is worth doing *before* the capture, not
+        # after: it names the folder, names the files, and rides the handoff so
+        # Full Rip gets identity together with the audio. Entirely optional --
+        # leave it alone and the tab behaves exactly as it always has.
+        album_row = QHBoxLayout()
+        self.lookup_button = QPushButton("Look up release...")
+        self.lookup_button.setToolTip(
+            "Say which record you're about to play. Optional -- it fills in the "
+            "folder and file names, and carries over to Full Rip.")
+        self.lookup_button.clicked.connect(self._open_lookup)
+        album_row.addWidget(self.lookup_button)
+        self.clear_release_button = QPushButton("Clear")
+        self.clear_release_button.setVisible(False)
+        self.clear_release_button.clicked.connect(self._clear_release_clicked)
+        album_row.addWidget(self.clear_release_button)
+        # The preview shares the button's row rather than taking one of its own:
+        # hidden it costs nothing, and shown it grows the row it already had.
+        self.release_preview = ReleasePreview(thumb_size=40)
+        album_row.addWidget(self.release_preview, 1)
+        album_row.addStretch(1)
+        out_form.addRow("Album:", self._wrap(album_row))
+
         folder_row = QHBoxLayout()
         self.folder_edit = QLineEdit(cfg.record_output_dir)
         self.folder_edit.setPlaceholderText("Where the side WAVs are written")
         self.folder_edit.editingFinished.connect(
             lambda: self.settings.set(record_output_dir=self.folder_edit.text().strip()))
+        # textEdited fires only for *user* keystrokes, never for setText -- which
+        # is exactly the line between "the user chose this path" and "we offered
+        # it". Once hand-edited, no suggestion touches it again.
+        self.folder_edit.textEdited.connect(self._note_folder_hand_edited)
         folder_row.addWidget(self.folder_edit, 1)
         browse = QPushButton("Browse...")
         browse.clicked.connect(self._browse_folder)
@@ -239,6 +315,19 @@ class RecordTab(QWidget):
         self.size_label.setStyleSheet("QLabel { color: palette(mid); }")
         transport.addWidget(self.size_label)
         transport.addStretch(1)
+
+        # The end of the record-first flow. Stop finishes a *side*; this says the
+        # *album* is done -- the one judgement only the user can make, since a
+        # release's side count is too often wrong to infer it from (9.10 ruling).
+        # It carries the session over to Full Rip and stops there: a bridge, not
+        # a trigger.
+        self.process_button = QPushButton("Done recording — process this album")
+        self.process_button.setEnabled(False)
+        self.process_button.setToolTip(
+            "Take this session's recordings to the Full Rip tab, ready to "
+            "process. Nothing starts until you say so there.")
+        self.process_button.clicked.connect(self._request_process)
+        transport.addWidget(self.process_button)
         root.addLayout(transport)
         root.addStretch(1)
 
@@ -539,12 +628,105 @@ class RecordTab(QWidget):
         self.settings.set(record_samplerate=44100)
         self._run_setup_check()                      # re-check to show it took
 
+    # -- album (optional identity for the session) ----------------------------
+    @property
+    def release(self):
+        """The release the user declared for this session, or ``None``."""
+        return self._release
+
+    def _open_lookup(self) -> None:
+        """The existing MetadataPanel, opened as a modal. One lookup UI, reused."""
+        from gui.metadata_panel import MetadataPanel
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Look up release")
+        dialog.resize(760, 640)
+        layout = QVBoxLayout(dialog)
+        # Pass settings through so the panel sees the user's MusicBrainz contact.
+        panel = MetadataPanel(settings=self.settings)
+        panel.statusMessage.connect(self._log)
+        panel.releaseSelected.connect(
+            lambda detail: (self.apply_release(detail), dialog.accept()))
+        layout.addWidget(panel)
+        dialog.exec()
+
+    def apply_release(self, detail) -> None:
+        """Adopt ``detail`` as this session's album and offer what follows from it."""
+        self._release = detail
+        self.release_preview.set_release(detail)
+        self.clear_release_button.setVisible(True)
+        self._suggest_folder()
+        self._log(f"Record: recording {detail.artist} — {detail.title}.")
+
+    def clear_release(self) -> None:
+        """Forget the album. Called by the 9.7 clean slate when one concludes."""
+        self._release = None
+        self.release_preview.clear()
+        self.clear_release_button.setVisible(False)
+
+    def _clear_release_clicked(self) -> None:
+        self.clear_release()
+        self._log("Record: album cleared — recording without a release.")
+
+    def _note_folder_hand_edited(self, _text: str) -> None:
+        self._folder_hand_edited = True
+
+    def _folder_root(self) -> str:
+        """The trunk that derived folders hang off.
+
+        The configured output root wins; failing that, whatever folder the tab is
+        already pointed at. Suggestions are never written back to settings, so
+        this stays a root rather than creeping down into the last album's folder.
+        """
+        cfg = self.settings.config
+        return (cfg.default_output_dir or cfg.record_output_dir
+                or self.folder_edit.text().strip())
+
+    def _suggest_folder(self) -> None:
+        """Offer ``{root}/{Artist}/{Album}`` -- prefilled, editable, never forced.
+
+        Skipped entirely once the user has typed a path of their own: an offer
+        that overwrites a deliberate choice is not an offer.
+        """
+        if self._release is None or self._folder_hand_edited:
+            return
+        root = self._folder_root()
+        if not root:
+            return
+        suggestion = Path(root) / safe_part(self._release.artist) / safe_part(
+            self._release.title)
+        self.folder_edit.setText(str(suggestion))
+
+    # -- the record-to-rip bridge --------------------------------------------
+    def note_handoff(self, landed: bool, side_label=None, album=None) -> None:
+        """The window reports where the just-finished recording went.
+
+        Called between the handoff and :meth:`_report`, so the saved-summary line
+        can name the side it mapped to, and so the bridge button knows whether
+        this session has anything worth processing.
+        """
+        self._last_mapping = (side_label, album) if landed and side_label else None
+        if landed:
+            self._landed += 1
+        self.process_button.setEnabled(self._landed > 0)
+
+    def reset_session(self) -> None:
+        """A new record: forget the album and disarm the bridge (9.7 clean slate)."""
+        self.clear_release()
+        self._landed = 0
+        self._last_mapping = None
+        self.process_button.setEnabled(False)
+
+    def _request_process(self) -> None:
+        self.processAlbumRequested.emit()
+
     # -- transport -----------------------------------------------------------
     def _browse_folder(self) -> None:
         start = self.folder_edit.text().strip() or str(Path.home())
         chosen = QFileDialog.getExistingDirectory(self, "Where should recordings go?", start)
         if chosen:
             self.folder_edit.setText(chosen)
+            self._folder_hand_edited = True      # browsing is choosing
             self.settings.set(record_output_dir=chosen)
 
     def destination(self) -> Path | None:
@@ -611,22 +793,34 @@ class RecordTab(QWidget):
         self.recordingStateChanged.emit(False)
         self.elapsed_label.setText(format_timestamp(result.duration))
 
+        self.meters.set_clip_runs(result.clip_runs)
+
+        # The handoff runs *before* the summary line, so the line can say where
+        # the side actually landed. The window answers via note_handoff().
+        self._last_mapping = None
+        self.recordingFinished.emit(result)
+
         self._report(result)
 
         # Name the next side before the user has finished flipping the record.
-        advanced = next_side_name(result.path.name)
+        advanced = next_side_name(result.path.name, side_labels(self._release))
         self.file_edit.setText(advanced)
         self.settings.set(record_next_file=advanced)
 
-        self.meters.set_clip_runs(result.clip_runs)
-        self.recordingFinished.emit(result)
         self._restart_monitor()
 
     def _report(self, result) -> None:
         peak = ("—" if result.max_peak_dbfs in (None, float("-inf"))
                 else f"{result.max_peak_dbfs:+.1f} dBFS")
+        # Where it went matters as much as that it saved -- without this the flow
+        # dead-ends at Stop and the mapping is invisible from here (9.10).
+        where = ""
+        if self._last_mapping is not None:
+            side, album = self._last_mapping
+            where = (f" — mapped to {side} of {album} in Full Rip" if album
+                     else f" — mapped to {side} in Full Rip")
         self._log(f"Record: saved {result.path.name} ({format_timestamp(result.duration)}). "
-                  f"Loudest point: {peak}.")
+                  f"Loudest point: {peak}{where}.")
         if result.clip_runs:
             self._log(f"  ! The sound was too loud and distorted in {result.clip_runs} "
                       "spot(s). Turn the input volume down and record this side again.")
