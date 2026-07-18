@@ -951,15 +951,15 @@ class FullRipTab(QWidget):
         # Live session: a job is running and this side mapped. Try to admit it.
         if self._album is not None and mapped is not None:
             if self._admit_recorded_side(mapped, path):
-                self._log(f"Full Rip: '{path.name}' mapped to Side "
-                          f"{side_letter(mapped)} and joined the running album -- "
-                          f"analysing now.{warn_note}")
+                self._log(f"Full Rip: '{path.name}' added as Side "
+                          f"{side_letter(mapped)} and joined the album that's "
+                          f"running — the app is working on it now.{warn_note}")
             else:
                 # The job already concluded (8.4): finished is finished.
-                self._log(f"Full Rip: '{path.name}' mapped to Side "
-                          f"{side_letter(mapped)}. The album already finished -- "
-                          f"press Start album to run it again including this "
-                          f"side.{warn_note}")
+                self._log(f"Full Rip: '{path.name}' added as Side "
+                          f"{side_letter(mapped)}. That album already finished — "
+                          f"press Start album to run it again with this side "
+                          f"included.{warn_note}")
             return True
 
         # No running job: map only, and never auto-start one the user didn't.

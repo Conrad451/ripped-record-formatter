@@ -111,7 +111,7 @@ def test_admission_carries_a_recordings_warnings_forward(qapp, tmp_path, monkeyp
                                warnings=["input overflow: a dropout is present"]) is True
 
     assert _drain(qapp, lambda: any(s.index == 1 for s in fr._album.sides))   # still admits
-    assert any("joined the running album" in m and "warning" in m for m in logged)
+    assert any("joined the album" in m and "warning" in m for m in logged)
 
 
 def test_cancel_album_cancels_an_admitted_side(qapp, tmp_path, monkeypatch):
