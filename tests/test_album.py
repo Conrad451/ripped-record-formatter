@@ -14,6 +14,8 @@ from core.album import (
     SideSummary,
     guess_side_index,
     measure_outputs,
+    probe_duration_ms,
+    propose_side_map,
     propose_wav_side_map,
     sides_from_proposal,
 )
@@ -88,6 +90,87 @@ def test_skipped_rows_are_excluded_from_the_job():
     assert Path("notes.wav") not in sides.values()
     assert Path("other_album_sideA.wav") not in sides.values()
     assert len(sides) == 2                 # two sides, not four
+
+
+# --------------------------------------------------------------------------- #
+# Auto-mapping: the confidence ladder (propose_side_map)
+# --------------------------------------------------------------------------- #
+def test_ladder_a_filenames_are_highest_confidence():
+    assert propose_side_map(["SideA.wav", "SideB.wav"], 2) == [0, 1]
+
+
+def test_ladder_b_count_and_order_maps_ordered_names():
+    # No side hint, but exactly 2 ordered WAVs for 2 sides -> map in ordinal order.
+    assert propose_side_map(["01.wav", "02.wav"], 2) == [0, 1]
+    assert propose_side_map(["02.wav", "01.wav"], 2) == [1, 0]   # order is the ordinal
+
+
+def test_ladder_b_single_wav_single_side_maps_trivially():
+    assert propose_side_map(["my recording.wav"], 1) == [0]
+
+
+def test_ladder_b_count_and_order_needs_matching_counts():
+    # 3 WAVs for 2 sides: order does not determine it -> all skip.
+    assert propose_side_map(["01.wav", "02.wav", "03.wav"], 2) == [None, None, None]
+
+
+def test_ladder_c_duration_maps_a_badly_named_file():
+    # "bounce.wav" has no side hint and no ordinal, but its length matches side B
+    # alone (1200s vs 1180s, within 5%).
+    m = propose_side_map(
+        ["SideA.wav", "bounce.wav"], 2,
+        wav_durations_ms=[600_000, 1_200_000],
+        side_totals_ms=[600_000, 1_180_000],
+    )
+    assert m == [0, 1]
+
+
+def test_ladder_c_refuses_two_way_ambiguity():
+    # One WAV within 5% of BOTH sides -> no single answer, stays on skip.
+    m = propose_side_map(
+        ["mystery.wav"], 2,
+        wav_durations_ms=[1_000_000],
+        side_totals_ms=[1_000_000, 1_010_000],
+    )
+    assert m == [None]
+
+
+def test_ladder_c_refuses_a_contested_side():
+    # Two hint-less WAVs both match side A's length; neither is the clear winner.
+    m = propose_side_map(
+        ["foo.wav", "bar.wav"], 2,
+        wav_durations_ms=[1_000_000, 1_000_000],
+        side_totals_ms=[1_000_000, 5_000_000],
+    )
+    assert m == [None, None]
+
+
+def test_ladder_hand_set_skip_is_never_refilled():
+    # The user set SideA's row to skip; re-proposal must not grab it back.
+    m = propose_side_map(
+        ["SideA.wav", "SideB.wav"], 2,
+        current=[None, None], locked={0},
+    )
+    assert m == [None, 1]
+
+
+def test_ladder_only_fills_skip_and_respects_taken_sides():
+    # Row 0 hand-set to side B(1); SideA fills the still-free side A(0).
+    m = propose_side_map(
+        ["SideB.wav", "SideA.wav"], 2,
+        current=[1, None], locked={0},
+    )
+    assert m == [1, 0]
+
+
+def test_probe_duration_ms_reads_header_only(tmp_path):
+    import numpy as np
+    import soundfile as sf
+
+    p = tmp_path / "one_sec.wav"
+    sf.write(str(p), np.zeros(44100, dtype="float32"), 44100, subtype="PCM_16")
+    assert abs(probe_duration_ms(p) - 1000) <= 5
+    assert probe_duration_ms(tmp_path / "missing.wav") == 0     # unreadable -> 0
 
 
 def test_happy_path_state_sequence():

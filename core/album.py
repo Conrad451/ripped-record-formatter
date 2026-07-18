@@ -305,6 +305,123 @@ def sides_from_proposal(wav_paths, proposal) -> dict[int, Path]:
     }
 
 
+#: A WAV whose duration is within this fraction of a side's expected total is a
+#: duration match. ~5%: turntable speed drift and lead-out deadspace move a side's
+#: real length a percent or two off the release's sum; a tighter window would miss
+#: real matches, a looser one would start pairing different-length sides.
+DURATION_MATCH_TOLERANCE = 0.05
+
+
+def probe_duration_ms(path) -> int:
+    """A WAV's duration in milliseconds from its header only -- no decode.
+
+    ``soundfile.info`` reads just the header, so this is cheap enough to run over
+    a whole folder. Returns 0 when the file is missing or unreadable, so a quirky
+    file never breaks auto-mapping -- it simply does not get a duration match.
+    """
+    try:
+        import soundfile as sf
+
+        info = sf.info(str(path))
+        if info.samplerate:
+            return int(round(1000.0 * info.frames / info.samplerate))
+    except Exception:
+        pass
+    return 0
+
+
+def _ordinal_key(name: str):
+    """A sortable ordinal ``(kind, value)`` for count-and-order, or ``None``.
+
+    A trailing/standalone side letter a-h, or the first run of digits in the stem.
+    The caller requires a homogeneous *kind* across a group so letters and numbers
+    are never ordered against each other.
+    """
+    stem = Path(name).stem
+    match = _TRAILING_LETTER.search(stem)
+    if match:
+        return ("L", match.group(1).lower())
+    match = re.search(r"\d+", stem)
+    if match:
+        return ("N", int(match.group()))
+    return None
+
+
+def propose_side_map(wav_names, num_sides: int, *, current=None, locked=None,
+                     wav_durations_ms=None, side_totals_ms=None,
+                     tolerance: float = DURATION_MATCH_TOLERANCE) -> list[int | None]:
+    """Propose a side for each WAV with a confidence ladder -- never a guess.
+
+    In descending confidence:
+
+    a. **Filename patterns** (``SideA``, ``side_2``, a lone ``A``) --
+       :func:`propose_wav_side_map`, unchanged and highest confidence.
+    b. **Count-and-order**: exactly K unmapped WAVs for K unmapped sides whose
+       names carry a homogeneous, distinct ordinal (all letters or all numbers) ->
+       map in sorted order. The single-WAV/single-side album maps trivially (there
+       is only one possibility).
+    c. **Duration match**: an unmapped WAV within ``tolerance`` of exactly one free
+       side's expected total, with no other free WAV competing for that side.
+    d. Otherwise **skip** (``None``).
+
+    ``current`` is the existing per-WAV mapping (parallel to ``wav_names``);
+    ``locked`` is the set of row indices the user hand-set -- kept verbatim,
+    including a hand-set skip. Only rows that are unlocked *and* currently ``None``
+    are ever filled, so hand edits survive re-proposal and the exclusive-side rule
+    (a side is claimed once, by the strongest signal) stands across every rung.
+    Returns a new full mapping.
+    """
+    n = len(wav_names)
+    result = list(current) if current is not None else [None] * n
+    locked = set(locked or ())
+    taken = {v for v in result if v is not None}
+
+    def free_rows():
+        return [i for i in range(n) if i not in locked and result[i] is None]
+
+    def free_sides():
+        return sorted(s for s in range(num_sides) if s not in taken)
+
+    def claim(row, side):
+        result[row] = side
+        taken.add(side)
+
+    # a. filename patterns
+    for i, idx in enumerate(propose_wav_side_map(wav_names, num_sides)):
+        if i not in locked and result[i] is None and idx is not None and idx not in taken:
+            claim(i, idx)
+
+    # b. count-and-order (and the trivial one-WAV/one-side album). Only from a
+    # clean slate: every WAV unmapped, every side free, counts equal. A remainder
+    # left after filename matching is not a clean ordered set -- its ordinal may
+    # point at an already-claimed side -- so we never order-map a leftover.
+    rows, sides = free_rows(), free_sides()
+    if rows and len(rows) == n and len(sides) == num_sides and len(rows) == len(sides):
+        if n == 1:
+            claim(rows[0], sides[0])                 # one WAV, one side: only option
+        else:
+            keys = {i: _ordinal_key(wav_names[i]) for i in rows}
+            vals = list(keys.values())
+            kinds = {v[0] for v in vals if v is not None}
+            if all(v is not None for v in vals) and len(kinds) == 1 and len(set(vals)) == len(vals):
+                for row, side in zip(sorted(rows, key=lambda i: keys[i]), sides):
+                    claim(row, side)
+
+    # c. duration match -- unique for the WAV, uncontested for the side
+    rows, sides = free_rows(), free_sides()
+    if rows and wav_durations_ms and side_totals_ms:
+        def within(i, s):
+            d = wav_durations_ms[i] if i < len(wav_durations_ms) else 0
+            t = side_totals_ms[s] if s < len(side_totals_ms) else 0
+            return bool(d) and bool(t) and abs(d - t) <= tolerance * t
+
+        for i in rows:
+            cand = [s for s in sides if within(i, s)]
+            if len(cand) == 1 and not any(j != i and within(j, cand[0]) for j in rows):
+                claim(i, cand[0])
+    return result
+
+
 # --------------------------------------------------------------------------- #
 # Controller
 # --------------------------------------------------------------------------- #

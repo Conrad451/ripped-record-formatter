@@ -351,6 +351,8 @@ class MainWindow(QMainWindow):
 
     def _on_recording_state(self, recording: bool) -> None:
         """Recording must be unmissable, whichever tab you are looking at."""
+        # Full Rip defers its between-albums reset while a capture is under way.
+        self.full_rip.set_recording_active(recording)
         index = self.tabs.indexOf(self.record_tab)
         self.tabs.setTabText(index, "● Record" if recording else "Record")
         self.setStyleSheet(

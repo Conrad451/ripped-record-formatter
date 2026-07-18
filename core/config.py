@@ -44,6 +44,16 @@ class Config:
     last_artist: str = ""
     last_album: str = ""
 
+    # --- default folders + what happens to them when an album concludes ---
+    # Each policy is one of: "keep" (leave the last-used value -- ships as default,
+    # matching prior behaviour), "reset" (set the field back to the default folder
+    # below), or "clear" (empty the field). Identity (Artist/Album/release) has no
+    # such policy -- it is always cleared, because no default is safe for identity.
+    default_source_dir: str = ""
+    default_output_dir: str = ""
+    source_post_album_policy: str = "keep"     # keep | reset | clear
+    output_post_album_policy: str = "keep"     # keep | reset | clear
+
     # --- metadata lookup ---
     metadata_contact: str = ""
     """Contact (email or URL) sent in the MusicBrainz User-Agent, so they can

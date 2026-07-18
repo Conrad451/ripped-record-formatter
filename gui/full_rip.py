@@ -52,13 +52,16 @@ from PySide6.QtWidgets import (
 
 from core import job_settings
 from core.album import (
+    DURATION_MATCH_TOLERANCE,
     AlbumController,
     NeedsAttention,
     SideJob,
     SideState,
     SideSummary,
+    guess_side_index,
     measure_outputs,
-    propose_wav_side_map,
+    probe_duration_ms,
+    propose_side_map,
     sides_from_proposal,
 )
 from core.side_partition import Side
@@ -151,16 +154,24 @@ class FullRipTab(QWidget):
         # Where the file dialogs open. Deliberately NOT a display field: the
         # old 'Side-long WAV' QLineEdit could end up showing an internal
         # staging path (%TEMP%\tmp...\src). Nothing internal is ever shown.
-        self._browse_start: str = settings.config.source_dir or ""
+        self._browse_start: str = (settings.config.default_source_dir
+                                   or settings.config.source_dir or "")
 
         # album mode
         self._album: AlbumController | None = None
         self._album_wavs: list[Path] = []
         self._album_mapping: list = []
+        # WAVs the user hand-set in the mapping table (path -> chosen side, or None
+        # for a deliberate skip). Re-proposal never overrides these.
+        self._pinned_map: dict[Path, int | None] = {}
         self._album_work_dir: Path | None = None
         self._album_output_root = ""
         self._album_meta: dict = {}
         self._album_review_index: int | None = None
+        # clean-slate-between-albums
+        self._recording_active = False       # a capture is under way (told by MainWindow)
+        self._reset_deferred = False         # album concluded mid-recording; wait to clear
+        self._rerun_snapshot: dict | None = None  # what "Run again" restores
         self._relay = _StateRelay()
         self._relay.changed.connect(self._on_side_state)
         self._relay.finished.connect(self._on_album_finished)
@@ -271,7 +282,8 @@ class FullRipTab(QWidget):
         side_row.addWidget(self.count_spin)
         form.addRow("Side:", self._wrap(side_row))
 
-        self.output_edit = QLineEdit(settings.config.output_dir)
+        self.output_edit = QLineEdit(settings.config.output_dir
+                                     or settings.config.default_output_dir)
         form.addRow("Output folder:", self._path_row(self.output_edit, self._browse_output))
 
         # The destination the encode will *actually* use. An album job captures
@@ -868,6 +880,7 @@ class FullRipTab(QWidget):
             self, "Select the folder holding this record's WAVs", start)
         if folder:
             self._album_wavs = sorted(Path(folder).glob("*.wav"))
+            self._pinned_map = {}          # a new source folder is a fresh slate
             self._rebuild_mapping_table()
             self._log(f"Source: {len(self._album_wavs)} WAV(s) found in {folder}")
 
@@ -877,10 +890,27 @@ class FullRipTab(QWidget):
         path, _ = QFileDialog.getOpenFileName(self, "Select a side WAV", start, "WAV files (*.wav)")
         if path:
             self._album_wavs = [Path(path)]
+            self._pinned_map = {}
             self._rebuild_mapping_table()
             self._log(f"Source: {Path(path).name}")
 
     def add_recorded_wav(self, path, *, warnings=()) -> bool:
+        """The record-to-rip handoff (see :meth:`_adopt_recorded_wav`), plus the
+        clean-slate deferral resolution.
+
+        If an album concluded while this recording was still in progress, its
+        landing decides the deferred reset: a WAV that joins *this* album (same
+        folder) cancels the reset -- the user is still building this record -- while
+        one that lands elsewhere lets the reset run now (the album is truly done).
+        """
+        adopted = self._adopt_recorded_wav(path, warnings=warnings)
+        if self._reset_deferred:
+            self._reset_deferred = False
+            if not adopted:
+                self._reset_identity()
+        return adopted
+
+    def _adopt_recorded_wav(self, path, *, warnings=()) -> bool:
         """A recording just landed. Fold it into the mapping table if it belongs.
 
         This is the record-to-rip handoff. If the Record tab is writing into the
@@ -966,11 +996,15 @@ class FullRipTab(QWidget):
         return False
 
     def _rebuild_mapping_table(self) -> None:
-        """One row per scanned WAV; the side dropdown defaults to skip.
+        """One row per scanned WAV; re-run the mapping proposal.
 
-        The heuristics only pre-fill files that actually name a side. Anything
-        else stays on skip, which is what makes a mixed folder safe: WAVs from
-        another album are simply not part of this job.
+        The confidence ladder (:func:`core.album.propose_side_map`) pre-fills only
+        what is knowable -- an explicit side name, an unambiguous count-and-order,
+        or a clear duration match -- and leaves the rest on skip, which keeps a
+        mixed folder safe. Hand-set rows (including a deliberate skip) are locked
+        and never overwritten by a re-proposal. Runs on every change to the WAV
+        list or the side structure, so a release looked up *after* scanning still
+        gets matched.
         """
         self.mapping_table.setRowCount(len(self._album_wavs))
         if not self._album_wavs:
@@ -978,10 +1012,30 @@ class FullRipTab(QWidget):
             return
 
         num_sides = len(self._sides)
-        self._album_mapping = (
-            propose_wav_side_map(self._album_wavs, num_sides) if num_sides
-            else [None] * len(self._album_wavs)
-        )
+        durations = None
+        auto: list[int] = []
+        if not num_sides:
+            self._album_mapping = [None] * len(self._album_wavs)
+        else:
+            current, locked = [], set()
+            for i, wav in enumerate(self._album_wavs):
+                if wav in self._pinned_map:
+                    current.append(self._pinned_map[wav])
+                    locked.add(i)
+                else:
+                    current.append(None)
+            durations = [probe_duration_ms(w) for w in self._album_wavs]
+            totals = [0] * num_sides
+            for s in self._sides:
+                if 0 <= s.index < num_sides:
+                    totals[s.index] = s.total_ms
+            self._album_mapping = propose_side_map(
+                [w.name for w in self._album_wavs], num_sides,
+                current=current, locked=locked,
+                wav_durations_ms=durations, side_totals_ms=totals)
+            auto = [i for i in range(len(self._album_wavs))
+                    if i not in locked and current[i] is None
+                    and self._album_mapping[i] is not None]
 
         for row, wav in enumerate(self._album_wavs):
             self.mapping_table.setItem(row, 0, QTableWidgetItem(wav.name))
@@ -991,6 +1045,7 @@ class FullRipTab(QWidget):
                 combo.addItem(f"Side {side_letter(s.index)} ({s.track_count} tr)", s.index)
             want = self._album_mapping[row]
             combo.setCurrentIndex(0 if want is None else max(0, combo.findData(want)))
+            combo.setToolTip(self._mapping_tooltip(row, want, durations))
             combo.currentIndexChanged.connect(
                 lambda _i, r=row, c=combo: self._mapping_changed(r, c))
             self.mapping_table.setCellWidget(row, 1, combo)
@@ -998,15 +1053,35 @@ class FullRipTab(QWidget):
         if not num_sides:
             self._log("Source: look up a release (or Define sides) to choose sides.")
             return
-        mapped = sum(1 for m in self._album_mapping if m is not None)
-        self._log(f"Source: {len(self._album_wavs)} WAV(s) - {mapped} mapped by name, "
-                  f"{len(self._album_wavs) - mapped} left on skip.")
+        if auto:
+            self._log(f"Mapped {len(auto)} WAV(s) to sides automatically.")
         if self._analysis is None:
             self._set_empty_state(self._pending_review_message())
+
+    def _mapping_tooltip(self, row: int, side_index, durations) -> str:
+        """Explain a duration-matched row ('Duration matches Side B: 22:41 ≈ 22:35').
+
+        Only for rows the *filename* did not name -- a name match speaks for itself.
+        """
+        if side_index is None or not durations:
+            return ""
+        wav = self._album_wavs[row]
+        if guess_side_index(wav.name) is not None:
+            return ""
+        dur = durations[row]
+        side = next((s for s in self._sides if s.index == side_index), None)
+        if side and dur and side.total_ms and \
+                abs(dur - side.total_ms) <= DURATION_MATCH_TOLERANCE * side.total_ms:
+            return (f"Duration matches Side {side_letter(side_index)}: "
+                    f"{format_timestamp(dur / 1000)} ≈ {format_timestamp(side.total_ms / 1000)}")
+        return ""
 
     def _mapping_changed(self, row: int, combo: QComboBox) -> None:
         side_index = combo.currentData()
         self._album_mapping[row] = side_index
+        # Remember the user's explicit choice (a side, or a deliberate skip) so a
+        # later re-proposal never overrides it.
+        self._pinned_map[self._album_wavs[row]] = side_index
         if side_index is None:
             return
         # A side holds exactly one WAV: if another row already claimed this side,
@@ -1014,6 +1089,8 @@ class FullRipTab(QWidget):
         for other in range(len(self._album_mapping)):
             if other != row and self._album_mapping[other] == side_index:
                 self._album_mapping[other] = None
+                # Displaced, not chosen: it goes back to being auto-mappable.
+                self._pinned_map.pop(self._album_wavs[other], None)
                 widget = self.mapping_table.cellWidget(other, 1)
                 if widget is not None:
                     widget.blockSignals(True)
@@ -1246,16 +1323,25 @@ class FullRipTab(QWidget):
         self._log(summary.describe())
         if summary.done:
             self._log(f"  -> {self._album_output_root}")
-        self._log("Album: press 'Start album' to run this mapping again "
-                  "(every side is analysed afresh).")
 
-        # The moment deserves a receipt, not just a log line: render the summary
-        # card into the now-idle review space. A run with no sides at all has
-        # nothing to show, so it falls back to the plain empty state.
+        # Snapshot the finished album *before* the clean-slate reset so "Run again"
+        # on the card can restore it in one click, then render the card (it copies
+        # what it needs, so clearing identity afterwards cannot disturb it).
+        self._rerun_snapshot = self._snapshot_album()
         if summary.total and self._album_review_index is None:
             self._show_summary_card(summary)
         elif self._album_review_index is None:
             self._set_empty_state(self._pending_review_message())
+
+        # Clean slate for the next record -- unless a capture is under way, in
+        # which case defer so a WAV about to land is not orphaned (9.2 decides
+        # where it lands; the reset waits until it has -- see add_recorded_wav).
+        if self._recording_active:
+            self._reset_deferred = True
+            self._log("Album: a recording is in progress -- keeping this mapping "
+                      "until it lands, then clearing for the next record.")
+        else:
+            self._reset_identity()
 
     def _show_summary_card(self, summary) -> None:
         """Populate and reveal the finished-album card (hiding the other two)."""
@@ -1266,6 +1352,7 @@ class FullRipTab(QWidget):
             album=self._album_meta.get("album", ""),
             destination=Path(self._album_output_root) if self._album_output_root else None,
             on_dismiss=self._dismiss_summary_card,
+            on_rerun=self._run_album_again,
         )
         self.empty_state.setVisible(False)
         self.review_box.setVisible(False)
@@ -1276,6 +1363,109 @@ class FullRipTab(QWidget):
         self.summary_card.setVisible(False)
         if self._album_review_index is None:
             self._set_empty_state(self._pending_review_message())
+
+    # -- clean slate between albums -----------------------------------------
+    def set_recording_active(self, active: bool) -> None:
+        """MainWindow tells us when a capture is under way, so an album that
+        concludes mid-recording can defer its clean-slate reset."""
+        self._recording_active = active
+
+    def _snapshot_album(self) -> dict:
+        """Everything needed to restore the just-finished album for a re-run."""
+        return {
+            "release": self._release,
+            "cover": self._cover,
+            "artist": self.artist_edit.text(),
+            "album": self.album_edit.text(),
+            "flat_titles": list(self._flat_titles),
+            "flat_durations_ms": list(self._flat_durations_ms),
+            "flat_track_infos": list(self._flat_track_infos),
+            "sides": list(self._sides),
+            "wavs": list(self._album_wavs),
+            "mapping": list(self._album_mapping),
+            "pinned": dict(self._pinned_map),
+            "output": self.output_edit.text(),
+            "browse_start": self._browse_start,
+        }
+
+    def _reset_identity(self) -> None:
+        """Clear all album *identity* between records -- unconditionally.
+
+        Artist/Album, the selected release + preview, the side picker and the
+        mapping table all go: no default is safe for identity, because inheriting
+        the last album's Artist/release would mistag the next record. Source and
+        output *folders* follow their configured policies (keep / reset / clear).
+        The summary card is left alone -- it holds its own state.
+        """
+        cfg = self.settings.config
+        self.artist_edit.clear()
+        self.album_edit.clear()
+        self._release = None
+        self._cover = None
+        self.release_preview.clear()
+        self._flat_titles = []
+        self._flat_durations_ms = []
+        self._flat_track_infos = []
+        self._album_wavs = []
+        self._pinned_map = {}
+        self._set_sides([])                  # empties the side picker (no WAVs -> no rebuild)
+        self.define_sides_button.setEnabled(False)
+        self.side_list.clear()
+        self._rebuild_mapping_table()        # empties the mapping table widget
+        self._apply_folder_policy(cfg.source_post_album_policy,
+                                  cfg.default_source_dir, is_source=True)
+        self._apply_folder_policy(cfg.output_post_album_policy,
+                                  cfg.default_output_dir, is_source=False)
+
+    def _apply_folder_policy(self, policy: str, default: str, *, is_source: bool) -> None:
+        """Post-album folder behaviour: keep (leave it), reset (to the configured
+        default), or clear (empty it). Identity has no such policy."""
+        if policy == "keep":
+            return
+        target = default if policy == "reset" else ""
+        if is_source:
+            self._browse_start = target
+            self.settings.set(source_dir=target)
+        else:
+            self.output_edit.setText(target)
+            self.settings.set(output_dir=target)
+
+    def _run_album_again(self) -> None:
+        """Restore the just-concluded album's identity + exact mapping and arm Start.
+
+        The escape hatch that makes the clean slate safe: the 8.4 do-over stays a
+        single click for the album you just finished, instead of full re-entry.
+        """
+        snap = self._rerun_snapshot
+        if snap is None:
+            return
+        self._release = snap["release"]
+        self._cover = snap["cover"]
+        self.artist_edit.setText(snap["artist"])
+        self.album_edit.setText(snap["album"])
+        self._flat_titles = list(snap["flat_titles"])
+        self._flat_durations_ms = list(snap["flat_durations_ms"])
+        self._flat_track_infos = list(snap["flat_track_infos"])
+        self._browse_start = snap["browse_start"]
+        self.output_edit.setText(snap["output"])
+        if snap["release"] is not None:
+            self.release_preview.set_release(snap["release"])
+        self.define_sides_button.setEnabled(bool(self._flat_titles))
+        self._album_wavs = list(snap["wavs"])
+        self._pinned_map = dict(snap["pinned"])
+        self._set_sides(list(snap["sides"]))     # rebuilds side_combo, re-derives mapping
+        # Force the *exact* saved mapping (not a fresh proposal) back onto the rows.
+        self._album_mapping = list(snap["mapping"])
+        for row in range(len(self._album_wavs)):
+            combo = self.mapping_table.cellWidget(row, 1)
+            if combo is not None:
+                want = self._album_mapping[row]
+                combo.blockSignals(True)
+                combo.setCurrentIndex(0 if want is None else max(0, combo.findData(want)))
+                combo.blockSignals(False)
+        self.summary_card.setVisible(False)
+        self.start_album_btn.setEnabled(not self._busy)
+        self._log("Album: restored -- press Start album to run it again.")
 
     def _on_side_list_click(self, item) -> None:
         if self._album is None:

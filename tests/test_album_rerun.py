@@ -139,10 +139,10 @@ def test_the_completed_album_logs_one_summary_line(qapp, tmp_path, monkeypatch):
     assert sum(1 for m in logged if m.startswith("Album complete:")) == 1
 
 
-def test_a_finished_album_shows_the_summary_card_and_start_dismisses_it(
+def test_a_finished_album_shows_the_summary_card_and_run_again_re_runs(
         qapp, tmp_path, monkeypatch):
-    """The receipt occupies the idle review space alone, and a fresh Start
-    steps it aside without being blocked by it."""
+    """The receipt occupies the idle review space alone; its "Run again" restores
+    the (clean-slate-cleared) mapping and re-runs without being blocked."""
     fr, _out = _tab(qapp, tmp_path, monkeypatch)
 
     _run_to_completion(qapp, fr)
@@ -154,10 +154,12 @@ def test_a_finished_album_shows_the_summary_card_and_start_dismisses_it(
     assert not fr.review_box.isVisibleTo(fr)
     assert "Kind of Blue" in fr.summary_card.title_label.text()
 
-    # A re-run is not blocked by the card, and dismisses it.
+    # Conclusion cleared identity (9.7); Run again restores it and steps the card
+    # aside, then Start is not blocked.
+    fr._run_album_again()
+    assert not fr.summary_card.isVisibleTo(fr)
     fr._start_album()
     assert fr._album is not None
-    assert not fr.summary_card.isVisibleTo(fr)
 
     fr._cancel_album()
     assert _drain(qapp, lambda: fr._album is None)
@@ -174,6 +176,7 @@ def test_pressing_start_again_runs_a_fresh_job_not_already_running(qapp, tmp_pat
     assert all(s.state == SideState.DONE for s in first)
 
     logged.clear()
+    fr._run_album_again()          # 9.7: the do-over restores the just-cleared album
     second = _run_to_completion(qapp, fr)
 
     assert "Album: already running." not in logged
@@ -194,6 +197,7 @@ def test_a_side_done_last_time_is_analysed_again_not_skipped(qapp, tmp_path,
     _run_to_completion(qapp, fr)
     assert sorted(analysed) == [0, 1]
 
+    fr._run_album_again()          # 9.7: restore the just-cleared album, then re-run
     _run_to_completion(qapp, fr)
     # Both sides analysed a second time -- nothing was skipped for being done.
     assert sorted(analysed) == [0, 0, 1, 1]
