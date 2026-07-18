@@ -83,6 +83,12 @@ class SideSummary:
     warnings: tuple[str, ...] = ()
     warned_tracks: int = 0
     """How many *tracks* carried at least one warning (not the warning count)."""
+    declick_repaired_samples: int | None = None
+    declick_total_samples: int | None = None
+    """adeclick's repaired/examined sample tally for this side, carried through
+    from :class:`~core.restoration.RestorationResult`. ``None`` when declick was
+    off for the run, or when ffmpeg printed no stat we could read. Samples, not
+    clicks -- the card must say so."""
 
 
 @dataclass(frozen=True)

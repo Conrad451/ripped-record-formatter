@@ -298,3 +298,86 @@ def test_rumble_filter_rejects_cutoff_above_nyquist(tmp_path):
 
     with pytest.raises(ValueError, match="cutoff_hz"):
         R.RumbleFilter(cutoff_hz=SR).apply(src, dst)
+
+
+# --------------------------------------------------------------------------- #
+# adeclick's statistic: parsed as ffmpeg actually prints it, absent when off
+# --------------------------------------------------------------------------- #
+#: Captured verbatim from ffmpeg 8.1.2 (gyan.dev essentials) running the exact
+#: command core.restoration.Declick builds. Kept as a fixture so the parser has
+#: a regression anchor that does not need a binary to exercise.
+ADECLICK_STDERR = r"""
+Input #0, wav, from 'C:\tmp\in_mono.wav':
+  Duration: 00:00:03.00, bitrate: 705 kb/s
+  Stream #0:0: Audio: pcm_s16le ([1][0][0][0] / 0x0001), 44100 Hz, mono, s16, 705 kb/s
+Stream mapping:
+  Stream #0:0 -> #0:0 (pcm_s16le (native) -> pcm_f32le (native))
+[Parsed_adeclick_0 @ 000001b7c965e100] Detected clicks in 1015 of 132300 samples (0.767196%).
+[out#0/wav @ 000001b7c965d200] video:0KiB audio:517KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: 0.017385%
+size=     517KiB time=00:00:03.00 bitrate=1411.4kbits/s speed=70.7x elapsed=0:00:00.04
+"""
+
+
+def test_adeclick_stderr_parses_to_repaired_and_examined_samples():
+    """The recorded ffmpeg line yields adeclick's own two numbers, unembellished."""
+    repaired, total = R.Declick._parse_stats(ADECLICK_STDERR)
+    assert (repaired, total) == (1015, 132300)
+
+
+def test_adeclick_stats_are_samples_not_clicks():
+    """Guards the label, which is the whole honesty question here.
+
+    The capture above came from a signal with exactly 200 injected impulses, and
+    adeclick reported 1015 samples -- so the figure cannot be presented as a
+    click count. This test exists to fail loudly if anyone "simplifies" the
+    parser into one that pretends otherwise.
+    """
+    repaired, total = R.Declick._parse_stats(ADECLICK_STDERR)
+    assert repaired != 200                      # not the number of clicks
+    assert 0 < repaired < total                 # a share of samples examined
+
+
+def test_adeclick_parser_reports_unknown_rather_than_zero_when_unrecognised():
+    """A build that words the line differently must degrade to None, not to 0."""
+    assert R.Declick._parse_stats("") == (None, None)
+    assert R.Declick._parse_stats("ffmpeg said something else entirely") == (None, None)
+    # adeclip (a filter we do not run) prints the same shape with "clips".
+    assert R.Declick._parse_stats(
+        "[Parsed_adeclip_0 @ 0x1] Detected clips in 7 of 900 samples (0.7%).") == (7, 900)
+
+
+def test_restore_carries_the_declick_tally_and_omits_it_when_declick_is_off(tmp_path):
+    """Runs real ffmpeg, like the other declick tests in this file."""
+    t = np.arange(int(SR * 2)) / SR
+    sig = 0.2 * np.sin(2 * np.pi * 1000 * t)
+    rng = np.random.default_rng(11)
+    idx = rng.choice(t.size, size=150, replace=False)
+    sig[idx] += rng.choice([-1, 1], 150) * 0.9
+    sig = np.clip(sig, -1, 1).astype(np.float32)
+
+    src = tmp_path / "in.wav"
+    sf.write(str(src), sig, SR, subtype="PCM_16")
+
+    on = R.restore(src, tmp_path / "on.wav", stages=[R.Declick()])
+    print(f"\n[declick-stat] {on.declick_repaired_samples} of "
+          f"{on.declick_total_samples} samples ({on.declick_percent:.3f}%)")
+    assert on.declick_repaired_samples > 0
+    assert on.declick_total_samples == SR * 2        # mono, 2 s, one channel
+    assert 0 < on.declick_percent < 100
+
+    off = R.restore(src, tmp_path / "off.wav", stages=[])
+    assert off.declick_repaired_samples is None      # absent, not zero
+    assert off.declick_total_samples is None
+    assert off.declick_percent is None
+
+
+def test_declick_percent_distinguishes_zero_repaired_from_unknown():
+    """0 repaired is a fact (0.0%); a missing count is not (None)."""
+    known_zero = R.RestorationResult(
+        output_path=Path("x.wav"), samplerate=SR, channels=1, subtype="PCM_16",
+        declick_repaired_samples=0, declick_total_samples=132300)
+    assert known_zero.declick_percent == 0.0
+
+    unknown = R.RestorationResult(
+        output_path=Path("x.wav"), samplerate=SR, channels=1, subtype="PCM_16")
+    assert unknown.declick_percent is None
