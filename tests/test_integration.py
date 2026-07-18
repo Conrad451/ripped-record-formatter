@@ -933,3 +933,39 @@ def test_recheck_mapping_unmaps_the_side_and_returns_to_the_table(qapp, tmp_path
     assert fr.diagnosis_box.isHidden()
     assert fr._album_review_index is None
     fr._album.shutdown(wait=True)
+
+
+# --------------------------------------------------------------------------- #
+# v2.3.2 merge seam: both branches' Record tab controls coexist.
+# --------------------------------------------------------------------------- #
+def test_the_merged_record_tab_carries_both_branches_controls(qapp):
+    """One render, all four features present -- the v2.3.2 merge seam.
+
+    fix/capture-rate brought the rate picker and the input-gain slider; the
+    session-flow branch brought the album row and the record-to-rip bridge. They
+    were developed against separate checkouts of the same tab and touched the
+    same constructor, so "both merged cleanly" is worth asserting as *visible
+    widgets*, not just as a green diff.
+    """
+    from gui.main_window import MainWindow
+
+    w = MainWindow()
+    w.resize(1000, 900)
+    tab = w.record_tab
+    w.tabs.setCurrentWidget(tab)          # Qt visibility is per-selected-tab
+    w.show()
+    qapp.processEvents()
+
+    # capture-rate: the rate picker probes the device rather than assuming 44.1k.
+    assert tab.rate_combo.isVisible()
+    # capture-rate: the gain slider sits beside the meters it moves. Existence,
+    # not visibility -- it deliberately hides itself when the Windows capture
+    # endpoint can't be reached, which is the normal state on a CI box.
+    assert tab.gain_slider in tab.gain_widgets
+    # session-flow: the optional album row.
+    assert tab.lookup_button.isVisible()
+    # session-flow: the bridge, present but disarmed until something lands.
+    assert tab.process_button.isVisible()
+    assert not tab.process_button.isEnabled()
+
+    w.close()
