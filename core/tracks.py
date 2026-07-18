@@ -72,6 +72,18 @@ def sanitize_filename_component(name: str) -> str:
     return cleaned.strip(" .")
 
 
+def safe_part(text: str) -> str:
+    """A single path segment that a filesystem will actually accept.
+
+    :func:`sanitize_filename_component` deliberately leaves the empty case to its
+    callers; the derived ``{root}/{Artist}/{Album}`` folders need *some* segment,
+    so this supplies the fallback. Artist and album names come from MusicBrainz,
+    which has no opinion about filesystems -- ``AC/DC`` and ``Where Are We Now?``
+    are both real releases.
+    """
+    return sanitize_filename_component(text or "") or "Unknown"
+
+
 @dataclass
 class Tracks:
     """A single track's metadata and the on-disk location of its source audio.
