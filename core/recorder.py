@@ -173,6 +173,31 @@ def list_output_devices() -> list[DeviceInfo]:
     return devices
 
 
+def supported_input_rates(device: int, channels: int, candidates,
+                          *, probe=None) -> list[int]:
+    """Which of ``candidates`` this input device will actually open at.
+
+    WASAPI shared mode opens a stream only at the device's *configured* rate, so a
+    fixed rate menu lies: picking 44100 on a device Windows has at 48000 fails with
+    ``PortAudioError -9997``. ``sounddevice.check_input_settings`` raises for an
+    unopenable ``(device, rate, channels)``; we probe each candidate and keep the
+    ones that don't raise. ``probe(rate) -> bool`` is injectable for tests. Never
+    raises -- an enumeration failure just drops that rate.
+    """
+    if probe is None:
+        import sounddevice as sd
+
+        def probe(rate: int) -> bool:
+            try:
+                sd.check_input_settings(device=device, samplerate=int(rate),
+                                        channels=channels, dtype="float32")
+                return True
+            except Exception:
+                return False
+
+    return [int(r) for r in candidates if probe(r)]
+
+
 class _ClipCounter:
     """Counts runs of consecutive full-scale frames, across block boundaries."""
 

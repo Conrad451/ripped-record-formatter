@@ -67,7 +67,7 @@ def _write_vorbis_tags(flac_path: Path, tags: dict) -> None:
     flac.save()
 
 
-def _rrf_tags(restoration_stages) -> dict:
+def _rrf_tags(restoration_stages, resample=None) -> dict:
     """Provenance Vorbis comments for a freshly *encoded* FLAC.
 
     Every FLAC the app encodes carries a signature of how it was made:
@@ -82,16 +82,37 @@ def _rrf_tags(restoration_stages) -> dict:
     (renders ``none``). ``None`` means the caller genuinely does not know how the
     audio was made, so nothing is written -- the same absent-writes-nothing rule
     as every other field.
+
+    ``resample`` is an optional ``(src_rate, dst_rate)`` pair when the encode
+    resampled the audio. It is appended additively per the RRF v1 format as a
+    ``resample(<src>-><dst>)`` token -- a resample is an encode-time fact, not a
+    restoration Stage, so it is assembled here rather than in ``format_restoration``.
+    A resample replaces the ``none`` placeholder (a resample *is* provenance).
     """
     if restoration_stages is None:
         return {}
     from core.restoration import format_restoration
     from core.version import __version__
 
+    restoration = format_restoration(restoration_stages)
+    if resample is not None:
+        token = f"resample({int(resample[0])}->{int(resample[1])})"
+        restoration = token if restoration == "none" else f"{restoration};{token}"
     return {
         "rrf_version": __version__,
-        "rrf_restoration": format_restoration(restoration_stages),
+        "rrf_restoration": restoration,
     }
+
+
+def _target_rate(output_sample_rate) -> int | None:
+    """Parse the ``output_sample_rate`` setting into a target Hz, or None to keep
+    the source rate ("source"/empty/unparseable all mean keep source)."""
+    if output_sample_rate in (None, "", "source"):
+        return None
+    try:
+        return int(output_sample_rate)
+    except (TypeError, ValueError):
+        return None
 
 
 def _read_rrf(flac_path: Path) -> dict:
@@ -208,6 +229,7 @@ def convert_wavs_to_flacs(
     max_workers: int = 1,
     should_cancel=None,
     restoration_stages=None,
+    output_sample_rate=None,
 ) -> BatchResult:
     """Convert each track's source WAV to a tagged FLAC in ``output_dir``.
 
@@ -220,8 +242,13 @@ def convert_wavs_to_flacs(
 
     ``restoration_stages`` carries provenance (see :func:`_rrf_tags`): the actual
     ``Stage`` objects applied to this audio (empty list -> ``RRF_RESTORATION`` is
-    ``none``), or ``None`` (the default) to write no ``RRF_*`` fields at all. All
-    tracks in one call share the same restoration, so it is formatted once.
+    ``none``), or ``None`` (the default) to write no ``RRF_*`` fields at all.
+
+    ``output_sample_rate`` ("source"/"44100"/"48000", or None to keep source) is
+    the FLAC sample rate. When it differs from a track's source rate, the encode
+    resamples (ffmpeg ``-ar``, high-quality swresample) and RRF_RESTORATION gains
+    a ``resample(<src>-><dst>)`` token. Per-track, because Convert-tab sources may
+    differ in rate.
     """
     if configure:
         from core.ffmpeg_locator import configure_pydub
@@ -230,13 +257,19 @@ def convert_wavs_to_flacs(
     from pydub import AudioSegment
 
     out_dir = _prepare_output_dir(output_dir)
-    rrf = _rrf_tags(restoration_stages)
+    target = _target_rate(output_sample_rate)
 
     def work(track):
         dest = out_dir / track.filename()
         audio = AudioSegment.from_wav(str(track.track_wav_loc))
-        audio.export(str(dest), format="flac", tags=track.tags())
+        src_rate = int(audio.frame_rate)
+        params, resample = None, None
+        if target is not None and target != src_rate:
+            params = ["-ar", str(target)]       # ffmpeg SRC to the library rate
+            resample = (src_rate, target)
+        audio.export(str(dest), format="flac", tags=track.tags(), parameters=params)
         outcome = TrackOutcome(track=track, output_path=dest)
+        rrf = _rrf_tags(restoration_stages, resample=resample)
         try:
             _write_vorbis_tags(dest, {**track.vorbis_tags(), **rrf})
         except Exception as exc:

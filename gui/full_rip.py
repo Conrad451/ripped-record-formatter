@@ -1889,7 +1889,8 @@ class FullRipTab(QWidget):
         batch = convert_wavs_to_flacs(tracks, out_dir, configure=False, cover=self._cover,
                                       max_workers=self.settings.config.encode_workers,
                                       should_cancel=should_cancel,
-                                      restoration_stages=side.analysis.stages)
+                                      restoration_stages=side.analysis.stages,
+                                      output_sample_rate=cfg.output_sample_rate)
         for warning in batch.warnings:
             self._log(f"  ! {side.label}: {warning}")
 

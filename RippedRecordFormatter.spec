@@ -24,7 +24,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
+from PyInstaller.utils.hooks import (
+    collect_data_files,
+    collect_dynamic_libs,
+    collect_submodules,
+)
 
 ROOT = Path(SPECPATH)
 sys.path.insert(0, str(ROOT))
@@ -136,6 +140,16 @@ hiddenimports = [
     # (scipy._lib.array_api_compat...), which does not exist in SciPy 1.18.
     "scipy._external.array_api_compat.numpy.fft",
 ]
+
+# pycaw drives the Windows capture-endpoint level (the input-gain slider) over
+# comtypes. comtypes builds its COM interface wrappers into a `comtypes.gen`
+# package at first use, which PyInstaller's static analysis cannot see, and which
+# a frozen app cannot always write. Collecting both packages' submodules ships the
+# generated modules instead of generating them at runtime. If this ever fails,
+# core.input_gain degrades by design: the slider hides and logs one line -- the
+# app still records.
+hiddenimports += collect_submodules("comtypes")
+hiddenimports += collect_submodules("pycaw")
 
 # --------------------------------------------------------------------------- #
 # Bundle diet
