@@ -32,30 +32,56 @@ import logging
 log = logging.getLogger(__name__)
 
 
+#: eCapture / DEVICE_STATE_ACTIVE -- we enumerate recording endpoints that exist
+#: right now, so a render endpoint can never be matched by name.
+_E_CAPTURE = 1
+_DEVICE_STATE_ACTIVE = 1
+_STGM_READ = 0
+
+#: PKEY_Device_FriendlyName -- the name Windows Sound shows, which is also the
+#: name PortAudio reports, which is how we match the selected device.
+_PKEY_FRIENDLY_NAME = ("{a45c254e-df1c-4efd-8020-67d146a850e0}", 14)
+
+
 def _resolve_endpoint(device_name: str):
     """The ``IAudioEndpointVolume`` for the capture endpoint whose FriendlyName is
     ``device_name``, or ``None`` if it can't be reached.
 
     Isolated behind this function so the COM dependency lives in one place and
     tests can inject a fake endpoint by passing their own ``resolver``.
+
+    Goes at ``IMMDeviceEnumerator`` directly rather than through
+    ``pycaw.utils.AudioUtilities``: that convenience layer enumerates *every*
+    endpoint in every state and reads every property (which raises benign
+    COMErrors it surfaces as warnings), and it drags ``psutil`` into the bundle
+    for session bookkeeping we never use. Asking for active capture endpoints and
+    one property is both narrower and correct by construction.
     """
     try:
-        import warnings
+        from ctypes import byref
 
-        from comtypes import CLSCTX_ALL, POINTER, cast
-        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+        from comtypes import CLSCTX_ALL, GUID, POINTER, CoCreateInstance, cast
+        from pycaw.api.endpointvolume import IAudioEndpointVolume
+        from pycaw.api.mmdeviceapi import IMMDeviceEnumerator
+        from pycaw.api.mmdeviceapi.depend.structures import PROPERTYKEY
+        from pycaw.constants import CLSID_MMDeviceEnumerator
     except Exception as exc:  # ImportError, or comtypes.gen failure in a frozen build
         log.info("Input gain: COM audio interface unavailable (%s); slider hidden.", exc)
         return None
+
     try:
-        with warnings.catch_warnings():
-            # Enumerating every endpoint trips benign per-property COMErrors that
-            # pycaw surfaces as warnings; we only read FriendlyName, so hush them.
-            warnings.simplefilter("ignore")
-            for dev in AudioUtilities.GetAllDevices():
-                if dev.FriendlyName == device_name:
-                    iface = dev._dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-                    return cast(iface, POINTER(IAudioEndpointVolume))
+        enumerator = CoCreateInstance(
+            CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, CLSCTX_ALL)
+        endpoints = enumerator.EnumAudioEndpoints(_E_CAPTURE, _DEVICE_STATE_ACTIVE)
+        key = PROPERTYKEY(GUID(_PKEY_FRIENDLY_NAME[0]), _PKEY_FRIENDLY_NAME[1])
+        for i in range(endpoints.GetCount()):
+            device = endpoints.Item(i)
+            name = device.OpenPropertyStore(_STGM_READ).GetValue(byref(key)).GetValue()
+            if str(name) == device_name:
+                iface = device.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                return cast(iface, POINTER(IAudioEndpointVolume))
+        log.info("Input gain: no active capture endpoint named '%s'; slider hidden.",
+                 device_name)
     except Exception as exc:
         log.info("Input gain: could not open '%s' (%s); slider hidden.", device_name, exc)
     return None

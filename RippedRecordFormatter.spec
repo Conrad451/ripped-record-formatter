@@ -143,13 +143,20 @@ hiddenimports = [
 
 # pycaw drives the Windows capture-endpoint level (the input-gain slider) over
 # comtypes. comtypes builds its COM interface wrappers into a `comtypes.gen`
-# package at first use, which PyInstaller's static analysis cannot see, and which
-# a frozen app cannot always write. Collecting both packages' submodules ships the
-# generated modules instead of generating them at runtime. If this ever fails,
-# core.input_gain degrades by design: the slider hides and logs one line -- the
-# app still records.
+# package at first use, which PyInstaller's static analysis cannot see and which a
+# frozen app cannot always write; collecting its submodules ships them instead of
+# generating them at runtime. If this ever fails, core.input_gain degrades by
+# design: the slider hides and logs one line -- the app still records.
 hiddenimports += collect_submodules("comtypes")
-hiddenimports += collect_submodules("pycaw")
+# Only the pycaw modules core.input_gain actually imports. NOT
+# collect_submodules("pycaw"): that would pull in pycaw.utils, which imports
+# psutil for audio-session bookkeeping this app never touches -- see the excludes.
+hiddenimports += [
+    "pycaw.api.endpointvolume",
+    "pycaw.api.mmdeviceapi",
+    "pycaw.api.mmdeviceapi.depend.structures",
+    "pycaw.constants",
+]
 
 # --------------------------------------------------------------------------- #
 # Bundle diet
@@ -173,6 +180,11 @@ excludes = [
     "tk",
     "IPython",
     "pytest",
+    # pycaw declares psutil and imports it from pycaw.utils, the audio-*session*
+    # helper. core.input_gain goes at IMMDeviceEnumerator directly and never
+    # imports that module, so psutil is dead weight in the bundle. Verified: the
+    # gain path imports pycaw.api.* only, with psutil absent from sys.modules.
+    "psutil",
     # PySide6 modules we never touch. Qt is the single biggest thing in here, and
     # WebEngine alone is >100 MB.
     "PySide6.QtWebEngineCore",
