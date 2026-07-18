@@ -276,6 +276,10 @@ class MainWindow(QMainWindow):
         # The payoff: a finished side walks straight into Full Rip's mapping table.
         self.record_tab.recordingFinished.connect(self._on_recording_finished)
         self.record_tab.recordingStateChanged.connect(self._on_recording_state)
+        # ...and the other end of that flow: the user declares the album done.
+        self.record_tab.processAlbumRequested.connect(self._on_process_album_requested)
+        # The between-albums clean slate reaches the Record tab's session state too.
+        self.full_rip.identityReset.connect(self.record_tab.reset_session)
         self.tabs.addTab(self.full_rip, "Full Rip")
         self.tabs.addTab(self.record_tab, "Record")
         self.tabs.addTab(self.convert_panel, "Convert")
@@ -337,17 +341,54 @@ class MainWindow(QMainWindow):
         """Hand the capture to Full Rip, if it is working in the same folder.
 
         Carries the recording's warnings (dropouts, clipping) forward so a flagged
-        capture stays visible when Full Rip admits the side into a live album.
+        capture stays visible when Full Rip admits the side into a live album, and
+        the album the Record tab declared, so Full Rip receives files, mapping and
+        identity together rather than being told who this is later, elsewhere.
+
+        Reports the outcome back to the Record tab: it needs to know both where
+        the side landed (for its saved-summary line) and that *something* landed
+        (which is what arms its "process this album" bridge).
         """
         path = result.path
         warnings = list(result.warnings)
         if getattr(result, "clipped", False):
             warnings.append(f"clipping detected ({result.clip_runs} run(s))")
-        if self.full_rip.add_recorded_wav(path, warnings=warnings):
+
+        # Identity travels with the first side, and only fills a vacuum -- a
+        # release already chosen in Full Rip is the user's more recent word.
+        release = self.record_tab.release
+        if release is not None and self.full_rip._release is None:
+            self.full_rip._apply_release(release)
+
+        landed = self.full_rip.add_recorded_wav(path, warnings=warnings)
+        if landed:
             self._log(f"Recorded side '{Path(path).name}' added to the Full Rip mapping.")
         else:
             self._log(f"Recorded '{Path(path).name}'. Select its folder in Full Rip "
                       "to include it in an album.")
+        self.record_tab.note_handoff(
+            landed,
+            side_label=self.full_rip.mapped_side_label(path) if landed else None,
+            album=release.title if release is not None else None,
+        )
+
+    def _on_process_album_requested(self) -> None:
+        """The record-to-rip bridge: carry the session to Full Rip and stop there.
+
+        Files and mapping are already staged (they arrived side by side); this
+        adds identity if the Record tab has it, shows the user where they now are,
+        and puts the emphasis on the next thing to press. It never presses it --
+        no processing starts that the user did not ask for.
+        """
+        release = self.record_tab.release
+        if release is not None and self.full_rip._release is None:
+            self.full_rip._apply_release(release)
+        self.tabs.setCurrentWidget(self.full_rip)
+        target = self.full_rip.focus_next_action()
+        self._log("Ready to process this album in Full Rip. "
+                  + ("Press Start album when you're ready."
+                     if target is self.full_rip.start_album_btn
+                     else "Look up the release first, then press Start album."))
 
     def _on_recording_state(self, recording: bool) -> None:
         """Recording must be unmissable, whichever tab you are looking at."""
