@@ -180,10 +180,20 @@ class RecordTab(QWidget):
         self._last_mapping = None
 
         root = QVBoxLayout(self)
+        # The Record tab is the tallest thing in the app and it exhausts an
+        # 800px window (measured in 9.9, and again in 9.14 when the meters grew
+        # into instruments). The height the meters need is *function* -- gain is
+        # the highest-stakes judgment here -- so it is bought from chrome, which
+        # is not: tighter gaps between groups and inside the forms. The history
+        # lanes are never touched. See the 9.14 report's budget accounting.
+        root.setSpacing(4)
+        root.setContentsMargins(6, 4, 6, 4)
 
         # --- input -----------------------------------------------------------
         input_box = QGroupBox("Input")
         form = QFormLayout(input_box)
+        form.setVerticalSpacing(4)
+        form.setContentsMargins(8, 6, 8, 6)
 
         device_row = QHBoxLayout()
         self.device_combo = QComboBox()
@@ -231,6 +241,8 @@ class RecordTab(QWidget):
         # --- levels ------------------------------------------------------------
         level_box = QGroupBox("Levels")
         level_layout = QVBoxLayout(level_box)
+        level_layout.setSpacing(4)
+        level_layout.setContentsMargins(8, 6, 8, 6)
 
         # Meters with the input-gain slider beside them: you set the knob while
         # watching the very bars it moves. The slider drives the Windows capture
@@ -306,6 +318,8 @@ class RecordTab(QWidget):
         # --- destination + transport -------------------------------------------
         out_box = QGroupBox("Destination")
         out_form = QFormLayout(out_box)
+        out_form.setVerticalSpacing(4)
+        out_form.setContentsMargins(8, 6, 8, 6)
 
         # --- album (optional) --------------------------------------------------
         # Saying what is on the platter is worth doing *before* the capture, not

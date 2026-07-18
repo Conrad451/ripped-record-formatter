@@ -969,3 +969,35 @@ def test_the_merged_record_tab_carries_both_branches_controls(qapp):
     assert not tab.process_button.isEnabled()
 
     w.close()
+
+
+def test_the_record_tab_still_fits_an_800px_window(qapp):
+    """The vertical budget, asserted rather than remembered.
+
+    The Record tab is the tallest thing in the app and 9.9 measured it as
+    exhausting an 800px window. 9.14 then grew the meters into instruments
+    (+35px) and bought it back out of chrome (-52px), so the tab is *smaller*
+    than it was and the log pane has more room, not less. This pins that: the
+    meters may not quietly reclaim the difference later.
+    """
+    from gui.main_window import MainWindow
+    from gui.meters import BAR_HEIGHT
+
+    w = MainWindow()
+    w.resize(1000, 800)
+    w.tabs.setCurrentWidget(w.record_tab)
+    w.show()
+    qapp.processEvents()
+
+    tabs_h, log_h = w._main_splitter.sizes()
+    assert log_h > 0, "the log pane was squeezed out of existence"
+    assert log_h < tabs_h * 0.15, "the log has taken over the window"
+
+    # The instrument-grade bars are actually present at this size...
+    assert w.record_tab.meters.rows[0].bar.height() >= BAR_HEIGHT
+    # ...and the calibrated rule under them survived the squeeze.
+    assert w.record_tab.meters.scale.isVisible()
+
+    # The lanes were explicitly not the place to take height from.
+    assert w.record_tab.history_strip.height() >= 68
+    w.close()
