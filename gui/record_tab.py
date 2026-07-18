@@ -39,6 +39,7 @@ from core.recorder import (
     list_input_devices,
     list_output_devices,
 )
+from core.setup_check import INFO, OK, WARN, CheckResult, check_sample_rate, check_signal
 from core.timefmt import format_timestamp
 from gui.level_history import LevelHistoryStrip
 from gui.meters import LevelMeters
@@ -94,6 +95,13 @@ class RecordTab(QWidget):
         self._monitor = LevelMonitor(on_telemetry=self._on_monitor_telemetry)
         self._latest = None                     # last Telemetry, drained by a timer
         self._active = False                    # is this tab the visible one?
+        # setup-check listen window
+        self._checking = False
+        self._check_peak = float("-inf")
+        self._check_clips = 0
+        self._pending_check: list = []
+        self._check_window_ms = 3000
+        self._checked_device = None             # device we last auto-checked
 
         root = QVBoxLayout(self)
 
@@ -157,11 +165,32 @@ class RecordTab(QWidget):
         self.history_strip = LevelHistoryStrip(channels=2)
         level_layout.addWidget(self.history_strip)
 
-        self.hint = QLabel("Play the loudest passage of the record and adjust input "
-                           "gain until peaks stay below −3 dBFS.")
+        self.hint = QLabel("Play the loudest passage of the record and turn the input "
+                           "volume up until peaks stay just below −3 dBFS.")
         self.hint.setWordWrap(True)
         level_layout.addWidget(self.hint)
 
+        # "Check my setup" -- plain-language advice, never a gate. The button runs
+        # the full check (rate + a short listen); a mis-set rate is also flagged
+        # automatically when a device is chosen.
+        check_row = QHBoxLayout()
+        self.check_button = QPushButton("Check my setup")
+        self.check_button.clicked.connect(self._run_setup_check)
+        check_row.addWidget(self.check_button)
+        self.rate_fix_button = QPushButton("Use 44100")
+        self.rate_fix_button.setVisible(False)
+        self.rate_fix_button.clicked.connect(self._fix_set_rate_44100)
+        check_row.addWidget(self.rate_fix_button)
+        check_row.addStretch(1)
+        level_layout.addLayout(check_row)
+
+        self.check_results = QLabel("")
+        self.check_results.setWordWrap(True)
+        self.check_results.setVisible(False)
+        level_layout.addWidget(self.check_results)
+
+        # Monitoring (software passthrough) shares this space; its hint points at
+        # the zero-latency hardware alternative.
         self.monitor_hint = QLabel(
             "Tip: your interface's own headphone jack monitors with zero latency; "
             "this software path adds a little delay.")
@@ -243,7 +272,7 @@ class RecordTab(QWidget):
             self._devices = list_input_devices()
         except Exception as exc:
             self._devices = []
-            self._log(f"Record: could not enumerate audio devices ({exc}).")
+            self._log(f"Record: couldn't find any audio devices ({exc}).")
 
         self.device_combo.blockSignals(True)
         self.device_combo.clear()
@@ -312,6 +341,10 @@ class RecordTab(QWidget):
         self.record_button.setToolTip("")
         self._restart_monitor()
         self._restart_passthrough()
+        # Automatic pass the first time a device is chosen while the tab is up.
+        if self._active and dev.name != self._checked_device:
+            self._checked_device = dev.name
+            self._run_setup_check()
 
     def _on_format_changed(self, *_args) -> None:
         self.settings.set(
@@ -408,7 +441,7 @@ class RecordTab(QWidget):
         self._monitor.start(dev.index, rate, channels)
         self.history_strip.reset()          # a new stream is a new history
         if self._monitor.error:
-            self._log(f"Record: cannot monitor levels on this device "
+            self._log(f"Record: can't show the levels for this device "
                       f"({self._monitor.error}).")
 
     def _on_monitor_telemetry(self, telemetry) -> None:
@@ -438,11 +471,73 @@ class RecordTab(QWidget):
         if telemetry is None:
             return
         self._latest = None
+        if self._checking:                       # accumulate the listen window
+            self._check_peak = max(self._check_peak, telemetry.max_peak_dbfs)
+            self._check_clips = telemetry.clip_runs
         self.meters.update_from(telemetry)
         self.history_strip.update_from(telemetry)
         if self.recording:
             self.elapsed_label.setText(format_timestamp(telemetry.elapsed_s))
             self.size_label.setText(f"{telemetry.bytes_written / 1_048_576:.1f} MB")
+
+    # -- setup check ---------------------------------------------------------
+    def _run_setup_check(self) -> None:
+        """Rate check now, then listen for a few seconds and judge the signal.
+
+        Advice only -- it never disables Record. Re-runnable at any time.
+        """
+        dev = self.current_device()
+        if dev is None:
+            self._render_checks([CheckResult(WARN, "Choose an input device first.")])
+            return
+        results: list = []
+        rate = check_sample_rate(device_rate=dev.samplerate,
+                                 capture_rate=self.settings.config.record_samplerate,
+                                 max_channels=dev.max_channels)
+        if rate is not None:
+            results.append(rate)
+        self._pending_check = results
+
+        # Measure only the listen window: reset the meters, then accumulate.
+        self._monitor.reset_peaks()
+        self._check_peak = float("-inf")
+        self._check_clips = 0
+        self._checking = True
+        self._render_checks(results + [CheckResult(
+            INFO, "Listening for a few seconds — play the loudest part of the record...")])
+        QTimer.singleShot(self._check_window_ms, self._finish_setup_check)
+
+    def _finish_setup_check(self) -> None:
+        if not self._checking:
+            return
+        self._checking = False
+        peak = self._check_peak if self._check_peak != float("-inf") else -120.0
+        signal = check_signal(clip_runs=self._check_clips, peak_dbfs=peak)
+        self._render_checks(self._pending_check + [signal])
+
+    def _render_checks(self, results: list) -> None:
+        icons = {OK: "✓", WARN: "⚠", INFO: "…"}
+        colors = {OK: "#2e7d32", WARN: "#c07000", INFO: "gray"}
+        import html
+
+        lines, show_fix = [], False
+        for r in results:
+            lines.append(
+                f'<div style="color:{colors.get(r.status, "gray")}; margin-bottom:4px;">'
+                f'{icons.get(r.status, "•")} {html.escape(r.message)}</div>')
+            show_fix = show_fix or r.fix_key == "set_rate_44100"
+        self.check_results.setText("".join(lines))
+        self.check_results.setVisible(bool(lines))
+        self.rate_fix_button.setVisible(show_fix)
+
+    def _fix_set_rate_44100(self) -> None:
+        idx = self.rate_combo.findData(44100)
+        if idx >= 0:
+            self.rate_combo.setCurrentIndex(idx)
+        # Persist directly too: this is a rate choice like any other, and it must
+        # stick even if the combo happened to already show 44100.
+        self.settings.set(record_samplerate=44100)
+        self._run_setup_check()                      # re-check to show it took
 
     # -- transport -----------------------------------------------------------
     def _browse_folder(self) -> None:
@@ -470,11 +565,11 @@ class RecordTab(QWidget):
             return
         dest = self.destination()
         if dest is None:
-            self._log("Record: choose a destination folder and file name first.")
+            self._log("Record: choose a folder and a file name first.")
             return
         if dest.exists():
-            self._log(f"Record: {dest.name} already exists — rename it first "
-                      "so an existing side is never overwritten.")
+            self._log(f"Record: a file named {dest.name} is already here. Rename it "
+                      "first so you don't record over it.")
             return
 
         self._monitor.stop()                # hand the device to the recorder
@@ -490,7 +585,7 @@ class RecordTab(QWidget):
             self._recorder.start(dev.index, dest, rate, channels, subtype)
         except Exception as exc:
             self._recorder = None
-            self._log(f"Record: could not start recording — {type(exc).__name__}: {exc}")
+            self._log(f"Record: couldn't start recording. {exc}")
             self._restart_monitor()
             return
 
@@ -500,8 +595,7 @@ class RecordTab(QWidget):
         self.rate_combo.setEnabled(False)
         self.depth_combo.setEnabled(False)
         self.recordingStateChanged.emit(True)
-        self._log(f"Record: recording to {dest.name} "
-                  f"({rate} Hz, {subtype.replace('PCM_', '')}-bit, {channels}ch).")
+        self._log(f"Record: recording to {dest.name}. Press Stop at the end of the side.")
 
     def _stop_recording(self) -> None:
         recorder, self._recorder = self._recorder, None
@@ -531,11 +625,11 @@ class RecordTab(QWidget):
     def _report(self, result) -> None:
         peak = ("—" if result.max_peak_dbfs in (None, float("-inf"))
                 else f"{result.max_peak_dbfs:+.1f} dBFS")
-        self._log(f"Record: {result.path.name} — {format_timestamp(result.duration)}, "
-                  f"max peak {peak}.")
+        self._log(f"Record: saved {result.path.name} ({format_timestamp(result.duration)}). "
+                  f"Loudest point: {peak}.")
         if result.clip_runs:
-            self._log(f"  ! Clipping detected at {result.clip_runs} points — consider "
-                      "lowering input gain and re-recording this side.")
+            self._log(f"  ! The sound was too loud and distorted in {result.clip_runs} "
+                      "spot(s). Turn the input volume down and record this side again.")
         for warning in result.warnings:
             self._log(f"  ! {warning}")
 

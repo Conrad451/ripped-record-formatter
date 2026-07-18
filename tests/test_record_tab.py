@@ -321,7 +321,7 @@ def test_refuses_to_overwrite_an_existing_side(qapp, tmp_path):
     tab._start_recording()
 
     assert not tab.recording
-    assert "already exists" in w.log.toPlainText()
+    assert "already here" in w.log.toPlainText()     # plain-language overwrite refusal
     assert existing.read_bytes()                     # untouched
 
 
@@ -414,3 +414,59 @@ def test_monitor_output_vanishing_resets_the_toggle(qapp, no_hardware):
     assert not tab.monitor_check.isChecked()         # toggle reset, cleanly
     assert not tab._passthrough.running
     assert any("monitoring stopped" in m for m in logged)
+
+
+# --------------------------------------------------------------------------- #
+# "Check my setup" (9.5)
+# --------------------------------------------------------------------------- #
+def test_setup_check_flags_192k_and_the_fix_sets_44100(qapp, no_hardware):
+    from gui.main_window import MainWindow
+
+    tab = MainWindow().record_tab
+    tab.settings.set(record_samplerate=0)        # follow the device's own rate (192000)
+    tab.device_combo.setCurrentIndex(_idx_by_name(tab.device_combo, "Line In"))  # 192000
+    tab._run_setup_check()                       # rate flagged immediately
+
+    assert "44,100 Hz" in tab.check_results.text()
+    assert tab.rate_fix_button.isVisibleTo(tab)
+
+    tab._fix_set_rate_44100()                    # one-click fix
+    assert tab.settings.config.record_samplerate == 44100
+    assert not tab.rate_fix_button.isVisibleTo(tab)   # re-check: no longer flagged
+
+
+def test_setup_check_listen_reports_no_signal(qapp, no_hardware):
+    from gui.main_window import MainWindow
+
+    tab = MainWindow().record_tab
+    tab.device_combo.setCurrentIndex(_idx_by_name(tab.device_combo, "Line In"))
+    # Drive the finish directly with an accumulated silent window.
+    tab._pending_check = []
+    tab._checking = True
+    tab._check_peak = -95.0
+    tab._check_clips = 0
+    tab._finish_setup_check()
+    assert "No signal detected" in tab.check_results.text()
+
+
+def test_setup_check_listen_reports_too_hot(qapp, no_hardware):
+    from gui.main_window import MainWindow
+
+    tab = MainWindow().record_tab
+    tab.device_combo.setCurrentIndex(_idx_by_name(tab.device_combo, "Line In"))
+    tab._pending_check = []
+    tab._checking = True
+    tab._check_peak = -1.0
+    tab._check_clips = 3
+    tab._finish_setup_check()
+    assert "much too hot" in tab.check_results.text()
+
+
+def test_setup_check_never_gates_recording(qapp, no_hardware, tmp_path):
+    """Advice, not a wall: a flagged setup does not disable Record."""
+    from gui.main_window import MainWindow
+
+    tab = MainWindow().record_tab
+    tab.device_combo.setCurrentIndex(_idx_by_name(tab.device_combo, "Line In"))
+    tab._run_setup_check()                        # flags 192k
+    assert tab.record_button.isEnabled()          # still recordable
