@@ -593,8 +593,16 @@ def test_persisted_splitter_sizes_still_win_over_defaults(qapp):
     """
     from gui.main_window import MainWindow
 
+    # Tall enough that the tab area's minimum height is not the binding
+    # constraint. At 800px it *is*: the Record tab alone wants ~690px, so the
+    # splitter has no room to honour any drag and this would measure clamping
+    # rather than persistence. The tab has gained controls every release since
+    # v2.3.0 (9.10's album row most recently, with the capture-rate work to
+    # come), so the window under test needs headroom the property can show in.
+    height = 1200
+
     fresh = MainWindow()
-    fresh.resize(1000, 800)
+    fresh.resize(1000, height)
     fresh.show()
     qapp.processEvents()
     default_log_fraction = fresh._main_splitter.sizes()[1] / sum(fresh._main_splitter.sizes())
@@ -604,17 +612,16 @@ def test_persisted_splitter_sizes_still_win_over_defaults(qapp):
     fresh.settings.set(main_split_top=400, main_split_bottom=300)
 
     restored = MainWindow()
-    restored.resize(1000, 800)
+    restored.resize(1000, height)
     restored.show()
     qapp.processEvents()
     top, bottom = restored._main_splitter.sizes()
     log_fraction = bottom / (top + bottom)
     restored.close()
 
-    # Their choice, not the default. (The exact ratio is clamped by the tab
-    # area's minimum height -- which grew in v2.3.1 as the Record tab gained
-    # controls -- so assert the direction, not the pixel: the persisted drag
-    # still makes the log clearly larger than its default share.)
+    # Their choice, not the default: the persisted drag makes the log clearly
+    # larger than its default share. (QSplitter rescales to the real height, so
+    # this stays a ratio assertion, not a pixel one.)
     assert log_fraction > default_log_fraction * 1.5
 
 

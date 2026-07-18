@@ -67,7 +67,7 @@ from core.album import (
 from core.side_partition import Side
 from core.split_review import detect_progressive_drift, segment_deviations, wrong_side_suspected
 from core.timefmt import format_timestamp
-from core.tracks import track_filename
+from core.tracks import safe_part, track_filename
 from gui.playback import AuditionPlayer
 from gui.release_preview import NO_COVER_TEXT, ReleasePreview
 from gui.side_editor import SideEditorDialog, side_letter
@@ -125,6 +125,9 @@ class _Signals(QObject):
 # --------------------------------------------------------------------------- #
 class FullRipTab(QWidget):
     logMessage = Signal(str)
+    #: The between-albums clean slate ran (9.7). Other tabs holding session state
+    #: -- the Record tab's declared album -- clear themselves off this.
+    identityReset = Signal()
 
     def __init__(self, settings):
         super().__init__()
@@ -133,6 +136,11 @@ class FullRipTab(QWidget):
 
         # state
         self._release = None
+        #: Has the user typed an output path themselves? A derived suggestion
+        #: never overwrites a deliberate choice (9.10).
+        self._output_hand_edited = False
+        #: The widget the record-to-rip bridge last pointed the user at.
+        self._emphasised = None
         self._cover = None
         self._work_dir: Path | None = None
         self._analysis: AnalyzeResult | None = None
@@ -284,6 +292,10 @@ class FullRipTab(QWidget):
 
         self.output_edit = QLineEdit(settings.config.output_dir
                                      or settings.config.default_output_dir)
+        # See the Record tab's folder field: textEdited fires only for real
+        # keystrokes, which is the line between a chosen path and an offered one.
+        self.output_edit.textEdited.connect(
+            lambda _t: setattr(self, "_output_hand_edited", True))
         form.addRow("Output folder:", self._path_row(self.output_edit, self._browse_output))
 
         # The destination the encode will *actually* use. An album job captures
@@ -499,10 +511,54 @@ class FullRipTab(QWidget):
         self._set_sides(sides)
         self.define_sides_button.setEnabled(bool(self._flat_titles))
         self.release_preview.set_release(detail)
+        self._suggest_output_folder()
         self._log(f"Full Rip: release '{detail.title}' loaded "
                   f"({len(detail.media)} side(s), cover={'yes' if detail.cover else 'no'}).")
         if detail.cover is None:
             self._log(f"  ! {NO_COVER_TEXT} - tracks will be tagged without a picture.")
+
+    def _suggest_output_folder(self) -> None:
+        """Offer ``{output root}/{Artist}/{Album}`` -- editable, never forced.
+
+        The configured output root is the trunk every derived path hangs off; the
+        folder itself is created at encode time (see :func:`core.converter`), so
+        offering one that does not exist yet costs nothing. A path the user typed
+        is left strictly alone.
+        """
+        if self._release is None or self._output_hand_edited:
+            return
+        root = (self.settings.config.default_output_dir
+                or self.settings.config.output_dir)
+        if not root:
+            return
+        self.output_edit.setText(str(
+            Path(root) / safe_part(self._release.artist)
+            / safe_part(self._release.title)))
+
+    def mapped_side_label(self, path) -> "str | None":
+        """Which side a handed-off WAV mapped to, if it mapped at all.
+
+        The Record tab asks this so its post-stop line can say where the capture
+        went -- the mapping is decided here, but it has to be visible from there.
+        """
+        path = Path(path)
+        wavs = [Path(w) for w in self._album_wavs]
+        if path not in wavs:
+            return None
+        side = self._album_mapping[wavs.index(path)]
+        return None if side is None else f"Side {side_letter(side)}"
+
+    def focus_next_action(self) -> "QWidget | None":
+        """Point the user at the natural next step, and press nothing.
+
+        Arriving from the Record tab's bridge, the next action is Look up release
+        when this album has no identity yet, and Start album when it does.
+        """
+        target = self.lookup_button if self._release is None else self.start_album_btn
+        target.setFocus(Qt.FocusReason.OtherFocusReason)
+        target.setDefault(True)
+        self._emphasised = target
+        return target
 
     def _set_sides(self, sides: list[Side]) -> None:
         self._sides = sides
@@ -938,8 +994,12 @@ class FullRipTab(QWidget):
             return True                                # already listed
 
         # Only adopt it if it is in the folder this tab is already working from.
-        folder = self._album_wavs[0].parent if self._album_wavs else None
-        if folder is None or path.parent != folder:
+        # With nothing loaded there is no folder to disagree with, so the first
+        # recording of a record-first session sets it -- otherwise that session
+        # never lands anywhere and Stop is a dead end (9.10). An album already in
+        # progress is unaffected: this only fires when the table is empty.
+        folder = self._album_wavs[0].parent if self._album_wavs else path.parent
+        if path.parent != folder:
             return False
 
         self._album_wavs = sorted({*self._album_wavs, path})
@@ -1416,6 +1476,13 @@ class FullRipTab(QWidget):
                                   cfg.default_source_dir, is_source=True)
         self._apply_folder_policy(cfg.output_post_album_policy,
                                   cfg.default_output_dir, is_source=False)
+        # A cleared output field is no longer a path the user is defending, so the
+        # next release may offer one again.
+        self._output_hand_edited = bool(self.output_edit.text().strip())
+        self._emphasised = None
+        # The Record tab holds session state of its own (the declared album, the
+        # armed bridge); the clean slate is album-wide, not tab-wide.
+        self.identityReset.emit()
 
     def _apply_folder_policy(self, policy: str, default: str, *, is_source: bool) -> None:
         """Post-album folder behaviour: keep (leave it), reset (to the configured
