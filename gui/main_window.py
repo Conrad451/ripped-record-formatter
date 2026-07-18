@@ -64,6 +64,7 @@ class BatchPanel(QWidget):
         self.settings = settings
         self._file_glob = "*.wav" if kind == "convert" else "*.flac"
         self._cover = None   # set from a selected MusicBrainz release
+        self.mp3_section = None   # Convert only; attached by :class:`MainWindow`
 
         cfg = settings.config
         layout = QVBoxLayout(self)
@@ -175,6 +176,16 @@ class BatchPanel(QWidget):
         self.logMessage.emit(msg)
 
     # --- public API used by MainWindow -------------------------------------
+    def add_export_section(self, section) -> None:
+        """Append the MP3 export section below the track table (Convert only).
+
+        The section is built by :class:`MainWindow` rather than here because it
+        reads from the Full Rip tab (for "the album just finished"), which a
+        panel has no business knowing about.
+        """
+        self.mp3_section = section
+        self.layout().addWidget(section)
+
     def set_source_dir(self, path: str) -> None:
         self.source_edit.setText(path)
         self.settings.set(source_dir=path)
@@ -240,6 +251,8 @@ class BatchPanel(QWidget):
     def set_running(self, running: bool) -> None:
         self.run_button.setEnabled(not running)
         self.load_button.setEnabled(not running)
+        if self.mp3_section is not None:
+            self.mp3_section.set_running(running)
 
 
 class MainWindow(QMainWindow):
@@ -286,6 +299,24 @@ class MainWindow(QMainWindow):
         for panel in (self.convert_panel, self.retag_panel):
             panel.logMessage.connect(self._log)
             panel.runRequested.connect(lambda p=panel: self._start_job(p))
+
+        # Export to MP3 lives under the Convert tab: it is the same "turn a
+        # folder into another folder" shape, and it is a convenience for devices
+        # rather than a mode of its own. Built here because it reads the Full Rip
+        # tab's last output; run through the very same worker as a conversion.
+        from gui.mp3_export import Mp3ExportSection
+
+        self.mp3_section = Mp3ExportSection(
+            self.settings,
+            output_root=lambda: (self.settings.config.default_output_dir
+                                 or self.convert_panel.output_edit.text().strip()),
+            recent_album_dir=lambda: getattr(self.full_rip, "_album_output_root", ""),
+            metadata=lambda: (self.convert_panel.artist_edit.text().strip(),
+                              self.convert_panel.album_edit.text().strip()),
+        )
+        self.mp3_section.logMessage.connect(self._log)
+        self.mp3_section.exportRequested.connect(self._start_export)
+        self.convert_panel.add_export_section(self.mp3_section)
 
         self.full_rip.logMessage.connect(self._log)
         self.metadata_panel.statusMessage.connect(self._log)
@@ -385,7 +416,13 @@ class MainWindow(QMainWindow):
 
     # --- job orchestration -------------------------------------------------
     def _start_job(self, panel: BatchPanel) -> None:
-        job = panel.collect_job()
+        self._run_job(panel.collect_job())
+
+    def _start_export(self) -> None:
+        """Run the Convert tab's MP3 export -- same plumbing, different job."""
+        self._run_job(self.mp3_section.collect_job())
+
+    def _run_job(self, job) -> None:
         if job is None:
             return
         operation, tracks, output_dir, kwargs = job
