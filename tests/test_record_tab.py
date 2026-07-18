@@ -228,6 +228,48 @@ def test_rate_picker_recommends_native_and_marks_unsupported(qapp):
     assert "needs a Windows Sound change" not in supported  # 48k does open
 
 
+def test_a_remembered_rate_that_no_longer_opens_falls_back_to_native(qapp):
+    from gui.main_window import MainWindow
+
+    tab = MainWindow().record_tab
+    tab.settings.set(record_samplerate=44100)         # saved against another device
+    tab.device_combo.setCurrentIndex(_idx_by_name(tab.device_combo, "Line In"))
+    tab._on_device_changed()
+    assert tab.rate_combo.currentData() == 192000     # 44.1k can't open here
+
+
+def test_an_unopenable_rate_is_refused_in_plain_words_not_a_portaudio_error(
+        qapp, no_hardware, monkeypatch, tmp_path):
+    """Picking a rate WASAPI won't grant must produce one explanatory line -- never
+    a raw PortAudioError -9997 in the user's face."""
+    import sounddevice as sd
+
+    import core.recorder as rec_mod
+    from gui.main_window import MainWindow
+
+    def explode(self, *a, **kw):
+        raise sd.PortAudioError(
+            "Error opening InputStream: Invalid sample rate [PaErrorCode -9997]")
+
+    monkeypatch.setattr(rec_mod.Recorder, "start", explode)
+
+    tab = MainWindow().record_tab
+    tab.device_combo.setCurrentIndex(_idx_by_name(tab.device_combo, "Line In"))
+    tab.folder_edit.setText(str(tmp_path))
+    logged: list[str] = []
+    monkeypatch.setattr(tab, "_log", logged.append)
+
+    tab._start_recording()
+
+    assert logged, "the failure must say something"
+    line = logged[-1]
+    assert "can't record at" in line                  # plain words...
+    assert "192000 Hz" in line                        # ...naming the rate to pick
+    assert "44,100 Hz regardless" in line             # ...and reassuring about output
+    assert "PaErrorCode" not in line and "-9997" not in line   # never the raw error
+    assert not tab.recording
+
+
 # --------------------------------------------------------------------------- #
 # The payoff: record -> rip handoff
 # --------------------------------------------------------------------------- #

@@ -45,13 +45,16 @@ from core.recorder import (
 from core.setup_check import INFO, OK, WARN, CheckResult, check_sample_rate, check_signal
 
 
+from core.timefmt import format_timestamp
+from gui.level_history import LevelHistoryStrip
+from gui.meters import LevelMeters
+
+
 def _is_rate_error(message: str) -> bool:
     """Whether a stream-open failure is a shared-mode rate rejection (-9997)."""
     m = message.lower()
     return "9997" in m or "invalid sample rate" in m
-from core.timefmt import format_timestamp
-from gui.level_history import LevelHistoryStrip
-from gui.meters import LevelMeters
+
 
 #: Offered regardless of what the device claims natively -- a Realtek line input
 #: reports 192000 under WASAPI even when the whole chain is 44.1k.
