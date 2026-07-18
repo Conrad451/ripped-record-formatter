@@ -239,6 +239,28 @@ def test_an_unset_session_behaves_exactly_as_before(qapp, tmp_path):
     assert tab.process_button.isEnabled() is True     # ...but the bridge still works
 
 
+def test_the_album_lookup_reuses_the_existing_metadata_panel(qapp, monkeypatch):
+    """One lookup UI in the app, opened as a modal -- not a second one built here."""
+    from PySide6.QtWidgets import QDialog
+    from gui.main_window import MainWindow
+    from gui.metadata_panel import MetadataPanel
+
+    monkeypatch.setattr(QDialog, "exec", lambda self: None)   # don't block
+
+    w = MainWindow()
+    tab = w.record_tab
+    tab.lookup_button.click()
+
+    panel = tab.findChild(MetadataPanel)
+    assert panel is not None                     # the real panel, hosted in a dialog
+    assert panel._settings is tab.settings       # ...and it can see the MB contact
+
+    # Choosing a release in it is what declares the album.
+    panel.releaseSelected.emit(_release())
+    assert tab.release is not None
+    assert tab.release.title == "Songs From the Big Chair"
+
+
 def test_declaring_an_album_shows_the_compact_preview_strip(qapp):
     """The release-preview strip appears in the Album row once one is chosen."""
     from gui.main_window import MainWindow
