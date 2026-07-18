@@ -14,6 +14,7 @@ from PySide6.QtCore import Qt, QThreadPool, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
+    QDialog,
     QFileDialog,
     QGridLayout,
     QHBoxLayout,
@@ -114,11 +115,20 @@ class BatchPanel(QWidget):
 
         self.soundtrack_check: QCheckBox | None = None
         self.delete_check: QCheckBox | None = None
+        self.lookup_button: QPushButton | None = None
         if kind == "convert":
             self.soundtrack_check = QCheckBox("Soundtrack mode (per-track artist)")
             self.soundtrack_check.toggled.connect(self._update_artist_column)
             controls.addWidget(self.soundtrack_check)
         else:
+            # Re-tagging a folder is precisely when you want a tracklist, and
+            # until now the only way in was the standalone Metadata tab -- which
+            # applies to whichever batch panel you happened to visit last. This
+            # opens the same panel scoped to this tab, so the release lands here.
+            self.lookup_button = QPushButton("Look up release...")
+            self.lookup_button.clicked.connect(self._open_lookup)
+            controls.addWidget(self.lookup_button)
+
             self.delete_check = QCheckBox("Delete source files after re-tag")
             self.delete_check.setChecked(False)
             controls.addWidget(self.delete_check)
@@ -237,9 +247,34 @@ class BatchPanel(QWidget):
             self.model.paste_titles(0, titles)
         self._cover = detail.cover
 
+    def _open_lookup(self) -> None:
+        """Open the shared MetadataPanel as a modal, wired to this panel only."""
+        from gui.metadata_panel import MetadataPanel
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Look up release")
+        dialog.resize(760, 640)
+        layout = QVBoxLayout(dialog)
+        # settings carries the user's MusicBrainz contact (and the panel's
+        # splitter position); without it the lookup would identify itself as
+        # having no contact even when one is configured.
+        panel = MetadataPanel(settings=self.settings)
+        panel.artist_edit.setText(self.artist_edit.text())
+        panel.album_edit.setText(self.album_edit.text())
+        panel.statusMessage.connect(self.logMessage)
+        panel.releaseSelected.connect(
+            lambda detail: (self.apply_release(detail), dialog.accept()))
+        layout.addWidget(panel)
+        # Opening with artist/album already filled in *is* the search intent;
+        # making the user press Search again is friction. An empty open waits.
+        panel.search_on_open()
+        dialog.exec()
+
     def set_running(self, running: bool) -> None:
         self.run_button.setEnabled(not running)
         self.load_button.setEnabled(not running)
+        if self.lookup_button is not None:
+            self.lookup_button.setEnabled(not running)
 
 
 class MainWindow(QMainWindow):
@@ -329,6 +364,9 @@ class MainWindow(QMainWindow):
 
         self._restore_main_split()
         self.setCentralWidget(central)
+        # Last, so the central widget's size hints are in place and cannot
+        # argue with the frame we just restored.
+        self._restore_geometry()
         self._log("Ready. Full Rip a side, or Convert/Re-tag folders. "
                   "Use Metadata to pull tracklists + cover art.")
 
@@ -380,6 +418,7 @@ class MainWindow(QMainWindow):
                   f"-> applied to the {which} panel.")
 
     def closeEvent(self, event) -> None:
+        self._save_geometry()
         self.full_rip.cleanup()
         super().closeEvent(event)
 
@@ -444,6 +483,83 @@ class MainWindow(QMainWindow):
         width = min(1280, int(available.width() * 0.72))
         height = min(1000, int(available.height() * 0.92))
         return max(1000, width), max(700, height)
+
+    # --- window geometry persistence ---------------------------------------
+    #: A restored window must overlap a screen by at least this fraction of its
+    #: own area. A sliver on screen is not "visible": the user cannot reliably
+    #: grab a title bar that is 20px wide, and a window they cannot grab is a
+    #: window they cannot rescue. Generous enough that a large window on a small
+    #: laptop screen still passes (1280x1000 onto a 800x600 desktop is ~38%).
+    _MIN_ON_SCREEN_FRACTION = 0.25
+
+    @staticmethod
+    def _rect_is_on_a_screen(rect) -> bool:
+        """True when *rect* meaningfully overlaps some connected screen.
+
+        Checked against every screen's *available* geometry (so the taskbar does
+        not count as somewhere a window may live), because the monitor a window
+        was closed on may be gone -- unplugged dock, laptop undocked, projector
+        detached -- leaving a saved position that lands in dead space.
+        """
+        from PySide6.QtGui import QGuiApplication
+
+        area = rect.width() * rect.height()
+        if area <= 0:
+            return False
+        for screen in QGuiApplication.screens():
+            overlap = screen.availableGeometry().intersected(rect)
+            if overlap.width() * overlap.height() >= area * MainWindow._MIN_ON_SCREEN_FRACTION:
+                return True
+        return False
+
+    def _center_on_primary(self) -> None:
+        """Fall back to a sane default size, centred on the primary screen."""
+        from PySide6.QtGui import QGuiApplication
+
+        width, height = self._default_window_size()
+        self.resize(width, height)
+        screen = QGuiApplication.primaryScreen()
+        if screen is None:                       # headless / offscreen
+            return
+        available = screen.availableGeometry()
+        self.move(available.x() + (available.width() - width) // 2,
+                  available.y() + (available.height() - height) // 2)
+
+    def _restore_geometry(self) -> None:
+        """Restore the saved frame, but only where the user can actually see it."""
+        from PySide6.QtCore import QRect
+
+        cfg = self.settings.config
+        if cfg.window_w <= 0 or cfg.window_h <= 0:      # nothing saved yet
+            self._center_on_primary()
+            return
+
+        saved = QRect(cfg.window_x, cfg.window_y, cfg.window_w, cfg.window_h)
+        if not self._rect_is_on_a_screen(saved):
+            self._center_on_primary()
+            return
+
+        self.setGeometry(saved)
+        if cfg.window_maximized:
+            from PySide6.QtCore import Qt as _Qt
+
+            # setWindowState, not showMaximized(): this runs inside __init__ and
+            # showing the window is app.py's call to make, not the constructor's.
+            # The state is remembered and applied when show() eventually happens.
+            self.setWindowState(self.windowState() | _Qt.WindowState.WindowMaximized)
+
+    def _save_geometry(self) -> None:
+        """Record the frame on close, as one write rather than four."""
+        maximized = self.isMaximized()
+        # A maximized window's geometry() is the maximized rect; saving that and
+        # then un-maximizing would strand the user with no smaller size to
+        # return to. normalGeometry() is the frame underneath.
+        rect = self.normalGeometry() if maximized else self.geometry()
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+        self.settings.set(window_x=rect.x(), window_y=rect.y(),
+                          window_w=rect.width(), window_h=rect.height(),
+                          window_maximized=maximized)
 
     def _log(self, message: str) -> None:
         self.log.appendPlainText(message)

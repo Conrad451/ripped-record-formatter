@@ -926,3 +926,203 @@ def test_recheck_mapping_unmaps_the_side_and_returns_to_the_table(qapp, tmp_path
     assert fr.diagnosis_box.isHidden()
     assert fr._album_review_index is None
     fr._album.shutdown(wait=True)
+
+
+# --------------------------------------------------------------------------- #
+# Window geometry: restored only where the user can actually see it
+# --------------------------------------------------------------------------- #
+def _available_rect():
+    from PySide6.QtGui import QGuiApplication
+
+    screen = QGuiApplication.primaryScreen()
+    return screen.availableGeometry() if screen is not None else None
+
+
+def _seed_geometry(**fields):
+    """Persist geometry to the (test-isolated) config without opening a window.
+
+    A MainWindow closed to seed config would overwrite these values from its own
+    frame in closeEvent, so the seeding has to bypass the window entirely.
+    """
+    from gui.main_window import Settings
+
+    Settings().set(**fields)
+
+
+def test_offscreen_rect_is_rejected_and_an_onscreen_one_accepted(qapp):
+    """The screen test itself, against the real screen list."""
+    from PySide6.QtCore import QRect
+    from gui.main_window import MainWindow
+
+    available = _available_rect()
+    if available is None:
+        pytest.skip("no screen available")
+
+    # Far outside any screen: the saved position of a window last closed on a
+    # monitor that has since been unplugged.
+    assert MainWindow._rect_is_on_a_screen(QRect(-30000, -30000, 1200, 800)) is False
+    assert MainWindow._rect_is_on_a_screen(QRect(available.x() + 40000,
+                                                 available.y(), 1200, 800)) is False
+    # A sliver overlapping by a few pixels is not "visible" -- there is no title
+    # bar left to grab, which is exactly the state the user cannot recover from.
+    assert MainWindow._rect_is_on_a_screen(
+        QRect(available.right() - 5, available.y(), 1200, 800)) is False
+    # Squarely on the screen.
+    assert MainWindow._rect_is_on_a_screen(
+        QRect(available.x() + 20, available.y() + 20,
+              min(800, available.width()), min(600, available.height()))) is True
+    # A degenerate saved rect is never restorable.
+    assert MainWindow._rect_is_on_a_screen(QRect(0, 0, 0, 0)) is False
+
+
+def test_launch_rejects_an_offscreen_saved_rect_and_centers_instead(qapp):
+    """The half-off-screen spawn, end to end: bad rect in config, sane window out."""
+    from PySide6.QtCore import QRect
+    from gui.main_window import MainWindow
+
+    available = _available_rect()
+    if available is None:
+        pytest.skip("no screen available")
+
+    # Write the bad rect straight to config. Doing it through a live window and
+    # closing it would not work: closeEvent persists that window's own (valid)
+    # geometry over the top, and the test would silently stop testing anything.
+    _seed_geometry(window_x=-30000, window_y=-30000, window_w=1200, window_h=800,
+                   window_maximized=False)
+
+    restored = MainWindow()
+    try:
+        geom = restored.geometry()
+        assert (geom.x(), geom.y()) != (-30000, -30000)
+        assert MainWindow._rect_is_on_a_screen(
+            QRect(geom.x(), geom.y(), geom.width(), geom.height()))
+    finally:
+        restored.close()
+
+
+def test_launch_restores_a_saved_rect_that_still_lands_on_a_screen(qapp):
+    """The other half of the rule: a good position is honoured, not overridden."""
+    from gui.main_window import MainWindow
+
+    available = _available_rect()
+    if available is None:
+        pytest.skip("no screen available")
+
+    seed = MainWindow()
+    seed.setGeometry(available.x() + 30, available.y() + 30,
+                     min(900, available.width()), min(700, available.height()))
+    # Read back rather than trusting the request: Qt clamps to the layout's
+    # minimum size, so the frame actually saved may be larger than we asked for.
+    # The contract under test is "reopens where it closed", not "obeys any size".
+    saved = seed.geometry()
+    seed.close()
+
+    restored = MainWindow()
+    try:
+        geom = restored.geometry()
+        assert (geom.x(), geom.y()) == (saved.x(), saved.y())
+        assert (geom.width(), geom.height()) == (saved.width(), saved.height())
+    finally:
+        restored.close()
+
+
+def test_close_persists_the_window_frame(qapp):
+    """closeEvent writes the frame, so the next launch has something to restore."""
+    from gui.main_window import MainWindow
+
+    available = _available_rect()
+    if available is None:
+        pytest.skip("no screen available")
+
+    w = MainWindow()
+    w.setGeometry(available.x() + 25, available.y() + 25,
+                  min(880, available.width()), min(640, available.height()))
+    saved = w.geometry()          # post-clamp, see the restore test above
+    w.close()
+
+    cfg = w.settings.config
+    assert (cfg.window_w, cfg.window_h) == (saved.width(), saved.height())
+    assert (cfg.window_x, cfg.window_y) == (saved.x(), saved.y())
+    assert cfg.window_maximized is False
+
+
+# --------------------------------------------------------------------------- #
+# Re-tag tab: its own release lookup, feeding this tab and nothing else
+# --------------------------------------------------------------------------- #
+def test_retag_tab_has_a_lookup_button_and_convert_does_not(qapp):
+    from gui.main_window import MainWindow
+
+    w = MainWindow()
+    try:
+        assert w.retag_panel.lookup_button is not None
+        assert "Look up release" in w.retag_panel.lookup_button.text()
+        assert w.convert_panel.lookup_button is None    # scoped to Re-tag
+    finally:
+        w.close()
+
+
+def test_retag_lookup_fills_the_table_and_threads_cover_art(qapp):
+    """A selected release fills artist/album, retitles rows in order, keeps art."""
+    from pathlib import Path
+
+    from gui.main_window import MainWindow
+    from gui.metadata_panel import MetadataPanel
+    from gui.track_model import Row
+
+    cover = _png_cover()
+    w = MainWindow()
+    try:
+        retag = w.retag_panel
+        # apply_release retitles rows that exist; seed the table as "Load FLACs" would.
+        retag.model.set_rows([Row(title="track01", artist="", source_path=Path("a/01.flac"))])
+        retag.artist_edit.setText("")
+        retag.album_edit.setText("")
+
+        panel = MetadataPanel(provider=_StubProvider(cover=cover))
+        # Wired exactly as BatchPanel._open_lookup wires it: straight to this panel.
+        panel.releaseSelected.connect(retag.apply_release)
+
+        panel.artist_edit.setText("Miles Davis")
+        panel.search_on_open()
+        assert _wait(lambda: panel.results_table.rowCount() == 1)
+        panel.results_table.selectRow(0)
+        panel._start_fetch_detail()                     # "Use selected release"
+        assert _wait(lambda: retag.artist_edit.text() == "Miles Davis")
+
+        assert retag.album_edit.text() == "Kind of Blue"
+        assert retag.model.rows()[0].title == "So What"     # filled by order
+        assert retag._cover is cover                        # stashed for the pass
+
+        # And it reaches the re-tag call itself, as cover=.
+        retag.source_edit.setText("src")
+        retag.output_edit.setText("out")
+        operation, tracks, output_dir, kwargs = retag.collect_job()
+        assert kwargs["cover"] is cover
+    finally:
+        w.close()
+
+
+def test_a_window_closed_maximized_reopens_maximized(qapp):
+    """The maximized flag round-trips, and the frame under it is kept.
+
+    Restoring must not *show* the window -- app.py owns that call -- so the state
+    is set rather than showMaximized()'d, and only becomes visible on show().
+    """
+    from PySide6.QtCore import Qt
+    from gui.main_window import MainWindow
+
+    available = _available_rect()
+    if available is None:
+        pytest.skip("no screen available")
+
+    _seed_geometry(window_x=available.x() + 40, window_y=available.y() + 40,
+                   window_w=min(900, available.width()),
+                   window_h=min(700, available.height()),
+                   window_maximized=True)
+
+    restored = MainWindow()
+    try:
+        assert bool(restored.windowState() & Qt.WindowState.WindowMaximized)
+        assert not restored.isVisible()          # constructing never shows it
+    finally:
+        restored.close()

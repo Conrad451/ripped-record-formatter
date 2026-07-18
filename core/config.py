@@ -167,6 +167,21 @@ class Config:
     meta_split_top: int = 0
     meta_split_bottom: int = 0
 
+    # --- main window geometry (px; w/h of 0 = never saved, use default) ---
+    window_x: int = 0
+    window_y: int = 0
+    window_w: int = 0
+    window_h: int = 0
+    """Last normal (non-maximized) frame of the main window. The sentinel lives
+    on w/h, never on x/y: a window on a monitor left of or above the primary one
+    has legitimately negative coordinates, so 0 there is a real position. Restored
+    only when the rect still lands on a connected screen -- see
+    MainWindow._restore_geometry."""
+
+    window_maximized: bool = False
+    """Reopen maximized if it was closed that way, with the fields above holding
+    the underlying normal frame to un-maximize back onto."""
+
 
 def config_path() -> Path:
     """Full path to the settings file in the per-user config directory."""
