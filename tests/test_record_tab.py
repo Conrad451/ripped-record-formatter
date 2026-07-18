@@ -41,7 +41,14 @@ def no_hardware(monkeypatch):
         DeviceInfo(index=2, name="USB Microphone", hostapi="MME",
                    samplerate=44100, max_channels=2),
     ]
+    outputs = [
+        DeviceInfo(index=5, name="Speakers (Realtek)", hostapi="Windows WASAPI",
+                   samplerate=48000, max_channels=2),
+        DeviceInfo(index=9, name="Headphones (USB)", hostapi="Windows WASAPI",
+                   samplerate=44100, max_channels=2),
+    ]
     monkeypatch.setattr(tab_mod, "list_input_devices", lambda: devices)
+    monkeypatch.setattr(tab_mod, "list_output_devices", lambda: outputs)
     monkeypatch.setattr(rec_mod.LevelMonitor, "start", lambda self, *a, **k: None)
     monkeypatch.setattr(rec_mod.LevelMonitor, "stop", lambda self: None)
     return devices
@@ -316,3 +323,94 @@ def test_refuses_to_overwrite_an_existing_side(qapp, tmp_path):
     assert not tab.recording
     assert "already exists" in w.log.toPlainText()
     assert existing.read_bytes()                     # untouched
+
+
+# --------------------------------------------------------------------------- #
+# Software monitoring (passthrough): toggle, feedback guard, failure isolation
+# --------------------------------------------------------------------------- #
+class _FakePassthrough:
+    """Stands in for core.recorder.Passthrough -- no real audio streams."""
+
+    def __init__(self):
+        self.running = False
+        self.error = ""
+        self.latency_s = 0.05
+        self.started_with = None
+
+    def start(self, in_dev, out_dev, rate, channels):
+        self.started_with = (in_dev, out_dev, rate, channels)
+        self.running = True
+
+    def stop(self):
+        self.running = False
+
+
+def _idx_by_name(combo, name):
+    for i in range(combo.count()):
+        if name in combo.itemText(i):
+            return i
+    return 0
+
+
+def test_monitor_toggle_starts_passthrough_and_persists(qapp, no_hardware):
+    from gui.main_window import MainWindow
+
+    tab = MainWindow().record_tab
+    tab.set_active(True)
+    tab._passthrough = _FakePassthrough()
+
+    # Distinct input and output (no feedback), then switch monitoring on.
+    tab.device_combo.setCurrentIndex(_idx_by_name(tab.device_combo, "Line In"))
+    tab.monitor_combo.setCurrentIndex(_idx_by_name(tab.monitor_combo, "Speakers"))
+    tab.monitor_check.setChecked(True)
+
+    assert tab.settings.config.monitor_enabled is True
+    assert tab.settings.config.monitor_device == "Speakers (Realtek)"
+    assert tab._passthrough.running
+    assert tab.monitor_indicator.isVisibleTo(tab)
+
+
+def test_monitor_refuses_the_same_endpoint(qapp, monkeypatch, no_hardware):
+    import gui.record_tab as tab_mod
+    from gui.main_window import MainWindow
+
+    # An output whose NAME matches an input -> monitoring it would feed back.
+    same = [DeviceInfo(index=7, name="Line In (Realtek)", hostapi="Windows WASAPI",
+                       samplerate=192000, max_channels=2)]
+    monkeypatch.setattr(tab_mod, "list_output_devices", lambda: same)
+
+    tab = MainWindow().record_tab
+    tab.set_active(True)
+    tab._passthrough = _FakePassthrough()
+    logged: list[str] = []
+    tab.logMessage.connect(logged.append)
+
+    tab.device_combo.setCurrentIndex(_idx_by_name(tab.device_combo, "Line In"))
+    tab.monitor_combo.setCurrentIndex(0)             # "Line In (Realtek)" output
+    tab.monitor_check.setChecked(True)
+
+    assert not tab.monitor_check.isChecked()         # the guard reset the toggle
+    assert not tab._passthrough.running
+    assert any("feed back" in m or "same device" in m for m in logged)
+
+
+def test_monitor_output_vanishing_resets_the_toggle(qapp, no_hardware):
+    from gui.main_window import MainWindow
+
+    tab = MainWindow().record_tab
+    tab.set_active(True)
+    tab._passthrough = _FakePassthrough()
+    tab.device_combo.setCurrentIndex(_idx_by_name(tab.device_combo, "Line In"))
+    tab.monitor_combo.setCurrentIndex(_idx_by_name(tab.monitor_combo, "Speakers"))
+    tab.monitor_check.setChecked(True)
+    assert tab._passthrough.running
+
+    # The output device vanishes: the passthrough sets .error on its audio thread.
+    tab._passthrough.error = "PortAudioError: device unavailable"
+    logged: list[str] = []
+    tab.logMessage.connect(logged.append)
+    tab._drain_telemetry()                           # the health check notices it
+
+    assert not tab.monitor_check.isChecked()         # toggle reset, cleanly
+    assert not tab._passthrough.running
+    assert any("monitoring stopped" in m for m in logged)

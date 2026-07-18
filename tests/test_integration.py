@@ -612,8 +612,10 @@ def test_persisted_splitter_sizes_still_win_over_defaults(qapp):
     restored.close()
 
     # Their choice, not the default. (The exact ratio is clamped by the tab
-    # area's minimum height, so assert the direction, not the pixel.)
-    assert log_fraction > default_log_fraction * 2
+    # area's minimum height -- which grew in v2.3.1 as the Record tab gained
+    # controls -- so assert the direction, not the pixel: the persisted drag
+    # still makes the log clearly larger than its default share.)
+    assert log_fraction > default_log_fraction * 1.5
 
 
 # --------------------------------------------------------------------------- #

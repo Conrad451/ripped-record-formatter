@@ -19,6 +19,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -31,7 +32,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.recorder import LevelMonitor, Recorder, list_input_devices
+from core.recorder import (
+    LevelMonitor,
+    Passthrough,
+    Recorder,
+    list_input_devices,
+    list_output_devices,
+)
 from core.timefmt import format_timestamp
 from gui.level_history import LevelHistoryStrip
 from gui.meters import LevelMeters
@@ -114,6 +121,27 @@ class RecordTab(QWidget):
         self.depth_combo.setCurrentIndex(max(0, idx))
         self.depth_combo.currentIndexChanged.connect(self._on_format_changed)
         form.addRow("Bit depth:", self.depth_combo)
+
+        # --- software monitoring (opt-in passthrough to an output device) ------
+        # Checkbox + output picker + a small live indicator share one row, so the
+        # feature costs the Input group a single line.
+        self._output_devices = []
+        self._passthrough = Passthrough()
+        monitor_row = QHBoxLayout()
+        self.monitor_check = QCheckBox("Monitor")
+        self.monitor_check.setChecked(bool(cfg.monitor_enabled))
+        self.monitor_check.setToolTip("Hear the input on the output device below.")
+        self.monitor_check.toggled.connect(self._on_monitor_changed)
+        monitor_row.addWidget(self.monitor_check)
+        self.monitor_combo = QComboBox()
+        self.monitor_combo.currentIndexChanged.connect(self._on_monitor_changed)
+        monitor_row.addWidget(self.monitor_combo, 1)
+        self.monitor_indicator = QLabel("● live")
+        self.monitor_indicator.setStyleSheet(
+            "QLabel { color: #2e7d32; font-weight: bold; }")
+        self.monitor_indicator.setVisible(False)
+        monitor_row.addWidget(self.monitor_indicator)
+        form.addRow("Monitor output:", self._wrap(monitor_row))
         root.addWidget(input_box)
 
         # --- levels ------------------------------------------------------------
@@ -133,6 +161,16 @@ class RecordTab(QWidget):
                            "gain until peaks stay below −3 dBFS.")
         self.hint.setWordWrap(True)
         level_layout.addWidget(self.hint)
+
+        self.monitor_hint = QLabel(
+            "Tip: your interface's own headphone jack monitors with zero latency; "
+            "this software path adds a little delay.")
+        self.monitor_hint.setWordWrap(True)
+        self.monitor_hint.setStyleSheet("QLabel { color: palette(mid); }")
+        self.monitor_hint.setToolTip(
+            "Monitor passes the input through to your chosen output device so you "
+            "can hear the record without Windows' 'Listen to this device'.")
+        level_layout.addWidget(self.monitor_hint)
         root.addWidget(level_box)
 
         # --- destination + transport -------------------------------------------
@@ -222,11 +260,34 @@ class RecordTab(QWidget):
         wanted = next((i for i, d in enumerate(self._devices)
                        if d.name == remembered), 0)
         self.device_combo.setCurrentIndex(wanted)
+        self._refresh_output_devices()
         self._on_device_changed()
+
+    def _refresh_output_devices(self) -> None:
+        """Populate the monitor output picker, remembered by NAME like the input."""
+        remembered = self.settings.config.monitor_device
+        try:
+            self._output_devices = list_output_devices()
+        except Exception as exc:
+            self._output_devices = []
+            self._log(f"Record: could not enumerate output devices ({exc}).")
+
+        self.monitor_combo.blockSignals(True)
+        self.monitor_combo.clear()
+        for dev in self._output_devices:
+            self.monitor_combo.addItem(dev.label(), dev.index)
+        wanted = next((i for i, d in enumerate(self._output_devices)
+                       if d.name == remembered), 0)
+        self.monitor_combo.setCurrentIndex(wanted if self._output_devices else -1)
+        self.monitor_combo.blockSignals(False)
 
     def current_device(self):
         i = self.device_combo.currentIndex()
         return self._devices[i] if 0 <= i < len(self._devices) else None
+
+    def current_output_device(self):
+        i = self.monitor_combo.currentIndex()
+        return self._output_devices[i] if 0 <= i < len(self._output_devices) else None
 
     def _on_device_changed(self, *_args) -> None:
         dev = self.current_device()
@@ -250,6 +311,7 @@ class RecordTab(QWidget):
         self.record_button.setEnabled(True)
         self.record_button.setToolTip("")
         self._restart_monitor()
+        self._restart_passthrough()
 
     def _on_format_changed(self, *_args) -> None:
         self.settings.set(
@@ -257,6 +319,69 @@ class RecordTab(QWidget):
             record_subtype=str(self.depth_combo.currentData() or "PCM_16"),
         )
         self._restart_monitor()
+        self._restart_passthrough()
+
+    # -- software monitoring (passthrough) -----------------------------------
+    def _on_monitor_changed(self, *_args) -> None:
+        out = self.current_output_device()
+        self.settings.set(
+            monitor_enabled=bool(self.monitor_check.isChecked()),
+            monitor_device=out.name if out is not None else "",
+        )
+        self._restart_passthrough()
+
+    def _restart_passthrough(self) -> None:
+        """Start/stop the input->output passthrough from the current controls.
+
+        Runs whenever monitoring is on and the tab is up or recording -- it is
+        independent of the Recorder, so it happily runs *alongside* a capture.
+        Refuses a same-endpoint output (feedback) and reports an open failure,
+        resetting the toggle in either case.
+        """
+        self._passthrough.stop()
+        want = self.monitor_check.isChecked() and (self._active or self.recording)
+        if not want:
+            self._update_monitor_indicator()
+            return
+        dev = self.current_device()
+        out = self.current_output_device()
+        if dev is None or out is None:
+            self._update_monitor_indicator()
+            return
+        if dev.name == out.name:
+            self._log("Record: not monitoring -- the output is the same device as "
+                      "the input, which would feed back. Pick a different output.")
+            self._set_monitor_off()
+            return
+        rate = int(self.rate_combo.currentData() or dev.samplerate)
+        channels = min(2, dev.max_channels, out.max_channels) or 1
+        self._passthrough.start(dev.index, out.index, rate, channels)
+        if self._passthrough.error:
+            self._log(f"Record: could not start monitoring "
+                      f"({self._passthrough.error}).")
+            self._passthrough.stop()
+            self._set_monitor_off()
+        elif self._passthrough.latency_s > 0.15:
+            # Say nothing about latency unless it is genuinely bad: Windows'
+            # shared-mode audio can add well over 150 ms, which the headphone jack
+            # avoids entirely.
+            self._log(f"Record: monitoring has about "
+                      f"{self._passthrough.latency_s * 1000:.0f} ms of delay on this "
+                      "machine (Windows shared-mode audio). For in-time listening, "
+                      "use your interface's headphone jack.")
+        self._update_monitor_indicator()
+
+    def _set_monitor_off(self) -> None:
+        """Untick the toggle without re-entering the change handler, and persist."""
+        self.monitor_check.blockSignals(True)
+        self.monitor_check.setChecked(False)
+        self.monitor_check.blockSignals(False)
+        self.settings.set(monitor_enabled=False)
+        self._update_monitor_indicator()
+
+    def _update_monitor_indicator(self) -> None:
+        self.monitor_indicator.setVisible(
+            self._passthrough.running and not self._passthrough.error)
 
     # -- level monitoring (pre-roll gain setting) ----------------------------
     def set_active(self, active: bool) -> None:
@@ -266,6 +391,7 @@ class RecordTab(QWidget):
             self._restart_monitor()
         elif not self.recording:
             self._monitor.stop()
+        self._restart_passthrough()      # monitoring follows visibility too
 
     def _restart_monitor(self) -> None:
         """Run the meters whenever the tab is up and a device is chosen."""
@@ -301,6 +427,13 @@ class RecordTab(QWidget):
 
     def _drain_telemetry(self) -> None:
         """GUI thread: repaint at most 20x/second, from the newest sample only."""
+        # Monitor health: an output that vanished mid-passthrough sets .error on
+        # the audio thread. Notice it here, reset the toggle, and say so plainly.
+        # The capture, being a separate object, is untouched.
+        if self._passthrough.running and self._passthrough.error:
+            self._log(f"Record: monitoring stopped ({self._passthrough.error}).")
+            self._passthrough.stop()
+            self._set_monitor_off()
         telemetry = self._latest
         if telemetry is None:
             return
@@ -411,3 +544,4 @@ class RecordTab(QWidget):
         if self._recorder is not None:
             self._stop_recording()
         self._monitor.stop()
+        self._passthrough.stop()
