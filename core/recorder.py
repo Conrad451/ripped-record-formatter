@@ -97,6 +97,10 @@ class Telemetry:
     peaks_dbfs: list[float] = field(default_factory=list)   # per channel, this window
     max_peak_dbfs: float = -np.inf                          # running, whole session
     clip_runs: int = 0
+    clip_runs_by_channel: list[int] = field(default_factory=list)
+    """Latching clip-run count per channel, so the history strip can put a tick in
+    the lane that clipped. Empty when the producer doesn't track it; ``clip_runs``
+    stays the aggregate either way."""
     elapsed_s: float = 0.0
     bytes_written: int = 0
 
@@ -173,28 +177,85 @@ def list_output_devices() -> list[DeviceInfo]:
     return devices
 
 
-class _ClipCounter:
-    """Counts runs of consecutive full-scale frames, across block boundaries."""
+def supported_input_rates(device: int, channels: int, candidates,
+                          *, probe=None) -> list[int]:
+    """Which of ``candidates`` this input device will actually open at.
 
-    def __init__(self, level: float = CLIP_LEVEL, run_len: int = CLIP_RUN_LEN) -> None:
+    WASAPI shared mode opens a stream only at the device's *configured* rate, so a
+    fixed rate menu lies: picking 44100 on a device Windows has at 48000 fails with
+    ``PortAudioError -9997``. ``sounddevice.check_input_settings`` raises for an
+    unopenable ``(device, rate, channels)``; we probe each candidate and keep the
+    ones that don't raise. ``probe(rate) -> bool`` is injectable for tests. Never
+    raises -- an enumeration failure just drops that rate.
+    """
+    if probe is None:
+        import sounddevice as sd
+
+        def probe(rate: int) -> bool:
+            try:
+                sd.check_input_settings(device=device, samplerate=int(rate),
+                                        channels=channels, dtype="float32")
+                return True
+            except Exception:
+                return False
+
+    return [int(r) for r in candidates if probe(r)]
+
+
+def _scan_runs(hot, run: int, counted: bool, run_len: int) -> tuple[int, bool, int]:
+    """Count newly-completed clip runs in a 1-D boolean sequence.
+
+    ``run``/``counted`` carry the in-progress state across block boundaries, so a
+    run straddling two callbacks is one run and not two. Returns the new state
+    plus how many runs completed in this block.
+    """
+    added = 0
+    for is_hot in hot:
+        if is_hot:
+            run += 1
+            if run >= run_len and not counted:
+                added += 1
+                counted = True
+        else:
+            run = 0
+            counted = False
+    return run, counted, added
+
+
+class _ClipCounter:
+    """Counts runs of consecutive full-scale frames, across block boundaries.
+
+    Two views of the same events. ``runs`` is the aggregate -- a frame counts as
+    hot when *any* channel is at full scale -- which is what the latch, the
+    warning and :class:`RecordingResult` have always reported. ``channel_runs``
+    counts each channel separately, so the history strip can put a clip tick in
+    the lane of the channel that actually clipped rather than in both.
+    """
+
+    def __init__(self, level: float = CLIP_LEVEL, run_len: int = CLIP_RUN_LEN,
+                 channels: int = 1) -> None:
         self._level = level
         self._run_len = run_len
+        self.channels = max(1, int(channels))
         self._run = 0            # frames at full scale so far, carried between blocks
         self._counted = False    # whether the current run has already been counted
         self.runs = 0
+        self._ch_run = [0] * self.channels
+        self._ch_counted = [False] * self.channels
+        self.channel_runs = [0] * self.channels
 
     def feed(self, block: np.ndarray) -> None:
         """``block`` is (frames, channels) float."""
-        hot = np.any(np.abs(block) >= self._level, axis=1)
-        for is_hot in hot.tolist():
-            if is_hot:
-                self._run += 1
-                if self._run >= self._run_len and not self._counted:
-                    self.runs += 1
-                    self._counted = True
-            else:
-                self._run = 0
-                self._counted = False
+        hot = np.abs(block) >= self._level                  # (frames, channels)
+        self._run, self._counted, added = _scan_runs(
+            hot.any(axis=1).tolist(), self._run, self._counted, self._run_len)
+        self.runs += added
+
+        for ch in range(min(self.channels, hot.shape[1])):
+            self._ch_run[ch], self._ch_counted[ch], ch_added = _scan_runs(
+                hot[:, ch].tolist(), self._ch_run[ch], self._ch_counted[ch],
+                self._run_len)
+            self.channel_runs[ch] += ch_added
 
 
 class _LevelStats:
@@ -216,7 +277,7 @@ class _LevelStats:
         self._frames_seen = 0
         self.window_peak = np.zeros(self.channels, dtype=np.float64)
         self.max_peak = 0.0
-        self.clips = _ClipCounter()
+        self.clips = _ClipCounter(channels=self.channels)
 
     @property
     def in_grace(self) -> bool:
@@ -256,7 +317,7 @@ class _LevelStats:
         150 ms every time the user pressed a button.
         """
         self.max_peak = 0.0
-        self.clips = _ClipCounter()
+        self.clips = _ClipCounter(channels=self.channels)
         self.window_peak.fill(0.0)
 
 
@@ -441,6 +502,7 @@ class Recorder:
                 peaks_dbfs=self._stats.take_window_peaks(),
                 max_peak_dbfs=_to_dbfs(self._stats.max_peak),
                 clip_runs=self._stats.clips.runs,
+                clip_runs_by_channel=list(self._stats.clips.channel_runs),
                 elapsed_s=now - self._started_at,
                 bytes_written=self._bytes_written,
             ))
@@ -623,6 +685,7 @@ class LevelMonitor:
                 peaks_dbfs=self._stats.take_window_peaks(),
                 max_peak_dbfs=_to_dbfs(self._stats.max_peak),
                 clip_runs=self._stats.clips.runs,
+                clip_runs_by_channel=list(self._stats.clips.channel_runs),
                 elapsed_s=now - self._started_at,
                 bytes_written=0,
             ))

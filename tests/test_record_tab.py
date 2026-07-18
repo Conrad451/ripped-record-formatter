@@ -47,10 +47,23 @@ def no_hardware(monkeypatch):
         DeviceInfo(index=9, name="Headphones (USB)", hostapi="Windows WASAPI",
                    samplerate=44100, max_channels=2),
     ]
+    # Line In (48k device from the field report) supports only 48k/192k; the USB
+    # mic supports 44.1/48. No real hardware probe.
+    supported = {7: {48000, 192000}, 2: {44100, 48000}}
+
+    def fake_rates(device, channels, candidates, **kw):
+        ok = supported.get(device, set(candidates))
+        return [r for r in candidates if r in ok]
+
     monkeypatch.setattr(tab_mod, "list_input_devices", lambda: devices)
     monkeypatch.setattr(tab_mod, "list_output_devices", lambda: outputs)
+    monkeypatch.setattr(tab_mod, "supported_input_rates", fake_rates)
     monkeypatch.setattr(rec_mod.LevelMonitor, "start", lambda self, *a, **k: None)
     monkeypatch.setattr(rec_mod.LevelMonitor, "stop", lambda self: None)
+    # No COM audio endpoint by default -- the gain slider stays hidden. The
+    # dedicated gain test overrides this with a fake endpoint.
+    monkeypatch.setattr(tab_mod.EndpointGain, "for_device",
+                        classmethod(lambda cls, name, **kw: None))
     return devices
 
 
@@ -197,17 +210,64 @@ def test_device_is_remembered_by_name_not_index(qapp, no_hardware):
     assert tab2.current_device().name == "USB Microphone"
 
 
-def test_rate_defaults_to_device_native_but_offers_441(qapp):
+def test_rate_picker_recommends_native_and_marks_unsupported(qapp):
+    """The picker tells the truth: native is recommended; a rate WASAPI can't open
+    (44.1k on this 48k/192k device) is marked, not silently offered."""
     from gui.main_window import MainWindow
 
     tab = MainWindow().record_tab
-    tab.device_combo.setCurrentIndex(0)              # Realtek, native 192000
-    assert tab.rate_combo.currentData() == 192000    # defaults to native...
-    rates = [tab.rate_combo.itemData(i) for i in range(tab.rate_combo.count())]
-    assert 44100 in rates                            # ...but 44.1k is right there
+    tab.device_combo.setCurrentIndex(0)              # Line In, native 192000
+    assert tab.rate_combo.currentData() == 192000    # defaults to native
 
-    tab.rate_combo.setCurrentIndex(tab.rate_combo.findData(44100))
-    assert tab.settings.config.record_samplerate == 44100   # and it is persisted
+    labels = [tab.rate_combo.itemText(i) for i in range(tab.rate_combo.count())]
+    native = next(t for t in labels if t.startswith("192000"))
+    assert "device native — recommended" in native
+    unsupported = next(t for t in labels if t.startswith("44100"))
+    assert "needs a Windows Sound change" in unsupported   # 44.1k won't open here
+    supported = next(t for t in labels if t.startswith("48000"))
+    assert "needs a Windows Sound change" not in supported  # 48k does open
+
+
+def test_a_remembered_rate_that_no_longer_opens_falls_back_to_native(qapp):
+    from gui.main_window import MainWindow
+
+    tab = MainWindow().record_tab
+    tab.settings.set(record_samplerate=44100)         # saved against another device
+    tab.device_combo.setCurrentIndex(_idx_by_name(tab.device_combo, "Line In"))
+    tab._on_device_changed()
+    assert tab.rate_combo.currentData() == 192000     # 44.1k can't open here
+
+
+def test_an_unopenable_rate_is_refused_in_plain_words_not_a_portaudio_error(
+        qapp, no_hardware, monkeypatch, tmp_path):
+    """Picking a rate WASAPI won't grant must produce one explanatory line -- never
+    a raw PortAudioError -9997 in the user's face."""
+    import sounddevice as sd
+
+    import core.recorder as rec_mod
+    from gui.main_window import MainWindow
+
+    def explode(self, *a, **kw):
+        raise sd.PortAudioError(
+            "Error opening InputStream: Invalid sample rate [PaErrorCode -9997]")
+
+    monkeypatch.setattr(rec_mod.Recorder, "start", explode)
+
+    tab = MainWindow().record_tab
+    tab.device_combo.setCurrentIndex(_idx_by_name(tab.device_combo, "Line In"))
+    tab.folder_edit.setText(str(tmp_path))
+    logged: list[str] = []
+    monkeypatch.setattr(tab, "_log", logged.append)
+
+    tab._start_recording()
+
+    assert logged, "the failure must say something"
+    line = logged[-1]
+    assert "can't record at" in line                  # plain words...
+    assert "192000 Hz" in line                        # ...naming the rate to pick
+    assert "44,100 Hz regardless" in line             # ...and reassuring about output
+    assert "PaErrorCode" not in line and "-9997" not in line   # never the raw error
+    assert not tab.recording
 
 
 # --------------------------------------------------------------------------- #
@@ -419,20 +479,21 @@ def test_monitor_output_vanishing_resets_the_toggle(qapp, no_hardware):
 # --------------------------------------------------------------------------- #
 # "Check my setup" (9.5)
 # --------------------------------------------------------------------------- #
-def test_setup_check_flags_192k_and_the_fix_sets_44100(qapp, no_hardware):
+def test_setup_check_reassures_about_a_non_44100_device(qapp, no_hardware):
+    """The rewritten check: a 48k/192k device is FINE -- reassure that the FLACs
+    resample to 44.1k, rather than offering the broken 'Use 44100' stream fix."""
     from gui.main_window import MainWindow
 
     tab = MainWindow().record_tab
-    tab.settings.set(record_samplerate=0)        # follow the device's own rate (192000)
+    tab.settings.set(output_sample_rate="44100")
     tab.device_combo.setCurrentIndex(_idx_by_name(tab.device_combo, "Line In"))  # 192000
-    tab._run_setup_check()                       # rate flagged immediately
+    tab._run_setup_check()
 
-    assert "44,100 Hz" in tab.check_results.text()
-    assert tab.rate_fix_button.isVisibleTo(tab)
-
-    tab._fix_set_rate_44100()                    # one-click fix
-    assert tab.settings.config.record_samplerate == 44100
-    assert not tab.rate_fix_button.isVisibleTo(tab)   # re-check: no longer flagged
+    text = tab.check_results.text()
+    assert "device is set to 192000" in text     # (apostrophe in the HTML is escaped)
+    assert "saved at 44,100 Hz automatically" in text
+    assert not hasattr(tab, "rate_fix_button")   # the broken one-click fix is gone
+    assert tab.record_button.isEnabled()         # advice, never a gate
 
 
 def test_setup_check_listen_reports_no_signal(qapp, no_hardware):
@@ -485,3 +546,73 @@ def test_monitor_and_setup_check_coexist_on_the_tab(qapp, no_hardware):
     assert tab.check_button.isVisibleTo(tab)
     assert tab.check_results is not None
     assert tab.monitor_hint.isVisibleTo(tab)     # the hardware-jack hint, kept in the merge
+
+
+# --------------------------------------------------------------------------- #
+# Input-gain slider (9.9 part 3)
+# --------------------------------------------------------------------------- #
+class _FakeEndpoint:
+    def __init__(self, level=0.5):
+        self.level = level
+
+    def GetMasterVolumeLevelScalar(self):
+        return self.level
+
+    def SetMasterVolumeLevelScalar(self, value, _ctx):
+        self.level = value
+
+
+def test_gain_slider_round_trips_a_mocked_endpoint(qapp, no_hardware, monkeypatch):
+    """The slider reflects the endpoint's level, drives it on move, and persists
+    the setting per device name."""
+    import gui.record_tab as tab_mod
+    from core.input_gain import EndpointGain
+    from gui.main_window import MainWindow
+
+    ep = _FakeEndpoint(0.5)
+    monkeypatch.setattr(tab_mod.EndpointGain, "for_device",
+                        classmethod(lambda cls, name, **kw: EndpointGain(ep)))
+
+    tab = MainWindow().record_tab
+    tab.settings.set(record_input_levels={})      # no saved level: read the endpoint
+    tab.device_combo.setCurrentIndex(_idx_by_name(tab.device_combo, "USB Microphone"))
+    tab._on_device_changed()
+
+    assert tab.gain_slider.isVisibleTo(tab)
+    assert tab.gain_slider.value() == 50          # reads the endpoint's current level
+
+    tab.gain_slider.setValue(80)                  # move it
+    assert abs(ep.level - 0.80) < 1e-9            # drove the Windows level
+    name = tab.current_device().name
+    assert abs(tab.settings.config.record_input_levels[name] - 0.80) < 1e-9  # remembered
+
+
+def test_gain_slider_restores_a_remembered_level(qapp, no_hardware, monkeypatch):
+    """A device with a saved level pushes it back to Windows on selection."""
+    import gui.record_tab as tab_mod
+    from core.input_gain import EndpointGain
+    from gui.main_window import MainWindow
+
+    ep = _FakeEndpoint(0.2)
+    monkeypatch.setattr(tab_mod.EndpointGain, "for_device",
+                        classmethod(lambda cls, name, **kw: EndpointGain(ep)))
+
+    tab = MainWindow().record_tab
+    tab.settings.set(record_input_levels={"USB Microphone": 0.9})
+    tab.device_combo.setCurrentIndex(_idx_by_name(tab.device_combo, "USB Microphone"))
+    tab._on_device_changed()   # explicit: the combo may already sit on this device
+
+    assert tab.gain_slider.value() == 90          # slider shows the saved value
+    assert abs(ep.level - 0.90) < 1e-9            # and it was pushed to the endpoint
+
+
+def test_gain_slider_hidden_when_endpoint_inaccessible(qapp, no_hardware):
+    """No reachable endpoint (the autouse stub returns None) -> slider hidden,
+    no crash."""
+    from gui.main_window import MainWindow
+
+    tab = MainWindow().record_tab
+    tab.device_combo.setCurrentIndex(_idx_by_name(tab.device_combo, "USB Microphone"))
+    tab._on_device_changed()
+    assert not tab.gain_slider.isVisibleTo(tab)
+    assert tab._gain is None

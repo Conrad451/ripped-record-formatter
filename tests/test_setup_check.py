@@ -15,26 +15,27 @@ SR = 44100
 
 
 # --------------------------------------------------------------------------- #
-# Sample-rate nudge
+# Sample-rate reassurance (the rework: encode-time resample, not a stream fix)
 # --------------------------------------------------------------------------- #
-def test_rate_check_fires_on_a_192k_stereo_device_verbatim():
-    r = check_sample_rate(device_rate=192000, capture_rate=0, max_channels=2)
-    assert r.status == WARN
-    assert r.fix_key == "set_rate_44100"
-    assert r.fix_label == "Use 44100"
-    assert r.message == ("This device is set to 192000 in Windows. For vinyl you "
-                         "almost certainly want 44,100 Hz.")
+def test_rate_check_reassures_about_a_non_44100_device_verbatim():
+    r = check_sample_rate(device_rate=192000, output_rate="44100")
+    assert r.status == OK                      # reassurance, not a warning
+    assert r.fix_key is None                   # the broken one-click fix is gone
+    assert r.message == ("This device is set to 192000 in Windows — that's fine. "
+                         "Your FLACs will be saved at 44,100 Hz automatically.")
 
 
-def test_rate_check_silent_when_effective_rate_is_44100():
-    assert check_sample_rate(device_rate=44100, capture_rate=0, max_channels=2) is None
-    # Pinned to 44100 wins even if the device's native rate is 192000.
-    assert check_sample_rate(device_rate=192000, capture_rate=44100, max_channels=2) is None
+def test_rate_check_silent_when_no_resample_will_happen():
+    # Device already at the output rate -> nothing to reassure about.
+    assert check_sample_rate(device_rate=44100, output_rate="44100") is None
+    # "Keep source" -> no resample, no message.
+    assert check_sample_rate(device_rate=192000, output_rate="source") is None
 
 
-def test_rate_check_ignores_mono_devices():
-    # A mono device is a microphone, not a stereo line-in turntable feed.
-    assert check_sample_rate(device_rate=48000, capture_rate=0, max_channels=1) is None
+def test_rate_check_reflects_a_48000_output_target():
+    r = check_sample_rate(device_rate=44100, output_rate="48000")
+    assert r.status == OK
+    assert "saved at 48,000 Hz automatically" in r.message
 
 
 # --------------------------------------------------------------------------- #

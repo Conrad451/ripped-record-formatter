@@ -22,8 +22,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-#: Bottom of the meter scale. Below this there is nothing worth showing.
-FLOOR_DBFS = -60.0
+from gui.level_scale import FLOOR_DBFS, GRIDLINES_DBFS, dbfs_fraction
+
 #: Where the bar turns amber -- close enough to full scale to want a look.
 WARN_DBFS = -6.0
 #: How long a peak-hold tick lingers, in telemetry frames (~50 ms each).
@@ -40,6 +40,9 @@ _GREEN = QColor("#3aa655")
 _AMBER = QColor("#c07000")
 _RED = QColor("#c0392b")
 _TICK = QColor("#e8e8e8")
+#: Landmark rules on the bar, matching the history lanes' gridlines.
+_GRID_MARK = QColor(255, 255, 255, 40)
+_TARGET_MARK = QColor("#c07000")
 
 _MINUS = "−"           # a real minus sign; a hyphen reads as a dash
 
@@ -68,15 +71,9 @@ def format_headroom(dbfs: float) -> str:
     return f"max {sign}{abs(dbfs):.1f} dBFS ({margin:.1f} dB headroom)"
 
 
-def _fraction(dbfs: float) -> float:
-    """dBFS -> 0..1 along the meter scale."""
-    if dbfs is None or math.isinf(dbfs) or math.isnan(dbfs):
-        return 0.0
-    if dbfs <= FLOOR_DBFS:
-        return 0.0
-    if dbfs >= 0.0:
-        return 1.0
-    return (dbfs - FLOOR_DBFS) / (0.0 - FLOOR_DBFS)
+#: dBFS -> 0..1 along the bar. Shared with the history lanes so a level lands in
+#: the same place in both views -- see :mod:`gui.level_scale`.
+_fraction = dbfs_fraction
 
 
 class PeakBar(QWidget):
@@ -121,6 +118,17 @@ class PeakBar(QWidget):
             colour = _GREEN if peak_db < WARN_DBFS else (
                 _AMBER if peak_db < -0.1 else _RED)
             painter.fillRect(QRectF(0, 0, filled, height), colour)
+
+        # The same landmarks the history lanes rule, at the same fractions. A bar
+        # with no marks cannot be read: -7 dBFS truthfully fills 88% of a -60..0
+        # scale, which looks "nearly full" until you can see it sitting below the
+        # -6 and -3 marks. The marks are what make the position legible.
+        for db in GRIDLINES_DBFS:
+            if db >= 0.0:
+                continue                      # 0 dBFS is the bar's own right edge
+            gx = width * dbfs_fraction(db)
+            painter.fillRect(QRectF(gx, 0, 1, height),
+                             _TARGET_MARK if db == SAFE_DBFS else _GRID_MARK)
 
         if self._hold > 0:
             x = min(width - 2, width * self._hold)

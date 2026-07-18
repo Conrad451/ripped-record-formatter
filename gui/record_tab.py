@@ -17,7 +17,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from PySide6.QtCore import QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -28,21 +28,33 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QSlider,
     QVBoxLayout,
     QWidget,
 )
 
+from core.input_gain import EndpointGain
 from core.recorder import (
     LevelMonitor,
     Passthrough,
     Recorder,
     list_input_devices,
     list_output_devices,
+    supported_input_rates,
 )
 from core.setup_check import INFO, OK, WARN, CheckResult, check_sample_rate, check_signal
+
+
 from core.timefmt import format_timestamp
 from gui.level_history import LevelHistoryStrip
 from gui.meters import LevelMeters
+
+
+def _is_rate_error(message: str) -> bool:
+    """Whether a stream-open failure is a shared-mode rate rejection (-9997)."""
+    m = message.lower()
+    return "9997" in m or "invalid sample rate" in m
+
 
 #: Offered regardless of what the device claims natively -- a Realtek line input
 #: reports 192000 under WASAPI even when the whole chain is 44.1k.
@@ -155,9 +167,31 @@ class RecordTab(QWidget):
         # --- levels ------------------------------------------------------------
         level_box = QGroupBox("Levels")
         level_layout = QVBoxLayout(level_box)
+
+        # Meters with the input-gain slider beside them: you set the knob while
+        # watching the very bars it moves. The slider drives the Windows capture
+        # level for the selected device (see _sync_gain_slider); it hides itself
+        # when that endpoint can't be reached.
+        meter_row = QHBoxLayout()
         self.meters = LevelMeters(channels=2)
         self.meters.resetRequested.connect(self._reset_levels)
-        level_layout.addWidget(self.meters)
+        meter_row.addWidget(self.meters, 1)
+
+        self._gain: EndpointGain | None = None
+        gain_col = QVBoxLayout()
+        self.gain_label = QLabel("Input")
+        self.gain_label.setAlignment(Qt.AlignHCenter)
+        gain_col.addWidget(self.gain_label)
+        self.gain_slider = QSlider(Qt.Vertical)
+        self.gain_slider.setRange(0, 100)
+        self.gain_slider.setToolTip(
+            "Adjusts the Windows input level. If the signal distorts even at low "
+            "settings, turn down the source instead.")
+        self.gain_slider.valueChanged.connect(self._on_gain_changed)
+        gain_col.addWidget(self.gain_slider, 1, Qt.AlignHCenter)
+        self.gain_widgets = (self.gain_label, self.gain_slider)
+        meter_row.addLayout(gain_col)
+        level_layout.addLayout(meter_row)
 
         # The bars say what the input is doing *now*; the strip says what it has
         # been doing for the last half minute -- which is the question you are
@@ -177,10 +211,6 @@ class RecordTab(QWidget):
         self.check_button = QPushButton("Check my setup")
         self.check_button.clicked.connect(self._run_setup_check)
         check_row.addWidget(self.check_button)
-        self.rate_fix_button = QPushButton("Use 44100")
-        self.rate_fix_button.setVisible(False)
-        self.rate_fix_button.clicked.connect(self._fix_set_rate_44100)
-        check_row.addWidget(self.rate_fix_button)
         check_row.addStretch(1)
         level_layout.addLayout(check_row)
 
@@ -323,17 +353,32 @@ class RecordTab(QWidget):
         if dev is None:
             return
         self.settings.set(record_device=dev.name)
+        self._sync_gain_slider(dev.name)
 
-        # Offer the standard rates plus whatever the device claims, defaulting to
-        # the device's native rate but letting a pinned choice win.
-        rates = sorted({*_RATES, dev.samplerate})
+        # Probe which of the standard rates this device can actually open under
+        # WASAPI shared mode -- the menu tells the truth instead of offering rates
+        # that fail with -9997. The device's own rate always works.
+        candidates = sorted({*_RATES, dev.samplerate})
+        channels = min(2, dev.max_channels) or 1
+        try:
+            supported = set(supported_input_rates(dev.index, channels, candidates))
+        except Exception:
+            supported = set(candidates)          # probe unavailable: don't hide anything
+        supported.add(dev.samplerate)
+
         remembered = self.settings.config.record_samplerate
         self.rate_combo.blockSignals(True)
         self.rate_combo.clear()
-        for rate in rates:
-            suffix = "  (device native)" if rate == dev.samplerate else ""
-            self.rate_combo.addItem(f"{rate} Hz{suffix}", rate)
-        target = remembered if remembered in rates else dev.samplerate
+        for rate in candidates:
+            if rate == dev.samplerate:
+                label = f"{rate} Hz (device native — recommended)"
+            elif rate in supported:
+                label = f"{rate} Hz"
+            else:
+                label = f"{rate} Hz — needs a Windows Sound change"
+            self.rate_combo.addItem(label, rate)
+        # Default to native; only honour a remembered rate that still opens.
+        target = remembered if remembered in supported else dev.samplerate
         self.rate_combo.setCurrentIndex(max(0, self.rate_combo.findData(target)))
         self.rate_combo.blockSignals(False)
 
@@ -345,6 +390,50 @@ class RecordTab(QWidget):
         if self._active and dev.name != self._checked_device:
             self._checked_device = dev.name
             self._run_setup_check()
+
+    # -- input gain (Windows capture-endpoint level) -------------------------
+    def _sync_gain_slider(self, device_name: str) -> None:
+        """Point the gain slider at ``device_name``'s Windows input level.
+
+        Restores the remembered level for this device (or reads the endpoint's
+        current one), and hides the slider entirely -- with a single log line --
+        when the endpoint volume can't be reached, so a machine or frozen build
+        without the COM interface degrades gracefully.
+        """
+        self._gain = EndpointGain.for_device(device_name)
+        if self._gain is None:
+            for w in self.gain_widgets:
+                w.setVisible(False)
+            return
+
+        remembered = self.settings.config.record_input_levels.get(device_name)
+        level = remembered if remembered is not None else self._gain.get()
+        if level is None:                       # endpoint opened but won't read
+            for w in self.gain_widgets:
+                w.setVisible(False)
+            self._gain = None
+            return
+
+        if remembered is not None:              # push the saved value back to Windows
+            self._gain.set(remembered)
+        for w in self.gain_widgets:
+            w.setVisible(True)
+        self.gain_slider.blockSignals(True)
+        self.gain_slider.setValue(round(level * 100))
+        self.gain_slider.blockSignals(False)
+
+    def _on_gain_changed(self, value: int) -> None:
+        """Slider moved: drive the Windows level and remember it for this device."""
+        if self._gain is None:
+            return
+        dev = self.current_device()
+        if dev is None:
+            return
+        level = value / 100.0
+        self._gain.set(level)
+        levels = dict(self.settings.config.record_input_levels)
+        levels[dev.name] = level
+        self.settings.set(record_input_levels=levels)
 
     def _on_format_changed(self, *_args) -> None:
         self.settings.set(
@@ -441,8 +530,13 @@ class RecordTab(QWidget):
         self._monitor.start(dev.index, rate, channels)
         self.history_strip.reset()          # a new stream is a new history
         if self._monitor.error:
-            self._log(f"Record: can't show the levels for this device "
-                      f"({self._monitor.error}).")
+            if _is_rate_error(self._monitor.error):
+                self._log(f"Record: this device can't run at {rate} Hz — Windows "
+                          f"has it set to {dev.samplerate} Hz. Pick that rate; your "
+                          "FLACs are saved at 44,100 Hz regardless.")
+            else:
+                self._log(f"Record: can't show the levels for this device "
+                          f"({self._monitor.error}).")
 
     def _on_monitor_telemetry(self, telemetry) -> None:
         self._latest = telemetry            # audio thread: just hand it over
@@ -492,8 +586,7 @@ class RecordTab(QWidget):
             return
         results: list = []
         rate = check_sample_rate(device_rate=dev.samplerate,
-                                 capture_rate=self.settings.config.record_samplerate,
-                                 max_channels=dev.max_channels)
+                                 output_rate=self.settings.config.output_sample_rate)
         if rate is not None:
             results.append(rate)
         self._pending_check = results
@@ -520,24 +613,13 @@ class RecordTab(QWidget):
         colors = {OK: "#2e7d32", WARN: "#c07000", INFO: "gray"}
         import html
 
-        lines, show_fix = [], False
+        lines = []
         for r in results:
             lines.append(
                 f'<div style="color:{colors.get(r.status, "gray")}; margin-bottom:4px;">'
                 f'{icons.get(r.status, "•")} {html.escape(r.message)}</div>')
-            show_fix = show_fix or r.fix_key == "set_rate_44100"
         self.check_results.setText("".join(lines))
         self.check_results.setVisible(bool(lines))
-        self.rate_fix_button.setVisible(show_fix)
-
-    def _fix_set_rate_44100(self) -> None:
-        idx = self.rate_combo.findData(44100)
-        if idx >= 0:
-            self.rate_combo.setCurrentIndex(idx)
-        # Persist directly too: this is a rate choice like any other, and it must
-        # stick even if the combo happened to already show 44100.
-        self.settings.set(record_samplerate=44100)
-        self._run_setup_check()                      # re-check to show it took
 
     # -- transport -----------------------------------------------------------
     def _browse_folder(self) -> None:
@@ -585,7 +667,12 @@ class RecordTab(QWidget):
             self._recorder.start(dev.index, dest, rate, channels, subtype)
         except Exception as exc:
             self._recorder = None
-            self._log(f"Record: couldn't start recording. {exc}")
+            if _is_rate_error(str(exc)):
+                self._log(f"Record: this device can't record at {rate} Hz — Windows "
+                          f"has it set to {dev.samplerate} Hz. Pick that rate; your "
+                          "FLACs are saved at 44,100 Hz regardless.")
+            else:
+                self._log(f"Record: couldn't start recording. {exc}")
             self._restart_monitor()
             return
 

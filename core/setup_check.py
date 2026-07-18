@@ -21,10 +21,6 @@ OK = "ok"
 WARN = "warn"
 INFO = "info"
 
-#: Vinyl wants 44.1 kHz. A stereo (line-in-looking) device set to anything else
-#: gets a one-click nudge.
-TARGET_RATE = 44100
-
 #: A listen window whose loudest point stays below this (dBFS) means "no signal".
 SILENCE_DBFS = -70.0
 
@@ -44,21 +40,33 @@ class CheckResult:
     fix_key: str | None = None        # what that fix does
 
 
-def check_sample_rate(*, device_rate: int, capture_rate: int,
-                      max_channels: int) -> CheckResult | None:
-    """A stereo device configured to something other than 44.1 kHz gets a nudge.
+def _output_target(output_rate) -> int | None:
+    """The configured output sample rate as Hz, or None for "keep source"."""
+    if output_rate in (None, "", "source"):
+        return None
+    try:
+        return int(output_rate)
+    except (TypeError, ValueError):
+        return None
 
-    ``capture_rate`` is our pinned rate (0 = follow the device's own rate).
-    Returns ``None`` when the effective rate is already 44100, or the device does
-    not look like a stereo line input (mono devices are microphones, not turntables).
+
+def check_sample_rate(*, device_rate: int, output_rate) -> CheckResult | None:
+    """Reassure, don't nag: a device on a non-44.1k rate is *fine* -- the FLACs are
+    resampled to the library rate at encode.
+
+    ``output_rate`` is the ``output_sample_rate`` setting ("source"/"44100"/
+    "48000"). Returns ``None`` when nothing will be resampled (the setting is
+    "keep source", or the device already runs at the output rate) -- there is
+    then nothing to reassure about. There is no one-click fix: the old "Use 44100"
+    fix set the *stream* rate, which WASAPI shared mode rejects -- the whole point
+    of moving 44.1k to encode time.
     """
-    effective = capture_rate or device_rate
-    if max_channels >= 2 and effective != TARGET_RATE:
+    target = _output_target(output_rate)
+    if target is not None and device_rate != target:
         return CheckResult(
-            WARN,
-            f"This device is set to {device_rate} in Windows. For vinyl you almost "
-            f"certainly want 44,100 Hz.",
-            fix_label="Use 44100", fix_key="set_rate_44100")
+            OK,
+            f"This device is set to {device_rate} in Windows — that's fine. Your "
+            f"FLACs will be saved at {target:,} Hz automatically.")
     return None
 
 

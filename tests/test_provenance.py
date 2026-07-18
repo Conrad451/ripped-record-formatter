@@ -125,6 +125,62 @@ def test_convert_unknown_provenance_writes_nothing(tmp_path):
     assert "rrf_restoration" not in keys
 
 
+# --------------------------------------------------------------------------- #
+# Encode-time resample (9.9 part 2) -- the 44.1k convention, and its provenance
+# --------------------------------------------------------------------------- #
+def _wav_at(path, rate):
+    sf.write(str(path), np.zeros(rate // 10, dtype=np.float32), rate, subtype="PCM_16")
+    return path
+
+
+def test_a_48k_capture_encodes_to_a_44100_flac_and_says_so(tmp_path):
+    """The whole point of moving 44.1k to encode time: a 48k source (what WASAPI
+    shared mode gives you on a UFO202) lands in the library at 44.1k, and the
+    resample is recorded as provenance."""
+    configure_pydub()
+    t = Tracks(1, "Song", "Album", "Artist", _wav_at(tmp_path / "a.wav", 48000))
+    res = convert_wavs_to_flacs([t], tmp_path / "out", configure=False,
+                                restoration_stages=[], output_sample_rate="44100")
+    assert not res.warnings, res.warnings
+
+    out = res.outcomes[0].output_path
+    assert sf.info(str(out)).samplerate == 44100          # actually resampled
+    f = FLAC(str(out))
+    assert f["rrf_restoration"] == ["resample(48000->44100)"]
+    assert f["rrf_version"] == [__version__]
+
+
+def test_a_resample_joins_the_restoration_chain_rather_than_replacing_it(tmp_path):
+    configure_pydub()
+    t = Tracks(1, "Song", "Album", "Artist", _wav_at(tmp_path / "a.wav", 48000))
+    res = convert_wavs_to_flacs([t], tmp_path / "out", configure=False,
+                                restoration_stages=[RumbleFilter()],
+                                output_sample_rate="44100")
+    f = FLAC(str(res.outcomes[0].output_path))
+    assert f["rrf_restoration"] == ["rumble(25Hz,o4);resample(48000->44100)"]
+
+
+def test_no_token_when_the_source_is_already_at_the_output_rate(tmp_path):
+    """Nothing was resampled, so nothing is claimed."""
+    configure_pydub()
+    t = Tracks(1, "Song", "Album", "Artist", _wav_at(tmp_path / "a.wav", 44100))
+    res = convert_wavs_to_flacs([t], tmp_path / "out", configure=False,
+                                restoration_stages=[], output_sample_rate="44100")
+    out = res.outcomes[0].output_path
+    assert sf.info(str(out)).samplerate == 44100
+    assert FLAC(str(out))["rrf_restoration"] == ["none"]
+
+
+def test_keep_source_leaves_the_capture_rate_alone(tmp_path):
+    configure_pydub()
+    t = Tracks(1, "Song", "Album", "Artist", _wav_at(tmp_path / "a.wav", 48000))
+    res = convert_wavs_to_flacs([t], tmp_path / "out", configure=False,
+                                restoration_stages=[], output_sample_rate="source")
+    out = res.outcomes[0].output_path
+    assert sf.info(str(out)).samplerate == 48000          # untouched
+    assert FLAC(str(out))["rrf_restoration"] == ["none"]
+
+
 def test_retag_preserves_existing_rrf(tmp_path):
     """Re-tag edits metadata but carries provenance forward untouched."""
     configure_pydub()

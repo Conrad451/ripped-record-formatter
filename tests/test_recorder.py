@@ -169,6 +169,29 @@ def test_counts_injected_full_scale_runs(tmp_path):
     assert result.max_peak_dbfs == pytest.approx(0.0, abs=0.01)
 
 
+def test_clip_runs_are_also_counted_per_channel(tmp_path):
+    """The aggregate says *that* it clipped; the per-channel counts say *which*
+    channel did, which is what puts a tick in the right lane of the strip."""
+    from core.recorder import Telemetry
+
+    seen: list[Telemetry] = []
+    rec, made = _recorder(tmp_path, on_telemetry=seen.append)
+    rec.start(device=0, path=tmp_path / "SideA.wav", samplerate=SR, channels=2)
+    stream = made["stream"]
+    _prime(stream)
+
+    block = _tone(1024)
+    block[100:110, 1] = 1.0                  # R clips...
+    block[500:510, 1] = -1.0                 # ...twice
+    block[800:810, 0] = 1.0                  # L clips once
+    stream.push(block)
+    rec.stop()
+
+    counter = rec._stats.clips
+    assert counter.channel_runs == [1, 2]    # L once, R twice
+    assert counter.runs == 3                 # aggregate: three non-overlapping runs
+
+
 def test_a_clip_run_spanning_two_blocks_counts_once(tmp_path):
     """The run must be carried across the block boundary, not counted twice."""
     rec, made = _recorder(tmp_path)

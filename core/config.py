@@ -135,6 +135,12 @@ class Config:
     monitor_device: str = ""
     """Output device for passthrough, remembered by NAME (like record_device)."""
 
+    # --- input gain (Windows capture-endpoint level) ---
+    record_input_levels: dict[str, float] = field(default_factory=dict)
+    """Windows input level (0.0..1.0), remembered per device NAME, so the in-app
+    gain slider restores each interface's last setting. Empty until first moved;
+    devices whose endpoint volume can't be reached never appear here."""
+
     # --- audition playback ---
     preview_lead_in_s: float = 5.0
     """Preview a cut by playing from this many seconds before it, straight
@@ -154,6 +160,12 @@ class Config:
     to be told less often; lower it to be told sooner."""
 
     # --- encoding ---
+    output_sample_rate: str = "44100"
+    """Sample rate the encoded FLACs are written at: "source" (keep the capture
+    rate), "44100", or "48000". Default 44100 honours the library convention -- a
+    capture at 48 kHz (a UFO202's shared-mode rate) is resampled at encode time,
+    so the rate picker never has to fight WASAPI. Recorded in RRF_RESTORATION."""
+
     encode_workers: int = field(default_factory=lambda: min(4, os.cpu_count() or 1))
     """How many tracks to encode in parallel (each is an independent ffmpeg run)."""
 

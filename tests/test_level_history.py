@@ -33,9 +33,10 @@ def qapp():
     yield QApplication.instance() or QApplication([])
 
 
-def _snap(t, peaks=(-20.0, -20.0), clip_runs=0):
+def _snap(t, peaks=(-20.0, -20.0), clip_runs=0, by_channel=None):
     return Telemetry(peaks_dbfs=list(peaks), max_peak_dbfs=max(peaks),
-                     clip_runs=clip_runs, elapsed_s=t)
+                     clip_runs=clip_runs, elapsed_s=t,
+                     clip_runs_by_channel=list(by_channel or []))
 
 
 def _trace_len(trace):
@@ -160,10 +161,10 @@ def test_an_injected_full_scale_run_puts_a_tick_on_the_strip(qapp):
     qapp.processEvents()
 
     assert strip.clip_mark_count == 1
-    xs, ys = strip._clip_marks.getData()
+    xs, ys = strip._clip_marks[0].getData()      # lane L
     assert xs[0] == pytest.approx(-0.5)          # at the moment it clipped, and
                                                  # it stays there as it scrolls
-    assert ys[0] > FLOOR_DBFS / 2                # ...pinned to the top edge
+    assert ys[0] > FLOOR_DBFS / 2                # ...pinned to its lane's top edge
 
 
 def test_the_strip_runs_during_capture_not_only_pre_roll(qapp):
@@ -185,3 +186,71 @@ def test_reset_empties_the_strip(qapp):
     strip.reset()
     assert strip.clip_mark_count == 0
     assert _trace_len(strip._traces[0]) == 0
+
+
+# --------------------------------------------------------------------------- #
+# Stacked per-channel lanes (9.9 part 4)
+# --------------------------------------------------------------------------- #
+def test_a_clip_tick_lands_in_the_lane_of_the_channel_that_clipped(qapp):
+    """R clips alone -> a tick in the R lane and none in the L lane."""
+    strip = LevelHistoryStrip(channels=2)
+    strip.update_from(_snap(0.0, peaks=(-20.0, -20.0), by_channel=[0, 0]))
+    strip.update_from(_snap(0.5, peaks=(-20.0, 0.0), clip_runs=1, by_channel=[0, 1]))
+    strip.update_from(_snap(1.0, peaks=(-20.0, -20.0), clip_runs=1, by_channel=[0, 1]))
+    qapp.processEvents()
+
+    assert strip.lane_clip_mark_count(0) == 0      # L never clipped
+    assert strip.lane_clip_mark_count(1) == 1      # R did
+    xs = strip._clip_marks[1].getData()[0]
+    assert xs[0] == pytest.approx(-0.5)            # at the moment it happened
+
+
+def test_each_lane_counts_its_own_clips(qapp):
+    """Both channels clip, at different times, in their own lanes."""
+    strip = LevelHistoryStrip(channels=2)
+    strip.update_from(_snap(0.0, by_channel=[0, 0]))
+    strip.update_from(_snap(0.5, clip_runs=1, by_channel=[1, 0]))   # L
+    strip.update_from(_snap(1.0, clip_runs=2, by_channel=[1, 1]))   # R
+    strip.update_from(_snap(1.5, clip_runs=3, by_channel=[2, 1]))   # L again
+    qapp.processEvents()
+
+    assert strip.lane_clip_mark_count(0) == 2
+    assert strip.lane_clip_mark_count(1) == 1
+    assert strip.clip_mark_count == 3
+
+
+def test_lanes_share_one_time_window_after_scrolling(qapp):
+    """X-linked: both lanes show the same window, before and after a scroll."""
+    strip = LevelHistoryStrip(channels=2)
+    qapp.processEvents()
+    assert strip.lane_x_range(0) == pytest.approx(strip.lane_x_range(1))
+
+    for i in range(int(40 / RATE)):                # 40 s: past the 30 s window
+        strip.update_from(_snap(i * RATE, peaks=(-10.0, -14.0)))
+    qapp.processEvents()
+
+    assert strip.lane_x_range(0) == pytest.approx(strip.lane_x_range(1))
+    lo, hi = strip.lane_x_range(0)
+    assert lo == pytest.approx(-HISTORY_SECONDS)   # window stayed put
+    assert hi == pytest.approx(0.0)
+
+
+def test_each_lane_has_its_own_dbfs_scale_and_a_channel_label(qapp):
+    strip = LevelHistoryStrip(channels=2)
+    assert [lbl.toPlainText() for lbl in strip._lane_labels] == ["L", "R"]
+    for lane in strip.lanes:
+        lo, hi = lane.getViewBox().viewRange()[1]
+        assert (lo, hi) == pytest.approx((FLOOR_DBFS, 0.0))
+
+
+def test_a_trace_never_draws_past_its_own_lane(qapp):
+    """Values are clamped into the lane's scale, so neither trace can bleed into
+    the other's."""
+    strip = LevelHistoryStrip(channels=2)
+    strip.update_from(_snap(0.0, peaks=(12.0, -400.0)))   # over and under scale
+    qapp.processEvents()
+
+    for i in range(2):
+        ys = strip._traces[i].getData()[1]
+        assert ys.min() >= FLOOR_DBFS
+        assert ys.max() <= 0.0
