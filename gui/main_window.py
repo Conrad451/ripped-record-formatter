@@ -277,6 +277,7 @@ class MainWindow(QMainWindow):
         # The payoff: a finished side walks straight into Full Rip's mapping table.
         self.record_tab.recordingFinished.connect(self._on_recording_finished)
         self.record_tab.recordingStateChanged.connect(self._on_recording_state)
+        self.record_tab.monitoringStateChanged.connect(self._on_monitoring_state)
         # ...and the other end of that flow: the user declares the album done.
         self.record_tab.processAlbumRequested.connect(self._on_process_album_requested)
         # The between-albums clean slate reaches the Record tab's session state too.
@@ -395,13 +396,38 @@ class MainWindow(QMainWindow):
         """Recording must be unmissable, whichever tab you are looking at."""
         # Full Rip defers its between-albums reset while a capture is under way.
         self.full_rip.set_recording_active(recording)
-        index = self.tabs.indexOf(self.record_tab)
-        self.tabs.setTabText(index, "● Record" if recording else "Record")
+        self._recording = recording
         self.setStyleSheet(
             "QTabWidget::pane { border: 2px solid #c0392b; }" if recording else "")
-        self.setWindowTitle(
-            f"Ripped Record Formatter {__version__}"
-            + (" — RECORDING" if recording else ""))
+        self._refresh_record_state()
+
+    def _on_monitoring_state(self, monitoring: bool) -> None:
+        """The monitor runs at app level, so its state belongs to the window.
+
+        A monitor started on the Record tab keeps playing when the user moves to
+        another tab -- which means this indicator is the only thing standing
+        between them and audio with no visible source.
+        """
+        self._monitoring = monitoring
+        self._refresh_record_state()
+
+    def _refresh_record_state(self) -> None:
+        """Title and tab marker for recording and monitoring together.
+
+        Composed in one place because they overlap -- recording while
+        monitoring is the normal case, and whichever handler ran last must not
+        erase the other's mark.
+        """
+        recording = getattr(self, "_recording", False)
+        monitoring = getattr(self, "_monitoring", False)
+
+        marks = ("●" if recording else "") + ("♪" if monitoring else "")
+        index = self.tabs.indexOf(self.record_tab)
+        self.tabs.setTabText(index, f"{marks} Record" if marks else "Record")
+
+        suffix = (" — RECORDING" if recording else "") + (
+            " — MONITORING" if monitoring else "")
+        self.setWindowTitle(f"Ripped Record Formatter {__version__}{suffix}")
 
     def _on_tab_changed(self, index: int) -> None:
         widget = self.tabs.widget(index)

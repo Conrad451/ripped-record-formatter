@@ -622,3 +622,28 @@ def test_the_overshoot_the_meter_clamps_is_what_the_file_saturates_to(tmp_path):
     back, _ = sf.read(path, dtype="float32")
     assert float(np.abs(back).max()) <= 1.0
     assert float(np.abs(back).max()) == pytest.approx(1.0, abs=1e-4)
+
+
+def test_clamping_the_level_does_not_reduce_the_clip_count(tmp_path):
+    """The clip counter was field-verified, not inferred.
+
+    A stakeholder wired into the digitizer's direct output and heard heavy
+    clipping on the runs the counter had flagged: the 8 counted runs were real
+    ceiling contact, and the counter needed no fix. That makes it a thing to
+    *protect* while the level reading changes around it -- clamping the
+    reported peak to full scale must not quietly make clipping harder to count,
+    which would turn a verified-correct signal into a silent regression.
+    """
+    seen = []
+    rec, made = _recorder(tmp_path, telemetry_interval_s=0.0)
+    rec._on_telemetry = seen.append
+
+    rec.start(device=0, path=tmp_path / "a.wav", samplerate=SR, channels=2)
+    _prime(made["stream"])
+    # Well past the ceiling: exactly the case the clamp now flattens to 0.0 dBFS.
+    made["stream"].push(np.full((512, 2), 1.9, dtype=np.float32))
+    result = rec.stop()
+
+    assert result.clip_runs >= 1, "an overshoot stopped counting as clipping"
+    assert result.max_peak_dbfs == pytest.approx(0.0, abs=1e-9)
+    assert result.clipped
