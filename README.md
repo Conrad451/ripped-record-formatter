@@ -15,11 +15,13 @@ You play a record into it and get a finished album back. Ripped Record Formatter
 
 ## Features
 
-- **Recording.** Capture straight from any input device — turntable into a preamp into a line-in, or a USB interface — with live stereo level meters, peak-hold ticks and a clip indicator that *latches*, so you can set your input gain before you commit and still see afterwards that something clipped. Captures stream to disk (a side never sits in RAM), record to local staging and move to your folder on stop, and say so loudly if the audio has a dropout. Naming is side-aware: the next-file field pre-fills `SideA.wav` and advances to `SideB.wav` after each stop, because the thing you do between takes is flip the record, not type. Capture runs at whatever rate the device is really set to and the 44.1k conversion happens at encode, so there is no rate to pin; an input-gain slider sits beside the meters; and naming the release up front carries the album's identity across to Full Rip with the audio.
+- **Recording.** Capture straight from any input device — turntable into a preamp into a line-in, or a USB interface — with live stereo level meters, peak-hold ticks and a clip indicator that *latches*, so you can set your input gain before you commit and still see afterwards that something clipped. Captures stream to disk (a side never sits in RAM), record to local staging and move to your folder on stop, and say so loudly if the audio has a dropout. Naming is side-aware: the next-file field pre-fills `SideA.wav` and advances to `SideB.wav` after each stop, because the thing you do between takes is flip the record, not type. Capture runs at whatever rate the device is really set to and the 44.1k conversion happens at encode, so there is no rate to pin; a full-width input-gain fader sits beneath the meters with its own level ribbon; the exact file the next take will be written to is shown before you press Record; and naming the release up front carries the album's identity across to Full Rip with the audio.
 - **Restoration pipeline.** An ordered chain of independent stages — rumble filter (zero-phase subsonic high-pass), mains-hum removal (notch at the mains frequency and its harmonics), spectral-gating noise reduction profiled from the lead-in groove, and click/pop removal. Everything between stages is held as float, so a filter that overshoots full scale is not hard-clipped on the way to the next stage; the single conversion back to the source bit depth happens at the very end, with a headroom check that attenuates rather than clips.
 - **Duration-anchored splitting.** Given the expected track durations from the release, the splitter predicts roughly where each gap should fall, searches a window around that prediction for the real silence, and re-anchors the next prediction on the gap it just confirmed — so turntable speed error, unknown lead-out deadspace and approximate CD-sourced durations never accumulate down the side. **When a window contains no convincing silence — a segue, a crossfade, a genuinely gapless transition — it does not invent a split. It hands you that one gap, with the search window highlighted on the waveform, and asks you to place it; the rest of the side is still resolved automatically.**
 - **MusicBrainz lookup.** Search a release, pick the right pressing (vinyl is ranked above CD and studio albums above compilations, so the 1959 LP beats a later best-of), and pull down the per-side tracklist, track durations, MusicBrainz IDs and the front cover from the Cover Art Archive.
 - **Album orchestration.** Point it at the folder of side WAVs, map each file to its side, and the whole record goes through in one run — sides analyse in the background while you review the one in front of you, and accepting a side starts its encode immediately. Tracks land flat in one output folder, numbered continuously across the album, while the *tags* keep per-side TRACKNUMBER/DISCNUMBER (the Picard vinyl convention). A side you just recorded appears in the mapping table on its own, already assigned to its side — record A, flip, record B, and the album job is mapped without you touching it. And a finished album shows a receipt: sides, sizes, warnings, and a link to the output folder.
+- **Export to MP3.** A copy for the phone, the car or the gym, made from the FLACs without touching them — V0 by default, 320 CBR for devices that dislike VBR, V2 for when space is tight. Tags and cover art carry across into ID3, MusicBrainz IDs included, using Picard's spelling so other taggers find them.
+- **One pipeline, not five tools.** The tabs run left to right in the order you actually work — Record, Full Rip, Convert, Re-tag, Settings — the app opens on Record, and a one-line status strip along the bottom says what is happening right now in plain words, turning amber or red when something wants you.
 - **Network-share friendly.** Rips usually live on a NAS. Every operation stages through a local temp directory — copy in, work locally, write results back — and cleans up after itself even on failure or cancellation.
 
 ## Installation
@@ -58,7 +60,7 @@ Along the bottom, a one-line status strip says what the app is doing right now �
 
 A single WAV is just a one-row mapping table — use **Add single WAV…** instead of selecting a folder; everything after that is identical.
 
-**Convert** and **Re-tag** are the simpler tabs for WAVs that are already one-file-per-track, or FLACs that just need their tags rewritten.
+**Convert** and **Re-tag** are the simpler tabs for WAVs that are already one-file-per-track, or FLACs that just need their tags rewritten. Convert also carries **Export to MP3** for making a copy for a phone or a car; Re-tag has its own release lookup, so a folder of untagged FLACs can be given a tracklist without leaving the tab.
 
 ## Setting up your turntable
 
@@ -67,7 +69,7 @@ Getting a record into the computer needs one amplifier between the turntable and
 - **One preamp, not two.** A record needle puts out a tiny "phono" signal that has to be boosted to normal "line" level before recording. That boost must happen *once* — either inside the turntable (many have a PHONO/LINE switch on the back), or in the little USB box you plug into, or in a separate phono preamp — but never two in a row. Two boosts make the sound painfully loud and distorted; none makes it far too quiet. If your turntable has the switch and your USB box also amplifies, set the turntable to **LINE** so only one of them is boosting.
 - **A simple USB box works well.** A Behringer **UCA202** or **UFO202** is an inexpensive, well-behaved way to get a turntable into a computer over USB. The UFO202 has a built-in phono preamp and a headphone jack, so it can be the "one preamp" on its own.
 - **You do not need to set the sample rate.** Capture happens at whatever rate your device is already set to in Windows — 48,000 or even 192,000 Hz is fine — and your FLACs are saved at 44,100 Hz automatically. **Check my setup** says so rather than nagging you to change anything. (The library rate is configurable under **Settings**, including "keep source" if you would rather not resample at all.)
-- **Then set the volume.** Play the loudest song on the record and adjust the volume until the moving level line stays below the dashed one — then you're ready to record.
+- **Then set the volume.** Play the loudest song on the record and drag the input-gain fader until the peaks sit just below the −3 dBFS mark — then you're ready to record.
 
 ## Recording
 
@@ -127,6 +129,37 @@ Written as FLAC Vorbis comments. **A field that is absent writes no tag at all**
 | Front cover image | Cover Art Archive | Embedded as a FLAC picture block, type 3 (front cover) |
 
 The two `RRF_*` fields are written only when the app *encodes* the audio (Full Rip, plain Convert) — re-tagging carries forward whatever the original encode stamped and never rewrites them, so a re-tag cannot erase or falsify provenance.
+
+## Export to MP3
+
+FLAC is the library; MP3 is a copy for a device. The **Convert** tab has an **Export to MP3** section that turns a folder of FLACs into a folder of tagged MP3s, and **Use the album just finished** points it at the album you have this moment ripped. Sources are never modified, moved or deleted.
+
+Three qualities, because the reason you want an MP3 varies: **V0** (VBR ~245 kbps, the default — transparent for practical purposes and smaller than 320), **320 kbps CBR** (for devices and car decks that get unhappy with VBR headers), and **V2** (VBR ~190 kbps, for when the device is small and the commute is long). Encoding is a direct ffmpeg subprocess per track rather than a decode-to-RAM round trip, so an album of 24-bit sides does not need an album of 24-bit sides' worth of memory.
+
+Tags carry across. A field the FLAC does not have produces no frame at all, never an empty one:
+
+| FLAC (Vorbis comment) | MP3 (ID3v2.4) | Notes |
+| --- | --- | --- |
+| `TITLE` | `TIT2` | |
+| `ARTIST` | `TPE1` | |
+| `ALBUM` | `TALB` | |
+| `ALBUMARTIST` | `TPE2` | |
+| `DATE` | `TDRC` | Year as-is |
+| `TRACKNUMBER` + `TRACKTOTAL` | `TRCK` | Packed as `N/T` |
+| `DISCNUMBER` + `DISCTOTAL` | `TPOS` | Packed as `N/T` |
+| `MUSICBRAINZ_ALBUMID` | `TXXX:MusicBrainz Album Id` | Picard's spelling, so Picard and beets find them |
+| `MUSICBRAINZ_ARTISTID` | `TXXX:MusicBrainz Artist Id` | |
+| `MUSICBRAINZ_RECORDINGID` | `TXXX:MusicBrainz Recording Id` | |
+| `MUSICBRAINZ_TRACKID` | `TXXX:MusicBrainz Release Track Id` | |
+| `RRF_VERSION` | `TXXX:RRF_VERSION` | Provenance travels with the copy |
+| `RRF_RESTORATION` | `TXXX:RRF_RESTORATION` | |
+| Front cover picture | `APIC` type 3 | Description "front cover" |
+
+`TRACKTOTAL`/`DISCTOTAL` are also read as `TOTALTRACKS`/`TOTALDISCS`, which is how some other taggers spell them — the source folder is whatever you point at, not necessarily something this app wrote. A total with no corresponding number is dropped rather than written as `/5`.
+
+## Re-tagging with a tracklist
+
+The **Re-tag** tab has its own **Look up release…**, scoped to that tab. Re-tagging a folder is precisely the moment you want a tracklist, and until now the only way to get one was the standalone Metadata tab — which applied the release to whichever batch panel you happened to have visited last. The lookup now lands where you are standing.
 
 ## Roadmap & known limits
 
