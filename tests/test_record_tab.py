@@ -627,15 +627,22 @@ def _monitoring_window(qapp):
 
     w = MainWindow()
     tab = w.record_tab
-    # Genuinely *on* the Record tab first -- otherwise switching to Full Rip
-    # later is a no-op (it is the default tab) and the test proves nothing.
-    w.tabs.setCurrentWidget(tab)
+    # Genuinely *active* on the Record tab first, or "switch away" later proves
+    # nothing. Since the pipeline reorder Record is already the current tab, so
+    # setCurrentWidget would be a no-op and never fire activation -- showing the
+    # window is what activates the landing tab now.
+    w.show()
     qapp.processEvents()
-    assert tab._active, "the fixture must start on the Record tab"
+    assert tab._active, "the fixture must start active on the Record tab"
     tab._passthrough = _FakePassthrough()
     tab.device_combo.setCurrentIndex(_idx_by_name(tab.device_combo, "Line In"))
     tab.monitor_combo.setCurrentIndex(_idx_by_name(tab.monitor_combo, "Speakers"))
+    # monitor_enabled persists, and the config is shared across the session --
+    # so if an earlier test left it on, setChecked(True) is a no-op that never
+    # fires toggled and the passthrough is never started. Force the transition.
+    tab.monitor_check.setChecked(False)
     tab.monitor_check.setChecked(True)
+    assert tab._passthrough.running, "the fixture failed to start monitoring"
     return w, tab
 
 
@@ -729,6 +736,7 @@ def test_a_monitor_open_failure_is_plain_words_not_a_portaudio_error(
 
     tab.device_combo.setCurrentIndex(_idx_by_name(tab.device_combo, "Line In"))
     tab.monitor_combo.setCurrentIndex(_idx_by_name(tab.monitor_combo, "Speakers"))
+    tab.monitor_check.setChecked(False)      # guarantee a real transition
     tab.monitor_check.setChecked(True)
 
     assert logged, "the failure must say something"

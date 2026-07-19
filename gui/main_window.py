@@ -314,7 +314,6 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
 
         from gui.full_rip import FullRipTab
-        from gui.metadata_panel import MetadataPanel
         from gui.record_tab import RecordTab
         from gui.settings_panel import SettingsPanel
 
@@ -322,7 +321,6 @@ class MainWindow(QMainWindow):
         self.convert_panel = BatchPanel("convert", self.settings)
         self.retag_panel = BatchPanel("retag", self.settings)
         self.full_rip = FullRipTab(self.settings)
-        self.metadata_panel = MetadataPanel(settings=self.settings)
         self.settings_panel = SettingsPanel(self.settings)
         self.record_tab = RecordTab(self.settings)
         self.record_tab.logMessage.connect(self._log)
@@ -334,11 +332,15 @@ class MainWindow(QMainWindow):
         self.record_tab.processAlbumRequested.connect(self._on_process_album_requested)
         # The between-albums clean slate reaches the Record tab's session state too.
         self.full_rip.identityReset.connect(self.record_tab.reset_session)
-        self.tabs.addTab(self.full_rip, "Full Rip")
+        # The tab order *is* the pipeline: Record -> Full Rip (tag, restore,
+        # split, save) -> the two folder tools -> Settings. The app opens at the
+        # beginning of the story rather than in the middle of it, and someone
+        # working left to right is following the workflow rather than guessing
+        # at it.
         self.tabs.addTab(self.record_tab, "Record")
+        self.tabs.addTab(self.full_rip, "Full Rip")
         self.tabs.addTab(self.convert_panel, "Convert")
         self.tabs.addTab(self.retag_panel, "Re-tag")
-        self.tabs.addTab(self.metadata_panel, "Metadata")
         self.tabs.addTab(self.settings_panel, "Settings")
 
         for panel in (self.convert_panel, self.retag_panel):
@@ -364,10 +366,9 @@ class MainWindow(QMainWindow):
         self.convert_panel.add_export_section(self.mp3_section)
 
         self.full_rip.logMessage.connect(self._log)
-        self.metadata_panel.statusMessage.connect(self._log)
-        self.metadata_panel.releaseSelected.connect(self._on_release_selected)
-        self._last_batch_panel = self.convert_panel
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        #: The Record tab is activated on first show, not here -- see showEvent.
+        self._activated_landing_tab = False
         # Leaving Full Rip stops any audition and releases the staged file.
         self.tabs.currentChanged.connect(
             lambda _i: self.full_rip._stop_playback())
@@ -507,18 +508,25 @@ class MainWindow(QMainWindow):
         # Meters run whenever the Record tab is the visible one -- so you can set
         # input gain before you ever press Record.
         self.record_tab.set_active(widget is self.record_tab)
-        if widget in (self.convert_panel, self.retag_panel):
-            self._last_batch_panel = widget
 
-    def _on_release_selected(self, detail) -> None:
-        # The standalone Metadata tab feeds the last-used batch panel only;
-        # Full Rip has its own embedded lookup (scoped to itself).
-        panel = getattr(self, "_last_batch_panel", self.convert_panel)
-        panel.apply_release(detail)
-        which = "Convert" if panel is self.convert_panel else "Re-tag"
-        self._log(f"Release selected: {detail.artist} - {detail.title} "
-                  f"({detail.track_count} track(s), cover={'yes' if detail.cover else 'no'}) "
-                  f"-> applied to the {which} panel.")
+    def showEvent(self, event) -> None:
+        """Activate the landing tab the first time the window is actually shown.
+
+        The app opens at the story's beginning, and a Record tab shown with its
+        meters dormant is the "asleep controls" state the pipeline ordering
+        exists to avoid. ``currentChanged`` never fires for the tab that is
+        already index 0, so it has to be done explicitly.
+
+        On *show* rather than in the constructor, deliberately: constructing a
+        window that is never displayed must not open an input stream. That is
+        not a test convenience -- a window with no visible tab has nothing to
+        meter, and reaching for the audio device before anyone can see the bars
+        is work done for no one.
+        """
+        super().showEvent(event)
+        if not self._activated_landing_tab:
+            self._activated_landing_tab = True
+            self.record_tab.set_active(self.tabs.currentWidget() is self.record_tab)
 
     def closeEvent(self, event) -> None:
         self._save_geometry()

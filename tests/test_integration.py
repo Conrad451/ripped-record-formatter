@@ -65,14 +65,70 @@ def qapp():
     yield QApplication.instance() or QApplication([])
 
 
-def test_main_window_constructs_all_tabs(qapp):
+def test_the_tab_order_is_the_pipeline(qapp):
+    """Tab order is the user story: Record -> Full Rip -> the folder tools.
+
+    Record is first because that is where a record actually starts, and the app
+    should open at the beginning of the story rather than in the middle of it.
+    The standalone Metadata tab is gone: its only job was feeding "whichever
+    batch panel you visited last", which was a guess dressed up as a feature.
+    Re-tag now has its own scoped lookup and Full Rip always had one, so the
+    MetadataPanel is a modal everywhere and a tab nowhere.
+    """
     from gui.main_window import MainWindow
 
     w = MainWindow()
     labels = [w.tabs.tabText(i) for i in range(w.tabs.count())]
-    # Full Rip stays the landing tab: opening on Record would seize the audio
-    # device on every launch, for someone who may only want to re-tag.
-    assert labels == ["Full Rip", "Record", "Convert", "Re-tag", "Metadata", "Settings"]
+    assert labels == ["Record", "Full Rip", "Convert", "Re-tag", "Settings"]
+    assert "Metadata" not in labels
+
+
+def test_the_app_opens_on_the_record_tab_with_its_meters_live(qapp):
+    """Landing on Record is only half of it -- a Record tab whose meters are
+    dormant is exactly the "shown but asleep" state the reorder exists to fix.
+    currentChanged does not fire for index 0, so this catches the tab being
+    visible without ever having been activated.
+    """
+    from gui.main_window import MainWindow
+
+    w = MainWindow()
+    assert w.tabs.currentWidget() is w.record_tab
+    # Activation happens on show, not construction: a window nobody has seen
+    # has nothing to meter and must not reach for the audio device.
+    assert not w.record_tab._active
+    w.show()
+    qapp.processEvents()
+    assert w.record_tab._active, "the Record tab was shown but never activated"
+    w.close()
+
+
+def test_the_window_no_longer_owns_a_standalone_metadata_panel(qapp):
+    """The tab, the instance and the fan-out all go; the class stays.
+
+    MetadataPanel is still the reused lookup modal (Record, Re-tag, Full Rip),
+    so this asserts the *window* dropped its full-page copy -- not that the
+    class was deleted.
+    """
+    from gui.main_window import MainWindow
+
+    w = MainWindow()
+    assert not hasattr(w, "metadata_panel")
+    # ...and the "apply to whichever panel was visited last" fan-out with it.
+    assert not hasattr(w, "_last_batch_panel")
+    assert not hasattr(w, "_on_release_selected")
+
+
+def test_the_record_to_rip_bridge_targets_full_rip_by_identity(qapp):
+    """The bridge must survive a tab reorder.
+
+    It switches by widget, not by a hardcoded index -- which is the whole
+    reason moving Full Rip from position 0 to position 1 did not break it.
+    """
+    from gui.main_window import MainWindow
+
+    w = MainWindow()
+    w._on_process_album_requested()
+    assert w.tabs.currentWidget() is w.full_rip
 
 
 def test_full_rip_accept_gating_and_override(qapp):
@@ -556,6 +612,10 @@ def test_default_layout_gives_the_review_area_room(qapp):
 
     w = MainWindow()
     w.resize(1280, 956)                      # what a 1080p desktop gets
+    # Full Rip is tab 2 since the pipeline reorder, and Qt only lays out the
+    # *selected* tab -- without this both group boxes report an unlaid-out
+    # default and the comparison is meaningless rather than false.
+    w.tabs.setCurrentWidget(w.full_rip)
     w.show()
     qapp.processEvents()
     fr = w.full_rip
