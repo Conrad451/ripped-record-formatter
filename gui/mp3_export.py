@@ -31,7 +31,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from core import mp3_export
+from core import audio_export, export_profiles, mp3_export
+from gui.text_styles import apply_muted
 from core.tracks import sanitize_filename_component
 
 # The order the quality choices appear in the combo. V0 first: it is the default
@@ -43,7 +44,8 @@ _QUALITY_ORDER = (
 )
 
 
-def derived_output_dir(root: str, artist: str, album: str) -> str | None:
+def derived_output_dir(root: str, artist: str, album: str,
+                       format_folder: str = "MP3") -> str | None:
     """``{root}\\MP3\\{Artist}\\{Album}``, or ``None`` when it is not derivable.
 
     "Derivable" means we have a root folder and both an artist and an album that
@@ -51,9 +53,10 @@ def derived_output_dir(root: str, artist: str, album: str) -> str | None:
     export landing in ``.../MP3//`` because the album field was blank is worse
     than an empty box the user has to fill in.
 
-    The ``MP3`` level keeps the exports visibly apart from the FLAC library
-    underneath the same root: this is a copy for a device, and it should never be
-    mistakable for the library itself.
+    The format level keeps exports visibly apart from the FLAC library under the
+    same root -- and apart from *each other*, so an ALAC copy and a WAV copy of
+    the same album do not land in one folder. This is a copy for a device and
+    should never be mistakable for the library itself.
     """
     if not root:
         return None
@@ -61,7 +64,7 @@ def derived_output_dir(root: str, artist: str, album: str) -> str | None:
     album_part = sanitize_filename_component(album)
     if not artist_part or not album_part:
         return None
-    return str(Path(root) / "MP3" / artist_part / album_part)
+    return str(Path(root) / (format_folder or "MP3") / artist_part / album_part)
 
 
 class Mp3ExportSection(QGroupBox):
@@ -86,7 +89,7 @@ class Mp3ExportSection(QGroupBox):
         That keeps this widget testable on its own and means wiring it up does
         not couple it to the Full Rip tab's internals.
         """
-        super().__init__("Export to MP3 (for phones, iPods, car stereos)")
+        super().__init__("Export a copy (for Apple devices, CD burning, phones)")
         self.settings = settings
         self._output_root = output_root
         self._recent_album_dir = recent_album_dir
@@ -109,12 +112,28 @@ class Mp3ExportSection(QGroupBox):
         form.addWidget(self.output_edit, 1, 1)
         form.addWidget(self._browse_button(self.output_edit, "Select MP3 folder"), 1, 2)
 
-        # --- quality ---------------------------------------------------------
+        # --- format ----------------------------------------------------------
+        self.format_combo = QComboBox()
+        for profile in export_profiles.PROFILES:
+            self.format_combo.addItem(profile.label, profile.key)
+        self.format_combo.setCurrentIndex(
+            max(0, self.format_combo.findData(export_profiles.DEFAULT_PROFILE)))
+        self.format_combo.currentIndexChanged.connect(self._on_format_changed)
+        form.addWidget(QLabel("Format:"), 2, 0)
+        form.addWidget(self.format_combo, 2, 1)
+
+        # --- quality (only formats that have a choice) ------------------------
+        self.quality_label = QLabel("Quality:")
         self.quality_combo = QComboBox()
-        for quality in _QUALITY_ORDER:
-            self.quality_combo.addItem(mp3_export.QUALITY_LABELS[quality], quality)
-        form.addWidget(QLabel("Quality:"), 2, 0)
-        form.addWidget(self.quality_combo, 2, 1)
+        form.addWidget(self.quality_label, 3, 0)
+        form.addWidget(self.quality_combo, 3, 1)
+
+        # What the format costs you, said where you choose it rather than
+        # discovered afterwards.
+        self.caveat_label = QLabel("")
+        self.caveat_label.setWordWrap(True)
+        apply_muted(self.caveat_label)
+        form.addWidget(self.caveat_label, 4, 1, 1, 2)
         layout.addLayout(form)
 
         # --- actions ---------------------------------------------------------
@@ -125,7 +144,7 @@ class Mp3ExportSection(QGroupBox):
         self.use_album_button.clicked.connect(self.use_recent_album)
         actions.addWidget(self.use_album_button)
 
-        self.suggest_button = QPushButton("Suggest MP3 folder")
+        self.suggest_button = QPushButton("Suggest a folder")
         self.suggest_button.setToolTip(
             "Offer {output root}\\MP3\\{Artist}\\{Album} from the fields above.")
         self.suggest_button.clicked.connect(self.suggest_output)
@@ -143,6 +162,24 @@ class Mp3ExportSection(QGroupBox):
         self.source_edit.editingFinished.connect(self._offer_output)
 
     # --- helpers -------------------------------------------------------------
+    def current_profile(self):
+        """The chosen export profile."""
+        return export_profiles.get(
+            self.format_combo.currentData() or export_profiles.DEFAULT_PROFILE)
+
+    def _on_format_changed(self, *_args) -> None:
+        """Quality choices, the caveat and the button follow the format."""
+        profile = self.current_profile()
+        self.quality_combo.clear()
+        for key in profile.variants:
+            self.quality_combo.addItem(profile.variant_labels.get(key, key), key)
+        has_variants = bool(profile.variants)
+        self.quality_combo.setVisible(has_variants)
+        self.quality_label.setVisible(has_variants)
+        self.caveat_label.setText(profile.caveat)
+        self.export_button.setText(f"Export to {profile.label}")
+        self.output_edit.setPlaceholderText(f"Where the {profile.label} files go")
+
     def _browse_button(self, target: QLineEdit, caption: str) -> QPushButton:
         button = QPushButton("Browse...")
 
@@ -158,13 +195,14 @@ class Mp3ExportSection(QGroupBox):
         return button
 
     def quality(self) -> str:
-        """The selected quality constant (``"V0"``/``"320"``/``"V2"``)."""
-        return self.quality_combo.currentData()
+        """The selected quality variant, or "" for formats without one."""
+        return self.quality_combo.currentData() or ""
 
     def _suggestion(self) -> str | None:
         root = self._output_root() if self._output_root else ""
         artist, album = self._metadata() if self._metadata else ("", "")
-        return derived_output_dir(root, artist, album)
+        return derived_output_dir(root, artist, album,
+                                  self.current_profile().label.split(" ")[0])
 
     def _offer_output(self) -> None:
         """Pre-fill the destination if we can derive one and none is set yet."""
@@ -180,11 +218,11 @@ class Mp3ExportSection(QGroupBox):
         suggestion = self._suggestion()
         if not suggestion:
             self.logMessage.emit(
-                "Cannot suggest an MP3 folder yet -- set an output folder and "
+                "Cannot suggest a folder yet -- set an output folder and "
                 "fill in Artist and Album above.")
             return
         self.output_edit.setText(suggestion)
-        self.logMessage.emit(f"MP3 folder set to {suggestion}")
+        self.logMessage.emit(f"Export folder set to {suggestion}")
 
     def use_recent_album(self) -> None:
         """Point the source at the album Full Rip most recently completed."""
@@ -227,15 +265,17 @@ class Mp3ExportSection(QGroupBox):
 
         if Path(output).resolve() == Path(self.source_edit.text().strip()).resolve():
             self.logMessage.emit(
-                "The MP3 folder must not be the FLAC folder -- choose a "
+                "The export folder must not be the FLAC folder -- choose a "
                 "separate destination so the export cannot sit among the library.")
             return None
 
+        profile = self.current_profile()
         kwargs = {
-            "quality": self.quality(),
+            "profile": profile.key,
+            "variant": self.quality(),
             "max_workers": self.settings.config.encode_workers,
         }
-        return mp3_export.export_mp3, flacs, Path(output), kwargs
+        return audio_export.export_audio, flacs, Path(output), kwargs
 
     def set_running(self, running: bool) -> None:
         self.export_button.setEnabled(not running)
