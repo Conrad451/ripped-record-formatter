@@ -297,6 +297,9 @@ class FullRipTab(QWidget):
         # Always-visible summary of what is actually loaded. Its job is to make
         # a missing cover obvious *now* rather than after the album is encoded.
         self.release_preview = ReleasePreview()
+        # A cover the user supplies travels the identical cover= path as a
+        # fetched one; nothing downstream can tell the difference.
+        self.release_preview.coverChosen.connect(self._on_cover_chosen)
         form.addRow("", self.release_preview)
 
         side_row = QHBoxLayout()
@@ -2205,6 +2208,10 @@ class FullRipTab(QWidget):
                 use_side_letters=use_side_letters,
             ))
         return result
+
+    def _on_cover_chosen(self, cover) -> None:
+        self._cover = cover
+        self._log("Cover art: using your own image for this album.")
 
     def _update_meta_summary(self) -> None:
         if self._release is None:

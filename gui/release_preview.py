@@ -14,10 +14,11 @@ the vertical space more than this does.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap
 from gui.text_styles import apply_muted
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
+                               QWidget)
 
 #: The one wording for "this release has no art", used everywhere it is said.
 NO_COVER_TEXT = "No cover art on this release"
@@ -111,7 +112,14 @@ def describe_release(detail) -> tuple[str, str, str]:
 
 
 class ReleasePreview(QWidget):
-    """Thumbnail + three lines. Compact by design."""
+    """Thumbnail + three lines, and a way out of the no-art state.
+
+    Used by Full Rip's source row, the Record tab's album row and the lookup
+    dialog, so the manual-cover affordance built here reaches all three at once.
+    """
+
+    #: The user chose an image from disk. Carries a CoverArt.
+    coverChosen = Signal(object)
 
     def __init__(self, thumb_size: int = 64) -> None:
         super().__init__()
@@ -133,12 +141,52 @@ class ReleasePreview(QWidget):
         self.cover_label.setWordWrap(True)
         for label in (self.title_label, self.detail_label, self.cover_label):
             lines.addWidget(label)
+
+        # The no-art state used to report a problem and stop. A record with no
+        # art in the archive is common, and the person reading the warning very
+        # often has the sleeve scanned already -- so the warning carries the fix.
+        self.choose_cover_button = QPushButton("Choose cover image…")
+        self.choose_cover_button.setFlat(True)
+        self.choose_cover_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.choose_cover_button.setStyleSheet(
+            "QPushButton { border: none; color: palette(link); "
+            "text-decoration: underline; padding: 0; text-align: left; }")
+        self.choose_cover_button.setToolTip(
+            "Use a JPEG or PNG from your own disk as this album's cover.")
+        self.choose_cover_button.clicked.connect(self._choose_cover)
+        self.choose_cover_button.setVisible(False)
+        lines.addWidget(self.choose_cover_button)
+
         lines.addStretch(1)
         row.addLayout(lines, 1)
 
+        self._detail = None
         self.clear()
 
+    def _choose_cover(self) -> None:
+        from gui.cover_picker import choose_cover_file
+
+        cover, problem = choose_cover_file(self)
+        if problem:
+            self.cover_label.setText(problem)
+            self.cover_label.setStyleSheet(
+                "QLabel { color: #c0392b; font-weight: bold; }")
+            return
+        if cover is None:
+            return
+        self.set_cover(cover)
+        self.coverChosen.emit(cover)
+
+    def set_cover(self, cover) -> None:
+        """Show art supplied from outside (a file the user picked)."""
+        if self.thumb.set_cover(cover):
+            self.cover_label.setText("Cover art: your own image.")
+            apply_muted(self.cover_label)
+            self.choose_cover_button.setText("Choose a different image…")
+
     def clear(self) -> None:
+        self._detail = None
+        self.choose_cover_button.setVisible(False)
         self.thumb.clear_cover()
         self.title_label.setText("No release selected")
         self.detail_label.setText("Look up a release for titles, durations and cover art.")
@@ -147,6 +195,7 @@ class ReleasePreview(QWidget):
         self.setVisible(False)
 
     def set_release(self, detail) -> None:
+        self._detail = detail
         title_line, detail_line, layout_line = describe_release(detail)
         self.title_label.setText(title_line)
 
@@ -163,4 +212,7 @@ class ReleasePreview(QWidget):
                 else f"{NO_COVER_TEXT} - {NO_COVER_HINT}"
             )
             self.cover_label.setStyleSheet("QLabel { color: #c07000; font-weight: bold; }")
+        # Offered exactly where the gap is, and only there.
+        self.choose_cover_button.setVisible(not has_art)
+        self.choose_cover_button.setText("Choose cover image…")
         self.setVisible(True)

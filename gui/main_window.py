@@ -111,9 +111,13 @@ class BatchPanel(QWidget):
 
         # --- mode-specific controls ----------------------------------------
         controls = QHBoxLayout()
-        self.load_button = QPushButton(
-            "Load WAVs" if kind == "convert" else "Load FLACs"
-        )
+        # Kept as a manual re-scan for a folder that changed under you, but no
+        # longer the way files arrive: choosing a folder is the request, and
+        # every other tab in the app already discovers files on its own.
+        self.load_button = QPushButton("Rescan folder")
+        self.load_button.setToolTip(
+            "Read the folder again. Files load automatically when you choose "
+            "one; this is for when the folder has changed since.")
         self.load_button.clicked.connect(self.load_files)
         controls.addWidget(self.load_button)
 
@@ -136,6 +140,13 @@ class BatchPanel(QWidget):
             # Sides are how a flat folder of FLACs becomes a record: the same
             # partition editor Full Rip uses, against the same kind of flat
             # tracklist, producing the same per-side numbering.
+            self.cover_button = QPushButton("Choose cover image…")
+            self.cover_button.setToolTip(
+                "Embed a JPEG or PNG from your disk in every track this pass "
+                "writes. Use it when the release has no art online.")
+            self.cover_button.clicked.connect(self._choose_cover)
+            controls.addWidget(self.cover_button)
+
             self.define_sides_button = QPushButton("Define sides...")
             self.define_sides_button.setToolTip(
                 "Split this tracklist into sides. Track numbers restart on each "

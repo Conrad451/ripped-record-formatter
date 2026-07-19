@@ -187,8 +187,16 @@ class MetadataPanel(QWidget):
         self.cover_label.setWordWrap(True)
         self.cover_label.setFixedWidth(200)
         self.cover_label.setMinimumHeight(200)
+        # The fourth no-art site. A release with nothing in the archive is
+        # common; the warning carries the fix rather than ending there.
+        self.choose_cover_button = QPushButton("Choose cover image…")
+        self.choose_cover_button.setToolTip(
+            "Use a JPEG or PNG from your own disk as this release's cover.")
+        self.choose_cover_button.clicked.connect(self._choose_cover)
+        self.choose_cover_button.setVisible(False)
         self.cover_label.setStyleSheet(_COVER_STYLE)
         preview_layout.addWidget(self.cover_label)
+        preview_layout.addWidget(self.choose_cover_button)
 
         self._split = QSplitter(Qt.Orientation.Vertical)
         self._split.addWidget(top)
@@ -374,6 +382,30 @@ class MetadataPanel(QWidget):
         self.cover_label.setText("Could not load preview")
         self.cover_label.setStyleSheet(_NO_COVER_STYLE)
         self._set_status(message)
+
+    def _choose_cover(self) -> None:
+        """Attach a cover from disk to the release being previewed.
+
+        Replaces the previewed detail with one carrying the chosen art, so
+        committing the release hands the host exactly what is on screen.
+        """
+        import dataclasses
+
+        from gui.cover_picker import choose_cover_file
+
+        detail = self._detail_cache.get(self._preview_id) if self._preview_id else None
+        if detail is None:
+            return
+        cover, problem = choose_cover_file(self)
+        if problem:
+            self._set_status(problem)
+            return
+        if cover is None:
+            return
+        updated = dataclasses.replace(detail, cover=cover)
+        self._detail_cache[self._preview_id] = updated
+        self._populate_cover(updated)
+        self._set_status(f"{updated.title} - cover art: your own image.")
 
     def _show_preview(self, detail: ReleaseDetail) -> None:
         self._populate_tracks(detail)
