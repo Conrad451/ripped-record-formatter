@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable
 
+from core.batch import run_batch
 from core.tracks import Tracks
 
 if TYPE_CHECKING:
@@ -175,47 +176,17 @@ def _prepare_output_dir(output_dir: Path) -> Path:
 
 
 def _run_batch(tracks, work, on_progress, max_workers, should_cancel) -> BatchResult:
-    """Run ``work(track)`` over ``tracks``, serially or on a bounded thread pool.
+    """Batch a per-track job into a :class:`BatchResult`.
 
-    Each track's export/tag/cover is independent, so with ``max_workers > 1`` they
-    run concurrently (the encode is a per-track ffmpeg subprocess). ``on_progress``
-    fires once per *completed* track with ``(completed_count, total, name)`` --
-    order-independent "N of M", never "track K". ``should_cancel`` is polled
-    before each submission; in-flight tasks finish and a partial result returns.
-    Outcomes keep original track order regardless of completion order.
+    The batching itself lives in :func:`core.batch.run_batch`, shared with the
+    MP3 export path; this wrapper only supplies the track-name accessor and the
+    result type.
     """
-    tracks = list(tracks)
-    total = len(tracks)
-    outcomes: list = [None] * total
-
-    if max_workers and max_workers > 1 and total > 1:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {}
-            for i, track in enumerate(tracks):
-                if should_cancel is not None and should_cancel():
-                    break
-                futures[pool.submit(work, track)] = i
-            completed = 0
-            for future in as_completed(futures):
-                outcome = future.result()
-                outcomes[futures[future]] = outcome
-                completed += 1
-                if on_progress is not None:
-                    on_progress(completed, total, outcome.track.track_name)
-    else:
-        completed = 0
-        for i, track in enumerate(tracks):
-            if should_cancel is not None and should_cancel():
-                break
-            outcomes[i] = work(track)
-            completed += 1
-            if on_progress is not None:
-                on_progress(completed, total, outcomes[i].track.track_name)
-
     result = BatchResult()
-    result.outcomes = [o for o in outcomes if o is not None]
+    result.outcomes = run_batch(
+        tracks, work, name_of=lambda o: o.track.track_name,
+        on_progress=on_progress, max_workers=max_workers,
+        should_cancel=should_cancel)
     return result
 
 

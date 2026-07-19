@@ -72,6 +72,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
 
+from core.batch import run_batch
+
 # on_progress(current, total, name) -- current is 1-based and counts tracks that
 # have *completed*, matching core.converter's callback exactly so the GUI can
 # route an export through the same progress plumbing as a conversion.
@@ -373,48 +375,17 @@ def mp3_name(flac_path: Path) -> str:
 
 
 def _run_batch(items, work, on_progress, max_workers, should_cancel) -> ExportResult:
-    """Run ``work(item)`` over ``items``, serially or on a bounded thread pool.
+    """Batch a per-file export into an :class:`ExportResult`.
 
-    The same shape as :func:`core.converter._run_batch` -- each track is an
-    independent ffmpeg subprocess, ``on_progress`` fires once per *completed*
-    item as "N of M", ``should_cancel`` is polled before each submission and
-    in-flight work is allowed to finish, and outcomes keep input order regardless
-    of completion order. It is a separate copy rather than a shared helper only
-    because that one is typed around :class:`core.tracks.Tracks` and this path
-    works on bare paths; worth unifying if a third caller ever appears.
+    The batching itself lives in :func:`core.batch.run_batch`, shared with the
+    WAV->FLAC path; this wrapper only supplies the name accessor and the result
+    type.
     """
-    items = list(items)
-    total = len(items)
-    outcomes: list = [None] * total
-
-    if max_workers and max_workers > 1 and total > 1:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {}
-            for i, item in enumerate(items):
-                if should_cancel is not None and should_cancel():
-                    break
-                futures[pool.submit(work, item)] = i
-            completed = 0
-            for future in as_completed(futures):
-                outcome = future.result()
-                outcomes[futures[future]] = outcome
-                completed += 1
-                if on_progress is not None:
-                    on_progress(completed, total, outcome.name)
-    else:
-        completed = 0
-        for i, item in enumerate(items):
-            if should_cancel is not None and should_cancel():
-                break
-            outcomes[i] = work(item)
-            completed += 1
-            if on_progress is not None:
-                on_progress(completed, total, outcomes[i].name)
-
     result = ExportResult()
-    result.outcomes = [o for o in outcomes if o is not None]
+    result.outcomes = run_batch(
+        items, work, name_of=lambda o: o.name,
+        on_progress=on_progress, max_workers=max_workers,
+        should_cancel=should_cancel)
     return result
 
 

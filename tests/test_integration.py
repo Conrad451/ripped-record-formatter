@@ -1206,3 +1206,47 @@ def test_the_record_tab_still_fits_an_800px_window(qapp):
     # The lanes were explicitly not the place to take height from.
     assert w.record_tab.history_strip.height() >= 68
     w.close()
+
+
+# --------------------------------------------------------------------------- #
+# v2.4.0 merge seam: all three cars' surfaces coexist in one window.
+# --------------------------------------------------------------------------- #
+def test_the_merged_window_carries_all_three_cars(qapp):
+    """One render, three branches.
+
+    retag-and-chrome brought the release lookup into Re-tag, mp3-export brought
+    the MP3 section to Convert, meter-truth brought the per-channel meter
+    numerics. All three rewrote overlapping parts of MainWindow and BatchPanel
+    from separate checkouts, and two of them conflicted on the same
+    ``set_running`` guard -- so "merged green" is worth asserting as rendered
+    surfaces rather than as a clean diff.
+    """
+    from gui.main_window import MainWindow
+
+    w = MainWindow()
+    w.resize(1000, 900)
+    w.show()
+    qapp.processEvents()
+
+    # retag-and-chrome: Re-tag can look up a release; Convert deliberately cannot.
+    assert w.retag_panel.lookup_button is not None
+    assert w.convert_panel.lookup_button is None
+
+    # mp3-export: Convert carries the MP3 section; Re-tag deliberately does not.
+    assert w.convert_panel.mp3_section is not None
+    assert w.retag_panel.mp3_section is None
+
+    # meter-truth: per-channel numerics, one readout pair per channel.
+    rows = w.record_tab.meters.rows
+    assert len(rows) == 2
+    for row in rows:
+        assert row.peak_label is not None
+        assert row.hold_label is not None
+
+    # The conflicted seam itself: set_running must reach whichever the panel has,
+    # and must not trip over the one it lacks.
+    for panel in (w.convert_panel, w.retag_panel):
+        panel.set_running(True)
+        panel.set_running(False)
+
+    w.close()
