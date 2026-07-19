@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 
 from core.album import SideState
 from core.timefmt import format_size, format_timestamp
+from gui.text_styles import apply_body, apply_muted
 from gui.release_preview import CoverThumb
 
 # Errored/cancelled sides shown honestly in their state colour; done is neutral.
@@ -117,7 +118,7 @@ class AlbumSummaryCard(QFrame):
         self.title_label.setWordWrap(True)
         titles.addWidget(self.title_label)
         subtitle = QLabel(summary.describe())
-        subtitle.setStyleSheet("QLabel { color: palette(mid); }")
+        apply_muted(subtitle)
         titles.addWidget(subtitle)
         header.addLayout(titles, 1)
 
@@ -173,7 +174,7 @@ class AlbumSummaryCard(QFrame):
         label = QLabel(
             f"    Restoration: {repaired:,} of {total:,} samples declicked ({pct:.2f}%)"
         )
-        label.setStyleSheet("QLabel { color: palette(mid); }")
+        apply_body(label)          # a receipt is content, not a hint
         self.restoration_labels.append(label)
         return label
 
@@ -186,7 +187,7 @@ class AlbumSummaryCard(QFrame):
 
         path_text = str(self._destination) if self._destination else ""
         path_label = QLabel(path_text)
-        path_label.setStyleSheet("QLabel { color: palette(mid); }")
+        apply_body(path_label)
         path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         footer.addWidget(path_label, 1)
 

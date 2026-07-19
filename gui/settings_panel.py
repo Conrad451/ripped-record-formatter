@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from gui.text_styles import apply_muted
 from core.metadata_lookup import MAX_CONTACT_LENGTH, sanitize_contact
 
 #: Post-album folder policy choices, mirrored from core.config.
@@ -142,7 +143,7 @@ class SettingsPanel(QWidget):
             "album finishes -- no default is safe for identity. Only these folders "
             "follow a policy.")
         folders_hint.setWordWrap(True)
-        folders_hint.setStyleSheet("QLabel { color: palette(mid); }")
+        apply_muted(folders_hint)
         folders.addRow(folders_hint)
         root.addWidget(folders_box)
 
@@ -162,7 +163,7 @@ class SettingsPanel(QWidget):
             "you about traffic issues. Optional, but courteous."
         )
         hint.setWordWrap(True)
-        hint.setStyleSheet("QLabel { color: palette(mid); }")
+        apply_muted(hint)
         lookup.addRow(hint)
         root.addWidget(lookup_box)
 

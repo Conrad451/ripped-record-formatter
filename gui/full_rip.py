@@ -68,6 +68,7 @@ from core.side_partition import Side
 from core.split_review import detect_progressive_drift, segment_deviations, wrong_side_suspected
 from core.timefmt import format_timestamp
 from core.tracks import safe_part, track_filename
+from gui.text_styles import apply_body, apply_muted
 from gui.playback import AuditionPlayer
 from gui.release_preview import NO_COVER_TEXT, ReleasePreview
 from gui.side_editor import SideEditorDialog, side_letter
@@ -313,7 +314,7 @@ class FullRipTab(QWidget):
         # empty-state label instead of presenting a screenful of dead controls.
         self.empty_state = QLabel("Select a folder to begin.")
         self.empty_state.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.empty_state.setStyleSheet("QLabel { color: palette(mid); padding: 24px; }")
+        apply_muted(self.empty_state, extra="padding: 24px")
         root.addWidget(self.empty_state, 1)
 
         self.review_box = QWidget()
@@ -357,7 +358,7 @@ class FullRipTab(QWidget):
             "Space play/pause · Ctrl+click seeks · click a marker to select it, "
             "arrows nudge it, then Preview cut."
         )
-        self.playback_hint.setStyleSheet("QLabel { color: palette(mid); }")
+        apply_muted(self.playback_hint)
         play_row.addWidget(self.playback_hint, 1)
         review.addLayout(play_row)
 
@@ -435,7 +436,7 @@ class FullRipTab(QWidget):
 
         self.meta_summary = QLabel("")
         self.meta_summary.setWordWrap(True)
-        self.meta_summary.setStyleSheet("QLabel { color: palette(mid); }")
+        apply_muted(self.meta_summary)
         review.addWidget(self.meta_summary)
 
         self.progress = QProgressBar()

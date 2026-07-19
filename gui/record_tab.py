@@ -53,6 +53,7 @@ from core.recorder import (
 from core.setup_check import INFO, OK, WARN, CheckResult, check_sample_rate, check_signal
 from core.timefmt import format_timestamp
 from core.tracks import safe_part
+from gui.text_styles import apply_body, apply_muted
 from gui.gain_fader import GainFader
 from gui.level_history import LevelHistoryStrip
 from gui.meters import LevelMeters, format_channel_peak
@@ -352,7 +353,7 @@ class RecordTab(QWidget):
             "sounds like an echo. The monitor is for hearing the record play — "
             "judge levels by the meters, not by ear.")
         self.monitor_hint.setWordWrap(True)
-        self.monitor_hint.setStyleSheet("QLabel { color: palette(mid); }")
+        apply_muted(self.monitor_hint)
         self.monitor_hint.setToolTip(
             "Monitor passes the input through to your chosen output device so you "
             "can hear the record without Windows' 'Listen to this device'.")
@@ -424,7 +425,7 @@ class RecordTab(QWidget):
         # has no vertical budget to spend on a caption that grows with the
         # user's folder names.
         self.destination_label = ElidedPathLabel("—")
-        self.destination_label.setStyleSheet("QLabel { color: palette(mid); }")
+        apply_muted(self.destination_label)
         out_form.addRow("", self.destination_label)
         root.addWidget(out_box)
 
@@ -443,7 +444,7 @@ class RecordTab(QWidget):
         self.elapsed_label = QLabel("0:00")
         transport.addWidget(self.elapsed_label)
         self.size_label = QLabel("")
-        self.size_label.setStyleSheet("QLabel { color: palette(mid); }")
+        apply_muted(self.size_label)
         transport.addWidget(self.size_label)
         transport.addStretch(1)
 
@@ -978,8 +979,7 @@ class RecordTab(QWidget):
         if dest is None:
             self.destination_label.setFullText("— choose a folder and a file name")
             self.destination_label.setToolTip("")
-            self.destination_label.setStyleSheet(
-                "QLabel { color: palette(mid); font-style: italic; }")
+            apply_muted(self.destination_label, italic=True)
             return
 
         self.destination_label.setFullText(f"→ {dest}")

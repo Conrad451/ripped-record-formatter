@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from gui.text_styles import apply_muted
 from gui.level_scale import FLOOR_DBFS, GRIDLINES_DBFS, dbfs_fraction
 
 #: Where the bar turns amber -- close enough to full scale to want a look.
@@ -356,7 +357,7 @@ class LevelMeters(QWidget):
         # Same loud amber treatment as the no-cover state: this is a problem you
         # want to be told about, not a status you want to look for.
         self.clip_label = QLabel("no clipping")
-        self.clip_label.setStyleSheet("QLabel { color: palette(mid); }")
+        apply_muted(self.clip_label)
         readout.addWidget(self.clip_label)
 
         self.reset_button = QPushButton("Reset")
@@ -406,4 +407,4 @@ class LevelMeters(QWidget):
             row.reset()
         self.set_max_peak(float("-inf"))
         self.clip_label.setText("no clipping")
-        self.clip_label.setStyleSheet("QLabel { color: palette(mid); }")
+        apply_muted(self.clip_label)
