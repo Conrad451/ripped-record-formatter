@@ -47,6 +47,22 @@ import soundfile as sf
 CLIP_LEVEL = 0.999
 CLIP_RUN_LEN = 3
 
+#: Digital full scale, and the ceiling every reported level is measured against.
+#:
+#: WASAPI **shared mode hands us float32 that is not bounded to ±1.0**. Windows
+#: mixes, applies the endpoint volume and runs any APO processing in the float
+#: domain, so a device whose hardware is 16-bit still delivers samples above
+#: unity -- and ``_to_dbfs`` faithfully turns 1.2303 into +1.8 dBFS. That is the
+#: "max 1.8 dBFS (0.0 dB headroom)" from the field: not an arithmetic error, but
+#: a level measured in the wrong domain.
+#:
+#: The meter is a statement about *the recording*, and the recording is an
+#: integer file that saturates here: write that same 1.2303 sample as PCM_16 and
+#: it reads back 0.999969. So the peak is clamped to full scale at the moment it
+#: is measured. Nothing is lost by doing so -- a sample over the ceiling is
+#: clipping, ``CLIP_LEVEL`` catches it, and the clip counter is what reports it.
+FULL_SCALE = 1.0
+
 #: How often telemetry is pushed to the GUI. See the module docstring in the tab
 #: and the report: peak is accumulated over *every* frame in the callback, so a
 #: coarse emit rate loses no transient -- it only limits how often the meters
@@ -124,7 +140,16 @@ TelemetryCallback = Callable[[Telemetry], None]
 
 
 def _to_dbfs(amplitude: float) -> float:
-    return 20.0 * float(np.log10(amplitude)) if amplitude > 0 else -np.inf
+    """Amplitude -> dBFS, never above 0.
+
+    The clamp is belt-and-braces: :meth:`_LevelStats.feed` already holds the
+    stored peaks at :data:`FULL_SCALE`, but every dBFS number the telemetry
+    reports goes through this function, so the invariant is enforced where it
+    cannot be routed around.
+    """
+    if amplitude <= 0:
+        return -np.inf
+    return 20.0 * float(np.log10(min(float(amplitude), FULL_SCALE)))
 
 
 def list_input_devices() -> list[DeviceInfo]:
@@ -294,7 +319,10 @@ class _LevelStats:
             if block.shape[0] == 0:
                 return
 
-        peaks = np.abs(block).max(axis=0)
+        # Clamped to the format ceiling: shared-mode float32 can exceed unity
+        # (see FULL_SCALE), and a level meter that reads above full scale is
+        # describing a file that cannot exist.
+        peaks = np.minimum(np.abs(block).max(axis=0), FULL_SCALE)
         if peaks.shape == self.window_peak.shape:
             np.maximum(self.window_peak, peaks, out=self.window_peak)
         block_peak = float(peaks.max()) if peaks.size else 0.0

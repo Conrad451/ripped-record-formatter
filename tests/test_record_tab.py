@@ -616,3 +616,125 @@ def test_gain_slider_hidden_when_endpoint_inaccessible(qapp, no_hardware):
     tab._on_device_changed()
     assert not tab.gain_slider.isVisibleTo(tab)
     assert tab._gain is None
+
+
+# --------------------------------------------------------------------------- #
+# The monitor is a session feature, not a tab feature (9.14 Part 1f)
+# --------------------------------------------------------------------------- #
+def _monitoring_window(qapp):
+    """A window with monitoring on, driven through the real toggle path."""
+    from gui.main_window import MainWindow
+
+    w = MainWindow()
+    tab = w.record_tab
+    # Genuinely *on* the Record tab first -- otherwise switching to Full Rip
+    # later is a no-op (it is the default tab) and the test proves nothing.
+    w.tabs.setCurrentWidget(tab)
+    qapp.processEvents()
+    assert tab._active, "the fixture must start on the Record tab"
+    tab._passthrough = _FakePassthrough()
+    tab.device_combo.setCurrentIndex(_idx_by_name(tab.device_combo, "Line In"))
+    tab.monitor_combo.setCurrentIndex(_idx_by_name(tab.monitor_combo, "Speakers"))
+    tab.monitor_check.setChecked(True)
+    return w, tab
+
+
+def test_the_monitor_survives_a_tab_switch(qapp, no_hardware):
+    """The defect this replaces: monitoring stopped when the Record tab lost
+    focus, which pushed people onto Windows' "Listen to this device" as a
+    fallback -- and two monitors running at once was misread in the field as a
+    ~250 ms channel skew. Audio the user turned on stays on.
+    """
+    w, tab = _monitoring_window(qapp)
+    assert tab._passthrough.running
+
+    # Look at another tab. The real path: the window drives set_active(False).
+    w.tabs.setCurrentWidget(w.full_rip)
+    qapp.processEvents()
+
+    assert tab._passthrough.running, "the monitor stopped when the tab lost focus"
+    assert tab.monitoring
+
+
+def test_metering_dormancy_does_not_silence_the_passthrough(qapp, no_hardware):
+    """Split lifecycles: the meters may go dormant on an inactive tab (cheap,
+    and nothing but a paused display), but that must never reach the audio."""
+    w, tab = _monitoring_window(qapp)
+
+    stopped = []
+    tab._monitor.stop = lambda: stopped.append(True)   # metering only
+
+    tab.set_active(False)
+
+    assert stopped, "metering should go dormant on an inactive tab"
+    assert tab._passthrough.running, "metering dormancy silenced the monitor"
+
+
+def test_the_monitoring_indicator_is_visible_from_a_non_record_tab(qapp, no_hardware):
+    """Running audio must never be invisible. The Record tab's own dot is
+    hidden with the tab, so the *window* carries the state."""
+    w, tab = _monitoring_window(qapp)
+    w.tabs.setCurrentWidget(w.full_rip)
+    qapp.processEvents()
+
+    assert "MONITORING" in w.windowTitle()
+    index = w.tabs.indexOf(tab)
+    assert "♪" in w.tabs.tabText(index)
+
+
+def test_the_monitor_can_be_switched_off_from_anywhere(qapp, no_hardware):
+    w, tab = _monitoring_window(qapp)
+    w.tabs.setCurrentWidget(w.settings_panel)
+    qapp.processEvents()
+    assert tab._passthrough.running
+
+    tab.monitor_check.setChecked(False)          # the toggle, from another tab
+    qapp.processEvents()
+
+    assert not tab._passthrough.running
+    assert not tab.monitoring
+    assert "MONITORING" not in w.windowTitle()
+
+
+def test_recording_and_monitoring_marks_do_not_erase_each_other(qapp, no_hardware):
+    """They overlap constantly -- monitoring while recording is the normal case."""
+    w, tab = _monitoring_window(qapp)
+    w._on_recording_state(True)
+
+    assert "RECORDING" in w.windowTitle()
+    assert "MONITORING" in w.windowTitle()
+
+    w._on_recording_state(False)
+    assert "RECORDING" not in w.windowTitle()
+    assert "MONITORING" in w.windowTitle()       # the monitor plays on
+
+
+def test_a_monitor_open_failure_is_plain_words_not_a_portaudio_error(
+        qapp, no_hardware, monkeypatch):
+    """Observed in the field after a replug: "Insufficient memory
+    [PaErrorCode -9992]", which is what WASAPI says when an endpoint refuses.
+    Same treatment as the rate refusal -- raw text to the debug log only."""
+    from gui.main_window import MainWindow
+
+    tab = MainWindow().record_tab
+    tab.set_active(True)
+
+    class _FailingPassthrough(_FakePassthrough):
+        def start(self, in_dev, out_dev, rate, channels):
+            self.error = "PortAudioError: Insufficient memory [PaErrorCode -9992]"
+
+    tab._passthrough = _FailingPassthrough()
+    logged: list[str] = []
+    monkeypatch.setattr(tab, "_log", logged.append)
+
+    tab.device_combo.setCurrentIndex(_idx_by_name(tab.device_combo, "Line In"))
+    tab.monitor_combo.setCurrentIndex(_idx_by_name(tab.monitor_combo, "Speakers"))
+    tab.monitor_check.setChecked(True)
+
+    assert logged, "the failure must say something"
+    line = next(m for m in logged if "monitor" in m.lower())
+    assert "couldn't start the monitor" in line
+    assert "Speakers (Realtek)" in line              # names the device
+    assert "Refresh" in line                         # ...and what to do
+    assert "PaErrorCode" not in line and "-9992" not in line
+    assert not tab.monitor_check.isChecked()         # toggle reset, cleanly

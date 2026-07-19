@@ -2,8 +2,14 @@
 
 An appliance, not an editor. Beyond "which input" (once) and "press Record",
 the entire UI surface is **level awareness** and **file naming** -- because those
-are the only two things that can quietly ruin a rip. No monitoring (Windows'
-"Listen to this device" already does that), no live waveform, no editing.
+are the only two things that can quietly ruin a rip. No live waveform, no
+editing.
+
+Monitoring is the one thing here that is *not* scoped to this tab. The
+passthrough runs at app level once switched on -- it survives tab switches and
+focus loss, and only the user, app exit or a dead output device stops it. The
+meters may go dormant when the tab is hidden; the audio may not. See
+:meth:`RecordTab.set_active`.
 
 Side-aware naming is the payoff: the next-file field pre-fills ``SideA.wav`` and
 auto-advances to ``SideB.wav`` after each stop, so recording a record is
@@ -14,6 +20,7 @@ A, flip, record side B, and the album job is already mapped.
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 
@@ -44,13 +51,13 @@ from core.recorder import (
     supported_input_rates,
 )
 from core.setup_check import INFO, OK, WARN, CheckResult, check_sample_rate, check_signal
-
-
 from core.timefmt import format_timestamp
 from core.tracks import safe_part
 from gui.level_history import LevelHistoryStrip
 from gui.meters import LevelMeters
 from gui.release_preview import ReleasePreview
+
+log = logging.getLogger(__name__)
 
 
 def _is_rate_error(message: str) -> bool:
@@ -127,6 +134,11 @@ class RecordTab(QWidget):
     recordingFinished = Signal(object)          # RecordingResult
     #: Recording started/stopped -- the window makes the state unmissable.
     recordingStateChanged = Signal(bool)
+    #: The monitor started/stopped. It outlives this tab's visibility, so the
+    #: *window* has to show it: audio running from a tab you cannot see is
+    #: invisible sound, which is exactly how the double-monitor confusion
+    #: started. The window carries this into the title.
+    monitoringStateChanged = Signal(bool)
     #: "Done recording -- process this album": the user says the album is
     #: finished. A bridge to the Full Rip tab, never a trigger for processing.
     processAlbumRequested = Signal()
@@ -153,6 +165,9 @@ class RecordTab(QWidget):
         # The album the user has declared, if any. Optional throughout: an
         # anonymous session is a first-class flow, not a degraded one.
         self._release = None
+        #: Last monitoring state pushed to the window, so the signal fires on
+        #: transitions rather than on every passthrough restart.
+        self._monitor_shown = False
         #: Did the user type this folder themselves? A suggestion must never
         #: overwrite a hand-entered path, so we only ever fill a field the user
         #: has left alone.
@@ -165,10 +180,20 @@ class RecordTab(QWidget):
         self._last_mapping = None
 
         root = QVBoxLayout(self)
+        # The Record tab is the tallest thing in the app and it exhausts an
+        # 800px window (measured in 9.9, and again in 9.14 when the meters grew
+        # into instruments). The height the meters need is *function* -- gain is
+        # the highest-stakes judgment here -- so it is bought from chrome, which
+        # is not: tighter gaps between groups and inside the forms. The history
+        # lanes are never touched. See the 9.14 report's budget accounting.
+        root.setSpacing(4)
+        root.setContentsMargins(6, 4, 6, 4)
 
         # --- input -----------------------------------------------------------
         input_box = QGroupBox("Input")
         form = QFormLayout(input_box)
+        form.setVerticalSpacing(4)
+        form.setContentsMargins(8, 6, 8, 6)
 
         device_row = QHBoxLayout()
         self.device_combo = QComboBox()
@@ -216,6 +241,8 @@ class RecordTab(QWidget):
         # --- levels ------------------------------------------------------------
         level_box = QGroupBox("Levels")
         level_layout = QVBoxLayout(level_box)
+        level_layout.setSpacing(4)
+        level_layout.setContentsMargins(8, 6, 8, 6)
 
         # Meters with the input-gain slider beside them: you set the knob while
         # watching the very bars it moves. The slider drives the Windows capture
@@ -270,9 +297,16 @@ class RecordTab(QWidget):
 
         # Monitoring (software passthrough) shares this space; its hint points at
         # the zero-latency hardware alternative.
+        # Three sentences, each retiring a specific field confusion: the delay,
+        # the double-monitor echo (which cost a stakeholder a debugging session
+        # -- they diagnosed two concurrent monitors as channel skew), and the
+        # belief that you can judge levels by ear through this path.
         self.monitor_hint = QLabel(
             "Tip: your interface's own headphone jack monitors with zero latency; "
-            "this software path adds a little delay.")
+            "this software path adds a little delay. If you also have Windows "
+            "'Listen to this device' enabled, turn it off — two monitors at once "
+            "sounds like an echo. The monitor is for hearing the record play — "
+            "judge levels by the meters, not by ear.")
         self.monitor_hint.setWordWrap(True)
         self.monitor_hint.setStyleSheet("QLabel { color: palette(mid); }")
         self.monitor_hint.setToolTip(
@@ -284,6 +318,8 @@ class RecordTab(QWidget):
         # --- destination + transport -------------------------------------------
         out_box = QGroupBox("Destination")
         out_form = QFormLayout(out_box)
+        out_form.setVerticalSpacing(4)
+        out_form.setContentsMargins(8, 6, 8, 6)
 
         # --- album (optional) --------------------------------------------------
         # Saying what is on the platter is worth doing *before* the capture, not
@@ -550,7 +586,13 @@ class RecordTab(QWidget):
         resetting the toggle in either case.
         """
         self._passthrough.stop()
-        want = self.monitor_check.isChecked() and (self._active or self.recording)
+        # Deliberately NOT gated on self._active. Monitoring is a *session*
+        # feature, not a tab feature: it runs at app level until the user turns
+        # it off, the app closes, or the output device dies. It used to stop
+        # when the Record tab lost focus, which pushed people to Windows'
+        # "Listen to this device" as a fallback -- and with both running at once
+        # the doubled audio was misread in the field as ~250 ms channel skew.
+        want = self.monitor_check.isChecked()
         if not want:
             self._update_monitor_indicator()
             return
@@ -568,8 +610,15 @@ class RecordTab(QWidget):
         channels = min(2, dev.max_channels, out.max_channels) or 1
         self._passthrough.start(dev.index, out.index, rate, channels)
         if self._passthrough.error:
-            self._log(f"Record: could not start monitoring "
-                      f"({self._passthrough.error}).")
+            # Plain words, per 9.9: the raw PortAudio text is for the debug log,
+            # never the user's face. The field report was "Insufficient memory
+            # [PaErrorCode -9992]" -- which is what WASAPI says when an endpoint
+            # refuses, typically after the device was replugged, and which tells
+            # the operator nothing they can act on.
+            log.info("Monitor open failed on %s: %s", out.name, self._passthrough.error)
+            self._log(f"Record: couldn't start the monitor on {out.name} — it may "
+                      "be in use or was recently unplugged. Press Refresh and try "
+                      "again.")
             self._passthrough.stop()
             self._set_monitor_off()
         elif self._passthrough.latency_s > 0.15:
@@ -591,18 +640,33 @@ class RecordTab(QWidget):
         self._update_monitor_indicator()
 
     def _update_monitor_indicator(self) -> None:
-        self.monitor_indicator.setVisible(
-            self._passthrough.running and not self._passthrough.error)
+        live = self._passthrough.running and not self._passthrough.error
+        self.monitor_indicator.setVisible(live)
+        # ...and tell the window, which shows it from every tab.
+        if live != self._monitor_shown:
+            self._monitor_shown = live
+            self.monitoringStateChanged.emit(live)
+
+    @property
+    def monitoring(self) -> bool:
+        """Whether the passthrough is live -- regardless of which tab is up."""
+        return self._passthrough.running and not self._passthrough.error
 
     # -- level monitoring (pre-roll gain setting) ----------------------------
     def set_active(self, active: bool) -> None:
-        """The tab became visible / hidden. Meters only run when it is visible."""
+        """The tab became visible / hidden.
+
+        Metering and passthrough have deliberately *separate* lifecycles here.
+        The meters are a tab feature -- letting the level streams go dormant on
+        an inactive tab is cheap and costs nothing but a paused display. The
+        monitor is a session feature and is untouched by this: audio the user
+        turned on must not stop because they looked at another tab.
+        """
         self._active = active
         if active:
             self._restart_monitor()
         elif not self.recording:
-            self._monitor.stop()
-        self._restart_passthrough()      # monitoring follows visibility too
+            self._monitor.stop()         # metering only; the passthrough plays on
 
     def _restart_monitor(self) -> None:
         """Run the meters whenever the tab is up and a device is chosen."""

@@ -594,11 +594,16 @@ def test_persisted_splitter_sizes_still_win_over_defaults(qapp):
     from gui.main_window import MainWindow
 
     # Tall enough that the tab area's minimum height is not the binding
-    # constraint. At 800px it *is*: the Record tab alone wants ~690px, so the
-    # splitter has no room to honour any drag and this would measure clamping
-    # rather than persistence. The tab has gained controls every release since
-    # v2.3.0 (9.10's album row most recently, with the capture-rate work to
-    # come), so the window under test needs headroom the property can show in.
+    # constraint. At 800px it still *is*, so this would measure clamping rather
+    # than persistence.
+    #
+    # Re-measured against the merged v2.4.0 layout rather than trusted: the
+    # Record tab's minimum is now **646px** (9.14 grew the meters into
+    # instruments and bought the height back out of chrome, so it shrank from
+    # the ~690px this comment used to claim). It is still too tall for the drag
+    # under test at 800px -- the persisted 400/300 ratio comes back clamped,
+    # 0.104 against a 0.136 threshold. At 1200px the property has room to show
+    # itself: 0.260 against 0.089, a margin of +0.17.
     height = 1200
 
     fresh = MainWindow()
@@ -1169,3 +1174,35 @@ def test_a_window_closed_maximized_reopens_maximized(qapp):
         assert not restored.isVisible()          # constructing never shows it
     finally:
         restored.close()
+
+
+def test_the_record_tab_still_fits_an_800px_window(qapp):
+    """The vertical budget, asserted rather than remembered.
+
+    The Record tab is the tallest thing in the app and 9.9 measured it as
+    exhausting an 800px window. 9.14 then grew the meters into instruments
+    (+35px) and bought it back out of chrome (-52px), so the tab is *smaller*
+    than it was and the log pane has more room, not less. This pins that: the
+    meters may not quietly reclaim the difference later.
+    """
+    from gui.main_window import MainWindow
+    from gui.meters import BAR_HEIGHT
+
+    w = MainWindow()
+    w.resize(1000, 800)
+    w.tabs.setCurrentWidget(w.record_tab)
+    w.show()
+    qapp.processEvents()
+
+    tabs_h, log_h = w._main_splitter.sizes()
+    assert log_h > 0, "the log pane was squeezed out of existence"
+    assert log_h < tabs_h * 0.15, "the log has taken over the window"
+
+    # The instrument-grade bars are actually present at this size...
+    assert w.record_tab.meters.rows[0].bar.height() >= BAR_HEIGHT
+    # ...and the calibrated rule under them survived the squeeze.
+    assert w.record_tab.meters.scale.isVisible()
+
+    # The lanes were explicitly not the place to take height from.
+    assert w.record_tab.history_strip.height() >= 68
+    w.close()

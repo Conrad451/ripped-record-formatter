@@ -553,3 +553,97 @@ def test_telemetry_failure_never_breaks_the_capture(tmp_path):
 
     result = rec.stop()
     assert sf.info(str(result.path)).frames == 1024     # audio survived regardless
+
+
+# --------------------------------------------------------------------------- #
+# The invariant: an integer-format capture can never report above full scale.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("amp,expected_dbfs", [
+    (0.9, -0.92),        # the reference reading
+    (0.5, -6.02),
+    (1.0, 0.0),          # full scale is exactly zero, not "about" zero
+])
+def test_known_amplitudes_read_their_true_dbfs(tmp_path, amp, expected_dbfs):
+    """Injected known amplitudes, through the real callback path."""
+    seen = []
+    rec, made = _recorder(tmp_path, telemetry_interval_s=0.0)
+    rec._on_telemetry = seen.append
+
+    rec.start(device=0, path=tmp_path / "a.wav", samplerate=SR, channels=2)
+    _prime(made["stream"])
+    made["stream"].push(np.full((1024, 2), amp, dtype=np.float32))
+    rec.stop()
+
+    assert seen[-1].max_peak_dbfs == pytest.approx(expected_dbfs, abs=0.01)
+
+
+def test_no_telemetry_path_reports_above_full_scale(tmp_path):
+    """The v2.4.0 invariant, from a real field report: a stakeholder screenshot
+    showed "max 1.8 dBFS (0.0 dB headroom)" on a 16-bit capture -- a level the
+    sample format cannot contain.
+
+    Nothing was miscomputing it. WASAPI shared mode hands us float32 that is not
+    bounded to +/-1.0 (Windows applies the endpoint volume and any APO gain in
+    the float domain), and the peak was reported straight out of that domain
+    instead of the integer one the file is written in. 1.2303 really is +1.8
+    dBFS -- it just cannot survive the trip to PCM_16, where it saturates to
+    0.999969. So the meter now measures the ceiling the recording actually has.
+    """
+    seen = []
+    rec, made = _recorder(tmp_path, telemetry_interval_s=0.0)
+    rec._on_telemetry = seen.append
+
+    rec.start(device=0, path=tmp_path / "a.wav", samplerate=SR, channels=2)
+    _prime(made["stream"])
+    # 1.2303 is exactly the +1.8 dBFS from the screenshot.
+    made["stream"].push(np.full((1024, 2), 1.2303, dtype=np.float32))
+    rec.stop()
+
+    for t in seen:
+        assert t.max_peak_dbfs <= 0.0, f"telemetry reported {t.max_peak_dbfs} dBFS"
+        for db in t.peaks_dbfs:
+            assert db <= 0.0, f"per-channel telemetry reported {db} dBFS"
+    # It reads as pinned to the ceiling, and it is still reported as clipping --
+    # clamping the *level* must not hide the overshoot.
+    assert seen[-1].max_peak_dbfs == pytest.approx(0.0, abs=1e-9)
+    assert seen[-1].clip_runs >= 1
+
+
+def test_the_overshoot_the_meter_clamps_is_what_the_file_saturates_to(tmp_path):
+    """The clamp is not a cosmetic fix -- it is what the WAV holds.
+
+    Written as PCM_16, a float sample of 1.2303 comes back as 0.999969. The
+    meter reading and the file's own peak now agree, which is the whole claim.
+    """
+    path = tmp_path / "over.wav"
+    with sf.SoundFile(path, "w", samplerate=SR, channels=2, subtype="PCM_16") as f:
+        f.write(np.full((256, 2), 1.2303, dtype=np.float32))
+
+    back, _ = sf.read(path, dtype="float32")
+    assert float(np.abs(back).max()) <= 1.0
+    assert float(np.abs(back).max()) == pytest.approx(1.0, abs=1e-4)
+
+
+def test_clamping_the_level_does_not_reduce_the_clip_count(tmp_path):
+    """The clip counter was field-verified, not inferred.
+
+    A stakeholder wired into the digitizer's direct output and heard heavy
+    clipping on the runs the counter had flagged: the 8 counted runs were real
+    ceiling contact, and the counter needed no fix. That makes it a thing to
+    *protect* while the level reading changes around it -- clamping the
+    reported peak to full scale must not quietly make clipping harder to count,
+    which would turn a verified-correct signal into a silent regression.
+    """
+    seen = []
+    rec, made = _recorder(tmp_path, telemetry_interval_s=0.0)
+    rec._on_telemetry = seen.append
+
+    rec.start(device=0, path=tmp_path / "a.wav", samplerate=SR, channels=2)
+    _prime(made["stream"])
+    # Well past the ceiling: exactly the case the clamp now flattens to 0.0 dBFS.
+    made["stream"].push(np.full((512, 2), 1.9, dtype=np.float32))
+    result = rec.stop()
+
+    assert result.clip_runs >= 1, "an overshoot stopped counting as clipping"
+    assert result.max_peak_dbfs == pytest.approx(0.0, abs=1e-9)
+    assert result.clipped
