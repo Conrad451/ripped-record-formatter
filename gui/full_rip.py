@@ -52,6 +52,7 @@ from PySide6.QtWidgets import (
 )
 
 from core import job_settings
+from core import session_journal
 from core.album import (
     DURATION_MATCH_TOLERANCE,
     AlbumController,
@@ -190,6 +191,8 @@ class FullRipTab(QWidget):
         #: handler can report a side rather than pretending an album ran, and so
         #: a second job can be refused with a line that names what is in the way.
         self._redoing_side: int | None = None
+        #: Journal row for the live job, so a crash leaves a note behind.
+        self._session_id = None
         #: side index -> "noise reduction — 2/4", while that side is analysing.
         self._side_stage: dict[int, str] = {}
         # clean-slate-between-albums
@@ -1182,6 +1185,99 @@ class FullRipTab(QWidget):
                 self._log(f"Source: Side {side_letter(side_index)} reassigned; "
                           f"'{self._album_wavs[other].name}' set back to skip.")
 
+    def resume_from_journal(self, journal: dict) -> None:
+        """Rebuild an interrupted job from the journal and the WAVs on disk.
+
+        The journal says what was being worked on; **the filesystem says what is
+        actually there**, and where they disagree the filesystem wins. A WAV
+        that has moved is dropped from the mapping with a line saying so, rather
+        than restored as a row pointing at nothing.
+
+        Sides already finished are left alone: their FLACs are on disk and that
+        is the only work a restart preserves. Everything else is prepared again,
+        because staging was a temporary directory and is genuinely gone -- this
+        never pretends to restore analysis it does not have.
+
+        Identity comes back from the release cache when the journal recorded an
+        MBID, which costs no network call. Without one, the audio and the
+        destination return and the tracklist does not; the same honesty applies
+        as for a re-do, so it says so rather than quietly writing untitled
+        tracks.
+        """
+        wavs = [Path(w) for w in journal.get("wavs", ())]
+        present = [w for w in wavs if w.exists()]
+        missing = [w for w in wavs if not w.exists()]
+        if missing:
+            self._log("Resume: " + ", ".join(w.name for w in missing)
+                      + " is not where it was and has been left out. The WAVs on "
+                        "disk are what count.")
+        if not present:
+            self._log("Resume: none of that album's WAVs are still there, so "
+                      "there is nothing to pick up.")
+            return
+
+        destination = journal.get("destination", "")
+        if destination:
+            self.output_edit.setText(destination)
+
+        release = None
+        mbid = journal.get("release_mbid") or ""
+        if mbid:
+            from core import release_cache
+
+            release = release_cache.get(getattr(self, "store", None), mbid)
+        if release is not None:
+            self._apply_release(release)
+            self._log(f"Resume: {release.title} came back from the saved copy — "
+                      "no need to look it up again.")
+        else:
+            self.artist_edit.setText(journal.get("artist", ""))
+            self.album_edit.setText(journal.get("album", ""))
+            if mbid:
+                self._log("Resume: this album's tracklist is not saved, so the "
+                          "tracks would be written without titles. Look the "
+                          "release up again before starting.")
+
+        self._album_wavs = present
+        self._rebuild_mapping_table()
+        finished = [s.get("label") for s in journal.get("sides", ())
+                    if s.get("state") == "done"]
+        if finished:
+            self._log("Resume: " + ", ".join(finished)
+                      + " already finished last time; those files are left as "
+                        "they are.")
+        self._log("Resume: ready. Press Start album to prepare the unfinished "
+                  "sides again.")
+        self.summary_card.setVisible(False)
+        self._set_empty_state(
+            "Picked up where you left off. Press Start album when you are ready.")
+
+    def _journal_sides(self) -> list:
+        """The per-side detail the journal records, including stages as applied.
+
+        The stage parameters are the interesting part: they are what a re-do
+        weeks later would need in order to offer "the settings this side was
+        actually made with" rather than whatever Settings says by then. Read
+        from the side's own analysis where it has one, falling back to the
+        configuration the job started with.
+        """
+        fallback = session_journal.describe_stages(
+            job_settings.build_stages(self.settings.config))
+        out = []
+        for side in (self._album.sides if self._album else ()):
+            analysis = side.analysis
+            stages = getattr(analysis, "stages", None) if analysis is not None else None
+            out.append({
+                "index": side.index,
+                "label": side.label,
+                "wav": str(side.wav_path) if side.wav_path else "",
+                "state": side.state.value,
+                "titles": list(side.titles),
+                "durations_ms": list(side.durations_ms),
+                "stages": session_journal.describe_stages(stages) if stages else fallback,
+            })
+        return out
+
     def _album_side(self, index: int):
         return next((s for s in self._album.sides if s.index == index), None) if self._album else None
 
@@ -1259,6 +1355,14 @@ class FullRipTab(QWidget):
         self.cancel_album_btn.setEnabled(True)
         self.start_album_btn.setEnabled(False)
         self._lock_destination(True)
+        self._session_id = session_journal.begin(
+            getattr(self, "store", None),
+            artist=self._album_meta.get("artist", ""),
+            album=self._album_meta.get("album", ""),
+            release_mbid=self._release.release_id if self._release else "",
+            destination=self._album_output_root,
+            wavs=self._album_wavs, mapping=self._album_mapping,
+            sides=self._journal_sides())
         self._album.start()
         self._log(f"Album: started ({len(sides)} sides, {cfg.album_analysis_workers} "
                   f"analysis worker(s)) -> {self._album_output_root}")
@@ -1397,6 +1501,10 @@ class FullRipTab(QWidget):
                 break
         if side.state != SideState.ANALYZING:
             self._side_stage.pop(side.index, None)
+        # Cheap single-row update on the GUI thread, at every transition: the
+        # journal is only worth having if it is current when the lights go out.
+        session_journal.update(getattr(self, "store", None), self._session_id,
+                               sides=self._journal_sides())
         self._update_retry_enabled()
         if side.state == SideState.READY:
             self._log(f"Album: {side.label} ready for review.")
@@ -1433,6 +1541,8 @@ class FullRipTab(QWidget):
         album, self._album = self._album, None
         if album is not None:
             album.shutdown(wait=False)
+        session_journal.finish(getattr(self, "store", None), self._session_id)
+        self._session_id = None
 
         self._album_review_index = None
         self.cancel_album_btn.setEnabled(False)

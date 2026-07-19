@@ -36,6 +36,7 @@ from core import converter
 from core import mp3_export
 from core.version import __version__
 from gui import status_strip
+from gui.resume_bar import ResumeBar
 from gui.status_strip import StatusStrip
 from gui.track_model import COL_ARTIST, Row, TrackTableModel, TrackTableView
 
@@ -399,6 +400,14 @@ class MainWindow(QMainWindow):
         self.log.setMinimumHeight(line_h * 2)
         self._default_log_height = line_h * 4 + 12
 
+        # Above the tabs, because it is about the session rather than any one
+        # tab, and dismissible because an offer that cannot be ignored is a
+        # demand.
+        self.resume_bar = ResumeBar()
+        self.resume_bar.resumeRequested.connect(self._resume_session)
+        self.resume_bar.discardRequested.connect(self._discard_session)
+        root.addWidget(self.resume_bar)
+
         self._main_splitter = QSplitter(Qt.Orientation.Vertical)
         self._main_splitter.addWidget(self.tabs)
         self._main_splitter.addWidget(self.log)
@@ -549,6 +558,46 @@ class MainWindow(QMainWindow):
         # input gain before you ever press Record.
         self.record_tab.set_active(widget is self.record_tab)
 
+    def _offer_resume_if_interrupted(self) -> None:
+        """On launch: was a job still open when we last wrote?
+
+        Only ever an offer. A session that cannot be read, or holds nothing
+        unfinished, simply does not produce a bar.
+        """
+        from core import session_journal
+
+        journal = session_journal.interrupted(self.store)
+        if journal is None:
+            return
+        if session_journal.unfinished_side(journal) is None:
+            session_journal.close_all_open(self.store)   # nothing left to offer
+            return
+        self._pending_journal = journal
+        self.resume_bar.offer(session_journal.describe(journal))
+
+    def _resume_session(self) -> None:
+        """Hand the journal to Full Rip and say precisely what is happening."""
+        from core import session_journal
+
+        journal, self._pending_journal = getattr(self, "_pending_journal", None), None
+        if journal is None:
+            return
+        side = session_journal.unfinished_side(journal) or {}
+        wav = side.get("wav") or "its WAV"
+        # The precise version, for the audience that wants precision.
+        self._log(f"Resume: staging gone, re-analysing {side.get('label', 'the side')} "
+                  f"from {Path(wav).name if wav else 'its WAV'}.")
+        session_journal.close_all_open(self.store)
+        self.tabs.setCurrentWidget(self.full_rip)
+        self.full_rip.resume_from_journal(journal)
+
+    def _discard_session(self) -> None:
+        from core import session_journal
+
+        self._pending_journal = None
+        session_journal.close_all_open(self.store)
+        self._log("Resume: discarded. Nothing on disk was touched.")
+
     def set_log_visible(self, visible: bool) -> None:
         """Open or collapse the full log pane, and remember the choice.
 
@@ -584,6 +633,7 @@ class MainWindow(QMainWindow):
         if not self._activated_landing_tab:
             self._activated_landing_tab = True
             self.record_tab.set_active(self.tabs.currentWidget() is self.record_tab)
+            self._offer_resume_if_interrupted()
 
     def closeEvent(self, event) -> None:
         self._save_geometry()
