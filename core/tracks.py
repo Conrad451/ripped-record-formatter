@@ -21,6 +21,29 @@ from pathlib import Path
 _INVALID_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|]')
 
 
+#: A track-number prefix this app (or one like it) already stamped on a name:
+#: ``[01] - ``, ``[A01] - ``, and the same with stray extra spaces, which is how
+#: they turn up in the wild.
+_TRACK_PREFIX_RE = re.compile(r"^\s*\[[A-Za-z]?\d{1,3}\]\s*-\s*")
+
+
+def strip_track_prefix(name: str) -> str:
+    """Remove a leading ``[NN] - `` / ``[A01] - `` stamp from ``name``.
+
+    Re-tagging a folder this app already wrote reads titles that *contain* the
+    prefix -- because the previous run put it there, in the filename and often
+    in the title too -- and stamping again produced
+    ``[01] - [01] -  Femininomenon.flac``. The number is a filename convention,
+    not part of the title, so it is stripped before being re-applied.
+
+    Only one prefix is removed per call, deliberately. A title that genuinely
+    begins with something bracketed keeps it after the first strip, and a file
+    stamped twice by an older build is repaired by re-tagging twice rather than
+    by this guessing how many layers were a mistake.
+    """
+    return _TRACK_PREFIX_RE.sub("", name or "", count=1).strip()
+
+
 def track_filename(track_name: str, track_num: int, *, file_index: int | None = None,
                    side_letter: str = "", use_side_letters: bool = False) -> str:
     """``[NN] - name.flac``, with 2-digit zero padding.
@@ -46,7 +69,7 @@ def track_filename(track_name: str, track_num: int, *, file_index: int | None = 
     original, unsanitized title. Falls back to ``Track NN`` if sanitizing leaves
     nothing.
     """
-    name = sanitize_filename_component(track_name)
+    name = sanitize_filename_component(strip_track_prefix(track_name))
     if not name:
         name = f"Track {int(track_num):02d}"
 

@@ -38,6 +38,7 @@ import soundfile as sf
 from noisereduce import reduce_noise
 from scipy.signal import butter, filtfilt, iirnotch, sosfiltfilt
 
+from core import proc
 from core.ffmpeg_locator import ensure_ffmpeg
 
 # on_progress(stage_name, stage_idx_1based, total_stages)
@@ -257,7 +258,7 @@ class Declick(Stage):
 
     def apply(self, in_path: Path, out_path: Path) -> None:
         ffmpeg_path, _ = ensure_ffmpeg()
-        result = subprocess.run(
+        result = proc.run(
             [
                 str(ffmpeg_path), "-hide_banner", "-nostdin", "-y",
                 "-i", str(in_path),
