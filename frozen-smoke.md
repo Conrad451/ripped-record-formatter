@@ -28,11 +28,11 @@ It prints a table and exits `0` (nothing failed) or `1` (something did). Set
 
 ### On a machine with no sound card
 
-Servers and bare VMs have no audio hardware. The two audio checks then report
+Servers and bare VMs have no audio hardware. The audio checks then report
 **`[SKIP]`**, not `[FAIL]`, and the summary says so:
 
 ```
-  9/11 passed, 2 skipped: no audio hardware
+  9/12 passed, 3 skipped: no audio hardware
 ```
 
 That is **not a bundle defect** — PortAudio loaded and answered; the machine

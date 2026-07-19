@@ -366,6 +366,56 @@ def main() -> int:
         return f"{version.split(',')[0]} | {len(devices)} input device(s); " \
                f"first: {devices[0].name}"
 
+    @check("pycaw/comtypes: input gain resolves and releases cleanly")
+    def _input_gain():
+        """The gain control, exercised rather than assumed.
+
+        This check exists because its absence let a crash ship. The pycaw route
+        was only ever verified *statically* -- the modules were confirmed present
+        in the bundle, and nothing ever called them in the frozen environment.
+        comtypes generates its interface wrappers at first use, which is exactly
+        the kind of thing that works from source and fails frozen.
+
+        It also drives the lifetime discipline: resolve, read, release, and
+        confirm no COM pointer is left behind for the collector, which is the
+        v2.4.1 fix.
+        """
+        import gc
+
+        from core.input_gain import EndpointGain
+        from core.recorder import list_input_devices
+
+        devices = list_input_devices()
+        if not devices:
+            raise NoHardware(
+                "no audio input device on this machine, so there is no endpoint "
+                "volume to resolve (expected on a server or VM)")
+
+        from comtypes._post_coinit.unknwn import _compointer_base
+
+        def live():
+            return len([o for o in gc.get_objects()
+                        if isinstance(o, _compointer_base) and o])
+
+        before = live()
+        gain = EndpointGain.for_device(devices[0].name)
+        if gain is None:
+            # Degraded by design: no COM, hidden slider, capture unaffected. Not
+            # a bundle defect, but say so rather than reporting a silent pass.
+            raise NoHardware(
+                f"endpoint volume unreachable for '{devices[0].name}' -- the "
+                "slider degrades hidden, which is the designed fallback")
+        level = gain.get()
+        gain.close()
+        gc.collect()
+        leaked = live() - before
+        if leaked > 0:
+            raise RuntimeError(
+                f"{leaked} COM pointer(s) left for the garbage collector after "
+                "close() -- the v2.4.1 lifetime fix is not holding")
+        return (f"resolved '{devices[0].name}', level={level:.2f}, "
+                f"released explicitly, 0 pointers leaked")
+
     # --- AGPL artefacts ------------------------------------------------------
     @check("AGPL: LICENSE + SOURCE.txt ship in the bundle")
     def _agpl():

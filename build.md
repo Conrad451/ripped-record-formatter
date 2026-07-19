@@ -186,7 +186,7 @@ also records that ffmpeg is redistributed under its own separate licence.
 Run [`frozen-smoke.md`](frozen-smoke.md)'s ritual. `FrozenSmoke.exe` exercises
 every subsystem *in the frozen environment* — Qt, pyqtgraph, SciPy, soundfile,
 noisereduce, mutagen, QtMultimedia, PortAudio, the bundled ffmpeg, and one full
-restore → split → encode. Eleven checks; all must pass.
+restore → split → encode, and the pycaw/comtypes input-gain path. Twelve checks; all must pass.
 
 ### Cutting a release
 
@@ -253,7 +253,7 @@ A dev machine has Python, ffmpeg and audio drivers already installed, so it
    whole product. (`build\` is PyInstaller's scaffolding, not the product; ignore
    it.) Do not install anything.
 2. Run `FrozenSmoke.exe` — **double-clicking it is fine**, the window now stays
-   open until you press Enter. Expect **11/11 passed**; send the output back if
+   open until you press Enter. Expect **12/12 passed**; send the output back if
    not. On a machine with no sound card the two audio checks report `[SKIP]` and
    the summary reads *"9/11 passed, 2 skipped: no audio hardware"* — that is
    expected and is not a bundle defect. Only a `[FAIL]` is.
