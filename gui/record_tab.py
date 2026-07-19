@@ -582,6 +582,12 @@ class RecordTab(QWidget):
             self._run_setup_check()
 
     # -- input gain (Windows capture-endpoint level) -------------------------
+    def _release_gain(self) -> None:
+        """Close the endpoint handle, if we hold one. Idempotent."""
+        gain, self._gain = self._gain, None
+        if gain is not None:
+            gain.close()
+
     def _sync_gain_slider(self, device_name: str) -> None:
         """Point the gain slider at ``device_name``'s Windows input level.
 
@@ -590,6 +596,13 @@ class RecordTab(QWidget):
         when the endpoint volume can't be reached, so a machine or frozen build
         without the COM interface degrades gracefully.
         """
+        # Hand back the previous device's endpoint before binding the next one.
+        # Rebinding self._gain used to drop the old pointer for the garbage
+        # collector, which is exactly the lifetime bug: switching devices a few
+        # times left a pile of COM pointers waiting to be released at whatever
+        # moment GC next ran, on whatever thread it happened to be on.
+        self._release_gain()
+
         self._gain = EndpointGain.for_device(device_name)
         if self._gain is None:
             for w in self.gain_widgets:
@@ -601,7 +614,7 @@ class RecordTab(QWidget):
         if level is None:                       # endpoint opened but won't read
             for w in self.gain_widgets:
                 w.setVisible(False)
-            self._gain = None
+            self._release_gain()                # opened it, so give it back
             return
 
         if remembered is not None:              # push the saved value back to Windows
@@ -1091,3 +1104,9 @@ class RecordTab(QWidget):
             self._stop_recording()
         self._monitor.stop()
         self._passthrough.stop()
+        # Explicitly, on the GUI thread, while the interpreter is still healthy.
+        # Left to interpreter teardown this becomes the same crash in a smaller
+        # window: comtypes runs CoUninitialize from an atexit handler, and a
+        # pointer finalised after that point is released into an apartment that
+        # no longer exists.
+        self._release_gain()

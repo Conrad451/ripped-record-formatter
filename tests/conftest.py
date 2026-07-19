@@ -87,3 +87,14 @@ def silent_audio_hardware(monkeypatch):
 
     monkeypatch.setattr(sd, "InputStream", _SilentStream)
     monkeypatch.setattr(sd, "OutputStream", _SilentStream)
+
+
+@pytest.fixture(scope="module")
+def qapp_gui():
+    """A QApplication for tests that build real windows."""
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    yield QApplication.instance() or QApplication([])

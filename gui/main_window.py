@@ -576,6 +576,14 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._save_geometry()
+        # The Record tab owns a COM interface, two PortAudio streams and a
+        # timer, and its shutdown() was never actually being called -- all of it
+        # was left to interpreter teardown. For the COM pointer in particular
+        # that is the launch crash in miniature: comtypes runs CoUninitialize
+        # from an atexit handler, so anything finalised after that releases into
+        # an apartment that is already gone. Tear it down here, on the GUI
+        # thread, while everything is still alive to tear down.
+        self.record_tab.shutdown()
         self.full_rip.cleanup()
         super().closeEvent(event)
 
