@@ -99,6 +99,57 @@ The meters run whenever the Record tab is open — which, since it is the tab th
 
 **A clean slate between albums.** When an album finishes, the app clears its identity for the next record — the Artist and Album fields, the looked-up release and its cover, the side layout and the mapping table all reset, because no default is safe for identity: inheriting the last album's artist or release would quietly mistag the next one. The source and output folders are the exception — each follows a policy you set under **Settings → Default folders**: keep the last-used folder (the default), reset it to a folder you nominate, or clear it, so a location can persist across records even though identity never does. The finished-album receipt card carries a **Run this album again** button that restores everything just cleared in one click and re-arms Start, so redoing the record you just finished never means re-entering it. And if you are part-way through recording the next side when the album concludes, the clear waits until that capture has landed — a recording in flight is never orphaned by the reset.
 
+## One file of state
+
+Everything the app remembers lives in a single file, **`rrf.db`**, in your
+per-user config folder. Settings, the journal of the album you are working on,
+releases already fetched, and your collection list. One file: back it up, move
+it to a new machine, done.
+
+**It is never the source of truth for your library.** The FLACs and the tags
+inside them are that. Everything in the database that describes the world — a
+folder path, a finished album — is a *claim about the filesystem*, and where the
+two disagree the filesystem wins: an album whose folder has moved shows as
+"files not found" rather than insisting it is ripped. Delete `rrf.db` and the
+app starts with defaults, an empty ledger, and every one of your FLACs perfectly
+intact. You lose preferences, not music.
+
+Your old `settings.json` is read once on first launch, written into the
+database, and renamed to `settings.json.migrated` — kept, not deleted, because
+at that moment it is the only copy of your preferences.
+
+## If it stops part-way
+
+Turntable time is unrepeatable, so an interrupted rip is worth picking up rather
+than starting over. The app writes down what it is doing as it goes, and if it
+finds a job still open on the next launch it offers a bar — not a dialog you
+have to dismiss before you can do anything:
+
+> You were working on Discovery — Side B needs to be prepared again before
+> review. **[Resume] [Discard]**
+
+Sides that finished are left exactly as they are; their files are on disk.
+Anything unfinished is prepared again from its WAV, because the working files
+were temporary and are genuinely gone — the app will not pretend otherwise. If
+a WAV has moved since, it is left out and says so: the files on disk are what
+count.
+
+Because the release you looked up is remembered too, resuming brings back the
+tracklist and cover art without asking MusicBrainz again — as does re-doing a
+side, or running an album a second time.
+
+## Your collection
+
+A list of what you have ripped and what you still mean to. Albums add
+themselves when a rip finishes; add a record you own but have not ripped by
+hand. Reach it from **Collection** in the bar along the bottom, or from the
+link on an album's receipt.
+
+It reconciles against your disk every time you open it, so a record whose folder
+you have since moved shows as *files not found* rather than quietly claiming to
+be done. No playback, no shelf management, no Discogs — just the answer to
+"have I done this one yet?".
+
 ## How it works
 
 Everything that matters lives in `core/`, which is completely UI-agnostic: no printing, no prompting, no Qt. It exposes plain dataclasses and functions that take callbacks for progress, and the Qt layer in `gui/` is a thin driver on top — which is what makes the core testable against synthetic rips and reusable from a future CLI.

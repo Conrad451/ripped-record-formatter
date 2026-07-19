@@ -36,6 +36,7 @@ from core import converter
 from core import mp3_export
 from core.version import __version__
 from gui import status_strip
+from gui.resume_bar import ResumeBar
 from gui.status_strip import StatusStrip
 from gui.track_model import COL_ARTIST, Row, TrackTableModel, TrackTableView
 
@@ -273,7 +274,8 @@ class BatchPanel(QWidget):
         # settings carries the user's MusicBrainz contact (and the panel's
         # splitter position); without it the lookup would identify itself as
         # having no contact even when one is configured.
-        panel = MetadataPanel(settings=self.settings)
+        panel = MetadataPanel(settings=self.settings,
+                              store=getattr(self, 'store', None))
         panel.artist_edit.setText(self.artist_edit.text())
         panel.album_edit.setText(self.album_edit.text())
         panel.statusMessage.connect(self.logMessage)
@@ -299,8 +301,13 @@ class BatchPanel(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, store=None) -> None:
         super().__init__()
+        #: The state database, or None when running without one. Optional on
+        #: purpose: state is recoverable, so the window must come up and work
+        #: with no store at all -- that is the path tests take, and the path a
+        #: user takes if rrf.db cannot be opened.
+        self.store = store
         self.setWindowTitle(f"Ripped Record Formatter {__version__}")
         # Default geometry follows the screen rather than a hardcoded 920x760,
         # which squeezed the Full Rip tab (source group + metadata + waveform +
@@ -325,7 +332,11 @@ class MainWindow(QMainWindow):
         self.retag_panel = BatchPanel("retag", self.settings)
         self.full_rip = FullRipTab(self.settings)
         self.settings_panel = SettingsPanel(self.settings)
+        # The release cache reaches the lookup wherever it is opened from.
+        for surface in (self.convert_panel, self.retag_panel, self.full_rip):
+            surface.store = store
         self.record_tab = RecordTab(self.settings)
+        self.record_tab.store = store
         self.record_tab.logMessage.connect(self._log)
         self.record_tab.statusMessage.connect(self.set_status)
         # The payoff: a finished side walks straight into Full Rip's mapping table.
@@ -371,6 +382,7 @@ class MainWindow(QMainWindow):
 
         self.full_rip.logMessage.connect(self._log)
         self.full_rip.statusMessage.connect(self.set_status)
+        self.full_rip.openCollectionRequested.connect(self.open_collection)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         #: The Record tab is activated on first show, not here -- see showEvent.
         self._activated_landing_tab = False
@@ -389,6 +401,14 @@ class MainWindow(QMainWindow):
         self.log.setMinimumHeight(line_h * 2)
         self._default_log_height = line_h * 4 + 12
 
+        # Above the tabs, because it is about the session rather than any one
+        # tab, and dismissible because an offer that cannot be ignored is a
+        # demand.
+        self.resume_bar = ResumeBar()
+        self.resume_bar.resumeRequested.connect(self._resume_session)
+        self.resume_bar.discardRequested.connect(self._discard_session)
+        root.addWidget(self.resume_bar)
+
         self._main_splitter = QSplitter(Qt.Orientation.Vertical)
         self._main_splitter.addWidget(self.tabs)
         self._main_splitter.addWidget(self.log)
@@ -405,6 +425,19 @@ class MainWindow(QMainWindow):
         # presence, not content.
         self.status_strip = StatusStrip()
         self.status_strip.historyToggled.connect(self.set_log_visible)
+        # The standing door to the ledger. This row is already where ambient
+        # utilities live, and a collection reachable only in the minutes after a
+        # rip finishes would be a notification rather than a ledger.
+        self.collection_button = QPushButton("Collection")
+        self.collection_button.setFlat(True)
+        self.collection_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.collection_button.setStyleSheet(
+            "QPushButton { border: none; color: palette(link); "
+            "text-decoration: underline; padding: 0 6px; }")
+        self.collection_button.setToolTip(
+            "Which records you have ripped, and which you still mean to.")
+        self.collection_button.clicked.connect(self.open_collection)
+        self.status_strip.add_action(self.collection_button)
         root.addWidget(self.status_strip)
 
         # Collapsed by default, and the user's choice is remembered.
@@ -539,6 +572,52 @@ class MainWindow(QMainWindow):
         # input gain before you ever press Record.
         self.record_tab.set_active(widget is self.record_tab)
 
+    def _offer_resume_if_interrupted(self) -> None:
+        """On launch: was a job still open when we last wrote?
+
+        Only ever an offer. A session that cannot be read, or holds nothing
+        unfinished, simply does not produce a bar.
+        """
+        from core import session_journal
+
+        journal = session_journal.interrupted(self.store)
+        if journal is None:
+            return
+        if session_journal.unfinished_side(journal) is None:
+            session_journal.close_all_open(self.store)   # nothing left to offer
+            return
+        self._pending_journal = journal
+        self.resume_bar.offer(session_journal.describe(journal))
+
+    def _resume_session(self) -> None:
+        """Hand the journal to Full Rip and say precisely what is happening."""
+        from core import session_journal
+
+        journal, self._pending_journal = getattr(self, "_pending_journal", None), None
+        if journal is None:
+            return
+        side = session_journal.unfinished_side(journal) or {}
+        wav = side.get("wav") or "its WAV"
+        # The precise version, for the audience that wants precision.
+        self._log(f"Resume: staging gone, re-analysing {side.get('label', 'the side')} "
+                  f"from {Path(wav).name if wav else 'its WAV'}.")
+        session_journal.close_all_open(self.store)
+        self.tabs.setCurrentWidget(self.full_rip)
+        self.full_rip.resume_from_journal(journal)
+
+    def _discard_session(self) -> None:
+        from core import session_journal
+
+        self._pending_journal = None
+        session_journal.close_all_open(self.store)
+        self._log("Resume: discarded. Nothing on disk was touched.")
+
+    def open_collection(self) -> None:
+        """Both doors arrive here: the status row, and the album receipt."""
+        from gui.collection_view import CollectionDialog
+
+        CollectionDialog(self.store, self).exec()
+
     def set_log_visible(self, visible: bool) -> None:
         """Open or collapse the full log pane, and remember the choice.
 
@@ -574,6 +653,7 @@ class MainWindow(QMainWindow):
         if not self._activated_landing_tab:
             self._activated_landing_tab = True
             self.record_tab.set_active(self.tabs.currentWidget() is self.record_tab)
+            self._offer_resume_if_interrupted()
 
     def closeEvent(self, event) -> None:
         self._save_geometry()

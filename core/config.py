@@ -210,30 +210,101 @@ class Config:
 
 
 def config_path() -> Path:
-    """Full path to the settings file in the per-user config directory."""
+    """Full path to the legacy settings file in the per-user config directory.
+
+    Kept because it is still where settings *came from*: the migration reads it,
+    and tests point it at a scratch file. Settings now live in ``rrf.db``.
+    """
     return Path(user_config_dir(APP_NAME, appauthor=False)) / CONFIG_FILENAME
 
 
-def load(path: str | Path | None = None) -> Config:
-    """Load settings, returning defaults if the file is missing or unreadable.
+#: Where the old JSON file is moved once its contents are safely in the db.
+#: Renamed rather than deleted -- it is the only copy of the user's preferences
+#: at that moment, and a migration that eats them on a bad day is unforgivable.
+MIGRATED_SUFFIX = ".migrated"
 
-    Unknown keys in the file are ignored and missing keys fall back to defaults,
-    so the format can evolve without breaking old or new config files.
+#: Injected by :func:`use_store`. When set, load/save go through the database.
+_store = None
+
+
+def use_store(store) -> None:
+    """Point the config layer at a :class:`core.store.Store` (or None to unset).
+
+    Called once at startup. Everything else in the app keeps calling
+    :func:`load` and :func:`save` and never learns where the bytes went.
     """
-    path = Path(path) if path is not None else config_path()
+    global _store
+    _store = store
+
+
+def _from_mapping(raw: dict) -> Config:
+    """Build a Config from a loose mapping: unknown keys out, missing defaulted."""
+    known = {f.name for f in fields(Config)}
+    return Config(**{k: v for k, v in raw.items() if k in known})
+
+
+def migrate_json_to_store(store, path: str | Path | None = None) -> bool:
+    """Move a legacy ``settings.json`` into the database, once. Returns whether
+    it moved anything.
+
+    Deliberately conservative on every axis. It only runs when the database has
+    no settings at all, so it can never overwrite newer state with an old file.
+    It writes the table *before* touching the JSON, so a crash mid-way leaves
+    the original exactly where it was. And it renames rather than deletes,
+    because at that instant the file is the only copy of the user's preferences.
+    """
+    source = Path(path) if path is not None else config_path()
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        if store.has_settings():
+            return False
+    except Exception:
+        return False
+    try:
+        raw = json.loads(source.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError, OSError):
+        return False
+    if not isinstance(raw, dict):
+        return False
+
+    store.put_settings(asdict(_from_mapping(raw)))
+    try:
+        source.rename(source.with_suffix(source.suffix + MIGRATED_SUFFIX))
+    except OSError:
+        pass                     # the settings are safely in the db either way
+    return True
+
+
+def load(path: str | Path | None = None) -> Config:
+    """Load settings, returning defaults if nothing readable is stored.
+
+    Unknown keys are ignored and missing keys fall back to defaults, so the
+    format can evolve without breaking old or new state.
+
+    ``path`` still forces the legacy JSON file, which is what tests use and what
+    the migration reads.
+    """
+    if path is None and _store is not None:
+        try:
+            stored = _store.get_settings()
+        except Exception:
+            return Config()
+        return _from_mapping(stored) if stored else Config()
+
+    source = Path(path) if path is not None else config_path()
+    try:
+        raw = json.loads(source.read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError, OSError):
         return Config()
-
-    known = {f.name for f in fields(Config)}
-    filtered = {k: v for k, v in raw.items() if k in known}
-    return Config(**filtered)
+    return _from_mapping(raw)
 
 
 def save(config: Config, path: str | Path | None = None) -> Path:
-    """Write settings as pretty JSON, creating the config directory if needed."""
-    path = Path(path) if path is not None else config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(asdict(config), indent=2), encoding="utf-8")
-    return path
+    """Persist settings. Returns where they went."""
+    if path is None and _store is not None:
+        _store.put_settings(asdict(config))
+        return _store.path
+
+    target = Path(path) if path is not None else config_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(asdict(config), indent=2), encoding="utf-8")
+    return target
