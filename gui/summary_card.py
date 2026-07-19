@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 
 from core.album import SideState
 from core.timefmt import format_size, format_timestamp
+from gui.text_styles import apply_body, apply_muted
 from gui.release_preview import CoverThumb
 
 # Errored/cancelled sides shown honestly in their state colour; done is neutral.
@@ -64,6 +65,7 @@ class AlbumSummaryCard(QFrame):
         self._destination: Path | None = None
         self._on_dismiss = None
         self._on_rerun = None
+        self._on_redo_side = None
 
         # Rebuilt on every render(); exposed for tests and callers.
         self.title_label: QLabel | None = None
@@ -71,6 +73,8 @@ class AlbumSummaryCard(QFrame):
         self.open_button: QPushButton | None = None
         self.dismiss_button: QPushButton | None = None
         self.rerun_button: QPushButton | None = None
+        #: One "Re-do this side..." button per side line, by side index.
+        self.redo_buttons: dict[int, QPushButton] = {}
         self.warnings_button: QPushButton | None = None
         self.warnings_list: QLabel | None = None
 
@@ -85,18 +89,26 @@ class AlbumSummaryCard(QFrame):
         destination: Path | str | None = None,
         on_dismiss=None,
         on_rerun=None,
+        on_redo_side=None,
     ) -> None:
-        """Populate the card from ``summary``. Safe to call repeatedly."""
+        """Populate the card from ``summary``. Safe to call repeatedly.
+
+        ``on_redo_side`` receives a side index. A receipt is where you find out
+        the record came out wrong -- four tracks on a side that has five -- so
+        it is where the appeal belongs.
+        """
         self._destination = Path(destination) if destination else None
         self._on_dismiss = on_dismiss
         self._on_rerun = on_rerun
+        self._on_redo_side = on_redo_side
         _clear_layout(self._root)
         self.side_labels = []
         self.restoration_labels = []
+        self.redo_buttons = {}
 
         self._root.addLayout(self._build_header(summary, cover, artist, album))
         for side in summary.sides:
-            self._root.addWidget(self._side_line(side))
+            self._root.addLayout(self._side_row(side))
             restoration = self._restoration_line(side)
             if restoration is not None:
                 self._root.addWidget(restoration)
@@ -117,7 +129,7 @@ class AlbumSummaryCard(QFrame):
         self.title_label.setWordWrap(True)
         titles.addWidget(self.title_label)
         subtitle = QLabel(summary.describe())
-        subtitle.setStyleSheet("QLabel { color: palette(mid); }")
+        apply_muted(subtitle)
         titles.addWidget(subtitle)
         header.addLayout(titles, 1)
 
@@ -139,6 +151,32 @@ class AlbumSummaryCard(QFrame):
         self.dismiss_button.clicked.connect(self._dismiss)
         header.addWidget(self.dismiss_button, 0, Qt.AlignmentFlag.AlignTop)
         return header
+
+    def _side_row(self, side) -> QHBoxLayout:
+        """A side's line, with its own way back into review.
+
+        The re-do sits on the line it applies to rather than in the footer,
+        because the judgement is per-side: "Side B is wrong" is the thought, and
+        "run the whole album again" was the only answer the card had -- which
+        also re-did the side that was right.
+        """
+        row = QHBoxLayout()
+        row.addWidget(self._side_line(side))
+        row.addStretch(1)
+        if self._on_redo_side is not None:
+            button = QPushButton("Re-do this side…")
+            button.setToolTip(
+                f"Re-run {side.label} from its source WAV, back through split "
+                "review. The other sides are left alone.")
+            index = side.index
+            button.clicked.connect(lambda _=False, i=index: self._redo_side(i))
+            self.redo_buttons[index] = button
+            row.addWidget(button)
+        return row
+
+    def _redo_side(self, index: int) -> None:
+        if self._on_redo_side is not None:
+            self._on_redo_side(index)
 
     def _side_line(self, side) -> QLabel:
         n = side.track_count
@@ -173,7 +211,7 @@ class AlbumSummaryCard(QFrame):
         label = QLabel(
             f"    Restoration: {repaired:,} of {total:,} samples declicked ({pct:.2f}%)"
         )
-        label.setStyleSheet("QLabel { color: palette(mid); }")
+        apply_body(label)          # a receipt is content, not a hint
         self.restoration_labels.append(label)
         return label
 
@@ -186,7 +224,7 @@ class AlbumSummaryCard(QFrame):
 
         path_text = str(self._destination) if self._destination else ""
         path_label = QLabel(path_text)
-        path_label.setStyleSheet("QLabel { color: palette(mid); }")
+        apply_body(path_label)
         path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         footer.addWidget(path_label, 1)
 

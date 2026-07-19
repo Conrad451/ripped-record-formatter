@@ -59,7 +59,17 @@ class SideState(str, Enum):
 _TERMINAL = {SideState.DONE, SideState.ERROR, SideState.CANCELLED}
 
 #: States a side can be re-run from.
-_RETRYABLE = {SideState.ERROR, SideState.NEEDS_ATTENTION}
+#:
+#: DONE is in here deliberately. A side that failed and a side that came out
+#: wrong are the same gesture with different starting states -- "the splitter
+#: missed a track and Accept locked the door" is exactly as much a reason to
+#: re-run as "the share blinked". A tool that shows its work has to accept
+#: appeals, and the raw WAVs survive by design precisely so it can.
+#:
+#: CANCELLED is not: a cancelled side may have been cancelled *because* the
+#: album was being torn down, and re-running it would resurrect work the user
+#: just stopped.
+_RETRYABLE = {SideState.ERROR, SideState.NEEDS_ATTENTION, SideState.DONE}
 
 
 @dataclass(frozen=True)
@@ -548,18 +558,25 @@ class AlbumController:
 
     # -- lifecycle ----------------------------------------------------------
     def retry_side(self, index: int) -> bool:
-        """Re-run a failed side's analysis from scratch. Returns whether it ran.
+        """Re-run one side's analysis from scratch. Returns whether it ran.
 
-        A transient failure -- the share blinked, the file was locked, ffmpeg was
-        busy -- used to cost the whole album, because ERROR is terminal and the
-        only way back was starting over. Retrying re-queues just this side:
-        its error is cleared, any cancel flag is reset (a side cancelled with the
-        album is not retryable, but one that *errored* may have had the flag set
-        by a later cancel_all), and analysis is submitted afresh. Every other
-        side is untouched, including ones already encoding.
+        Two situations, one gesture. A transient failure -- the share blinked,
+        the file was locked, ffmpeg was busy -- used to cost the whole album,
+        because ERROR is terminal and the only way back was starting over. And a
+        side that *succeeded* but came out wrong (the splitter missed a track,
+        Accept was pressed, the door locked) had no way back at all: Re-tag
+        cannot split a FLAC, and re-running the album re-did the sides that were
+        already correct.
 
-        Deliberately no retry limit: if it fails again the new message is shown
-        and the user decides whether to try once more or give up.
+        Both are the same operation: re-queue this side and leave every other
+        one untouched, including ones already encoding. Its error is cleared,
+        its previous receipt is dropped so the card cannot show a stale track
+        count, any cancel flag is reset (a side cancelled with the album is not
+        re-runnable, but one that *errored* may have had the flag set by a later
+        cancel_all), and analysis is submitted afresh.
+
+        Deliberately no retry limit: if it comes out wrong again the user decides
+        whether to try once more or give up.
         """
         side = self._by_index(index)
         with self._lock:
@@ -573,6 +590,11 @@ class AlbumController:
             self._finished = False
         side.clear_error()
         side.analysis = None
+        # Drop the old receipt: re-running a DONE side means its recorded track
+        # count, size and declick figures describe files that are about to be
+        # replaced, and a card showing them alongside the new run would be
+        # reporting two different truths about one side.
+        side.result = None
         self._side_cancel[index].clear()
         self._set_state(side, SideState.QUEUED)
         self._analysis_pool.submit(self._run_analysis, side)

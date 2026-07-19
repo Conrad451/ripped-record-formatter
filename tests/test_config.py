@@ -33,3 +33,13 @@ def test_the_new_fields_round_trip_through_save_and_load(tmp_path):
     assert back.default_output_dir == "B:/out"
     assert back.source_post_album_policy == "clear"
     assert back.output_post_album_policy == "reset"
+
+
+def test_two_sides_analyse_at_once_by_default():
+    """Copy-local staging retired the share-contention argument for two sides.
+
+    An LP is two sides; analysing them together roughly halves the wait before
+    the first review. Deliberately not higher: the RAM argument is unchanged,
+    and four-way would hold four sides at once.
+    """
+    assert C.Config().album_analysis_workers == 2

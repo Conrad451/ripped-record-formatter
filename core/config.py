@@ -169,9 +169,19 @@ class Config:
     encode_workers: int = field(default_factory=lambda: min(4, os.cpu_count() or 1))
     """How many tracks to encode in parallel (each is an independent ffmpeg run)."""
 
-    album_analysis_workers: int = 1
-    """Sides analysed at once in Album mode. Conservative: each holds a whole
-    side in RAM and rips usually stream off a contended network share."""
+    album_analysis_workers: int = 2
+    """Sides analysed at once in Album mode.
+
+    Was 1, on the reasoning that each side holds a whole side in RAM and rips
+    stream off a contended network share. Copy-local staging retired the second
+    half of that: a side is copied to local disk before analysis, so the share
+    sees one sequential read per side rather than sustained random access from
+    several at once. Two sides is the common case -- an LP -- and analysing them
+    together roughly halves the wait before the first review.
+
+    Still user-adjustable, and deliberately not raised further: the RAM argument
+    is unchanged, and a double album at four-way parallelism would hold four
+    sides at once."""
 
     # --- window layout (splitter sizes in px; 0 = use default proportion) ---
     main_split_top: int = 0

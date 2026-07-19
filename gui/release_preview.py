@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap
+from gui.text_styles import apply_muted
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
 #: The one wording for "this release has no art", used everywhere it is said.
@@ -24,10 +25,16 @@ NO_COVER_HINT = "tracks will be tagged without a picture"
 UNREADABLE_COVER_TEXT = "Cover art unreadable"
 
 # Warning colours: this state has to read as a problem, not as a neutral blank.
-_WARN_STYLE = (
-    "QLabel { border: 1px solid palette(mid); color: palette(mid); "
-    "background: palette(alternate-base); }"
-)
+def _warn_style(widget) -> str:
+    """The neutral placeholder state. Built per-widget rather than as a
+    constant, because its text colour has to be computed against the live
+    palette to clear the contrast floor -- ``palette(mid)`` measured 1.73:1
+    here, which is a border colour standing in for words."""
+    from gui.text_styles import muted_colour
+
+    return ("QLabel { border: 1px solid palette(mid); "
+            f"color: {muted_colour(widget.palette()).name()}; "
+            "background: palette(alternate-base); }")
 _LOUD_STYLE = (
     "QLabel { border: 2px dashed #c07000; color: #c07000; "
     "background: palette(alternate-base); font-weight: bold; }"
@@ -48,7 +55,7 @@ class CoverThumb(QLabel):
     def clear_cover(self) -> None:
         self.setPixmap(QPixmap())
         self.setText("")
-        self.setStyleSheet(_WARN_STYLE)
+        self.setStyleSheet(_warn_style(self))
 
     def set_cover(self, cover) -> bool:
         """Show ``cover``; return whether real art was rendered.
@@ -72,7 +79,7 @@ class CoverThumb(QLabel):
             return False
 
         self.setText("")
-        self.setStyleSheet(_WARN_STYLE)
+        self.setStyleSheet(_warn_style(self))
         self.setPixmap(
             pixmap.scaled(
                 self._size, self._size,
@@ -121,7 +128,7 @@ class ReleasePreview(QWidget):
         self.title_label = QLabel("")
         self.title_label.setStyleSheet("QLabel { font-weight: bold; }")
         self.detail_label = QLabel("")
-        self.detail_label.setStyleSheet("QLabel { color: palette(mid); }")
+        apply_muted(self.detail_label)
         self.cover_label = QLabel("")
         self.cover_label.setWordWrap(True)
         for label in (self.title_label, self.detail_label, self.cover_label):
