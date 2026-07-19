@@ -38,6 +38,7 @@ from core.version import __version__
 from gui import status_strip
 from gui.resume_bar import ResumeBar
 from gui.status_strip import StatusStrip
+from gui.retag_table import RetagRow, RetagTableModel, RetagTableView
 from gui.track_model import COL_ARTIST, Row, TrackTableModel, TrackTableView
 
 
@@ -78,8 +79,13 @@ class BatchPanel(QWidget):
         form = QGridLayout()
         self.source_edit = QLineEdit(cfg.source_dir)
         self.output_edit = QLineEdit(cfg.output_dir)
-        self.artist_edit = QLineEdit(cfg.last_artist)
-        self.album_edit = QLineEdit(cfg.last_album)
+        # Deliberately *not* pre-filled from the last session. The clean-slate
+        # doctrine that governs Full Rip applies here too: no default is safe
+        # for identity, and a remembered artist is how a stale name ends up
+        # tagged onto the next record. Derived from the selected folder where
+        # that is possible, empty otherwise.
+        self.artist_edit = QLineEdit()
+        self.album_edit = QLineEdit()
 
         source_label = "Source WAV folder:" if kind == "convert" else "Source FLAC folder:"
         form.addWidget(QLabel(source_label), 0, 0)
@@ -97,24 +103,21 @@ class BatchPanel(QWidget):
         layout.addLayout(form)
 
         # persist fields on edit
-        self.source_edit.editingFinished.connect(
-            lambda: self.settings.set(source_dir=self.source_edit.text().strip())
-        )
+        self.source_edit.editingFinished.connect(self._on_source_chosen)
         self.output_edit.editingFinished.connect(
             lambda: self.settings.set(output_dir=self.output_edit.text().strip())
         )
-        self.artist_edit.editingFinished.connect(
-            lambda: self.settings.set(last_artist=self.artist_edit.text().strip())
-        )
-        self.album_edit.editingFinished.connect(
-            lambda: self.settings.set(last_album=self.album_edit.text().strip())
-        )
+        # Artist/Album are session state, not preferences -- see above.
 
         # --- mode-specific controls ----------------------------------------
         controls = QHBoxLayout()
-        self.load_button = QPushButton(
-            "Load WAVs" if kind == "convert" else "Load FLACs"
-        )
+        # Kept as a manual re-scan for a folder that changed under you, but no
+        # longer the way files arrive: choosing a folder is the request, and
+        # every other tab in the app already discovers files on its own.
+        self.load_button = QPushButton("Rescan folder")
+        self.load_button.setToolTip(
+            "Read the folder again. Files load automatically when you choose "
+            "one; this is for when the folder has changed since.")
         self.load_button.clicked.connect(self.load_files)
         controls.addWidget(self.load_button)
 
@@ -134,6 +137,23 @@ class BatchPanel(QWidget):
             self.lookup_button.clicked.connect(self._open_lookup)
             controls.addWidget(self.lookup_button)
 
+            # Sides are how a flat folder of FLACs becomes a record: the same
+            # partition editor Full Rip uses, against the same kind of flat
+            # tracklist, producing the same per-side numbering.
+            self.cover_button = QPushButton("Choose cover image…")
+            self.cover_button.setToolTip(
+                "Embed a JPEG or PNG from your disk in every track this pass "
+                "writes. Use it when the release has no art online.")
+            self.cover_button.clicked.connect(self._choose_cover)
+            controls.addWidget(self.cover_button)
+
+            self.define_sides_button = QPushButton("Define sides...")
+            self.define_sides_button.setToolTip(
+                "Split this tracklist into sides. Track numbers restart on each "
+                "side and DISCNUMBER follows, the way a vinyl rip is tagged.")
+            self.define_sides_button.clicked.connect(self._define_sides)
+            controls.addWidget(self.define_sides_button)
+
             self.delete_check = QCheckBox("Delete source files after re-tag")
             self.delete_check.setChecked(False)
             controls.addWidget(self.delete_check)
@@ -147,8 +167,18 @@ class BatchPanel(QWidget):
         layout.addLayout(controls)
 
         # --- track table ----------------------------------------------------
-        self.model = TrackTableModel()
-        self.table = TrackTableView()
+        # Re-tag shows every field it will write; Convert keeps the three-column
+        # table, because it is producing files rather than editing a library.
+        if kind == "retag":
+            self.model = RetagTableModel()
+            self.table = RetagTableView()
+            self.table.floodRequested.connect(self._on_flood)
+            self.model.flooded.connect(
+                lambda col, value, n: self.logMessage.emit(
+                    f"Applied to all {n} row(s)."))
+        else:
+            self.model = TrackTableModel()
+            self.table = TrackTableView()
         self.table.setModel(self.model)
         self.table.pasted.connect(self._on_pasted)
         self.table.rowsDeleted.connect(
@@ -171,9 +201,49 @@ class BatchPanel(QWidget):
             if chosen:
                 target.setText(chosen)
                 self.settings.set(**{config_key: chosen})
+                if config_key == "source_dir":
+                    self._on_source_chosen()
 
         button.clicked.connect(choose)
         return button
+
+    def _define_sides(self) -> None:
+        """Partition the loaded tracklist into sides, then renumber by them."""
+        from gui.side_editor import SideEditorDialog
+
+        rows = self.model.rows()
+        if not rows:
+            self.logMessage.emit("Load a folder first -- there is nothing to "
+                                 "split into sides yet.")
+            return
+        titles = [getattr(r, "title", "") or "" for r in rows]
+        # Durations are unknown for a folder of existing FLACs, and the editor
+        # only uses them to *suggest* a split. Equal weights give an even
+        # default, which the user then drags where the record actually breaks.
+        dialog = SideEditorDialog(titles, [1] * len(titles), self)
+        if not dialog.exec():
+            return
+        sides = [list(side.track_indices) for side in dialog.sides]
+        self.model.apply_sides(sides)
+        self._sides_defined = bool(sides)
+        self.logMessage.emit(
+            "Sides: " + ", ".join(dialog.side_labels())
+            + ". Track numbers restart on each side.")
+
+    def _choose_cover(self) -> None:
+        """Pick a cover image from disk, for a release that has none online."""
+        from gui.cover_picker import choose_cover_file
+
+        cover, problem = choose_cover_file(self)
+        if problem:
+            self.logMessage.emit(problem)
+            return
+        if cover is None:
+            return
+        self._cover = cover
+        self.logMessage.emit(
+            f"Cover art: using your own image ({len(cover.data) // 1024} KB). "
+            "It is embedded in every track this pass writes.")
 
     def _wants_per_row_artist(self) -> bool:
         if self.kind == "retag":
@@ -204,6 +274,47 @@ class BatchPanel(QWidget):
         self.source_edit.setText(path)
         self.settings.set(source_dir=path)
 
+    def _on_source_chosen(self) -> None:
+        """Choosing a folder is the request. Load it.
+
+        The separate Load button was a second step that only ever had one
+        sensible answer -- every other tab in the app discovers files on its own
+        when told where to look.
+        """
+        source = self.source_edit.text().strip()
+        self.settings.set(source_dir=source)
+        if source and Path(source).is_dir():
+            self._derive_identity_from(Path(source))
+            self.load_files()
+
+    def _derive_identity_from(self, folder: Path) -> None:
+        """Offer Artist/Album read back out of ``{FLAC root}/{Artist}/{Album}``.
+
+        Only when the folder actually sits under the configured FLAC root --
+        otherwise the last two path segments are a guess, and a wrong guess
+        typed into a tag field is worse than an empty one. Never overwrites
+        something already typed: an offer that overrides a choice is not an
+        offer.
+        """
+        root = (self.settings.config.default_output_dir or "").strip()
+        if not root:
+            return
+        try:
+            relative = folder.resolve().relative_to(Path(root).resolve())
+        except (ValueError, OSError):
+            return
+        parts = relative.parts
+        if len(parts) < 2:
+            return
+        if not self.artist_edit.text().strip():
+            self.artist_edit.setText(parts[-2])
+        if not self.album_edit.text().strip():
+            self.album_edit.setText(parts[-1])
+
+    def _on_flood(self, column: int, value: str) -> None:
+        """The view already applied it; this is only for the log line."""
+        return
+
     def load_files(self) -> None:
         source = self.source_edit.text().strip()
         if not source or not Path(source).is_dir():
@@ -211,7 +322,19 @@ class BatchPanel(QWidget):
             return
         files = sorted(Path(source).glob(self._file_glob))
         default_artist = self.artist_edit.text().strip()
-        rows = [Row(title=f.stem, artist=default_artist, source_path=f) for f in files]
+        default_album = self.album_edit.text().strip()
+        if self.kind == "retag":
+            # Titles seed from the filename with any existing [NN] - stamp
+            # removed: the number is a filename convention, and carrying it into
+            # the title is how it got applied twice.
+            from core.tracks import strip_track_prefix
+
+            rows = [RetagRow(source_path=f, title=strip_track_prefix(f.stem),
+                             artist=default_artist, album=default_album)
+                    for f in files]
+        else:
+            rows = [Row(title=f.stem, artist=default_artist, source_path=f)
+                    for f in files]
         self.model.set_rows(rows)
         self._update_artist_column()
         self.logMessage.emit(
@@ -229,9 +352,17 @@ class BatchPanel(QWidget):
             return None
         album = self.album_edit.text().strip()
         artist = self.artist_edit.text().strip()
-        tracks = self.model.build_tracks(
-            album, artist, self._wants_per_row_artist()
-        )
+        if self.kind == "retag":
+            # The same filename convention Full Rip uses, from the same setting,
+            # composed with the prefix strip so a legacy name re-stamps once.
+            tracks = self.model.build_tracks(
+                per_row_artist=self._wants_per_row_artist(),
+                default_artist=artist, default_album=album,
+                use_side_letters=self.settings.config.filename_side_letters)
+        else:
+            tracks = self.model.build_tracks(
+                album, artist, self._wants_per_row_artist()
+            )
         if not tracks:
             self.logMessage.emit("No tracks to process -- load files first.")
             return None
@@ -253,14 +384,21 @@ class BatchPanel(QWidget):
         return converter.retag_flacs, tracks, Path(output), kwargs
 
     def apply_release(self, detail) -> None:
-        """Fill artist/album, replace track titles by order, stash cover art."""
+        """Feed the selection into everything below it.
+
+        On Re-tag this is the whole parity story: the chosen release does not
+        just retitle rows, it supplies album artist, date and the MusicBrainz
+        identifiers for each track in order -- the same thirteen fields Full Rip
+        writes, from the same source. Identity is *not* persisted to settings;
+        it belongs to this session and the folder in front of you.
+        """
         self.artist_edit.setText(detail.artist)
-        self.settings.set(last_artist=detail.artist)
         self.album_edit.setText(detail.title)
-        self.settings.set(last_album=detail.title)
         titles = [t.title for t in detail.tracks]
         if titles and self.model.rowCount():
             self.model.paste_titles(0, titles)
+        if self.kind == "retag" and hasattr(self.model, "apply_release_fields"):
+            self.model.apply_release_fields(detail)
         self._cover = detail.cover
 
     def _open_lookup(self) -> None:

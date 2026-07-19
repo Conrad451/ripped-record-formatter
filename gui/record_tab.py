@@ -385,6 +385,7 @@ class RecordTab(QWidget):
         # The preview shares the button's row rather than taking one of its own:
         # hidden it costs nothing, and shown it grows the row it already had.
         self.release_preview = ReleasePreview(thumb_size=40)
+        self.release_preview.coverChosen.connect(self._on_cover_chosen)
         album_row.addWidget(self.release_preview, 1)
         album_row.addStretch(1)
         out_form.addRow("Album:", self._wrap(album_row))
@@ -894,6 +895,14 @@ class RecordTab(QWidget):
         self._release = None
         self.release_preview.clear()
         self.clear_release_button.setVisible(False)
+
+    def _on_cover_chosen(self, cover) -> None:
+        """A cover picked here rides along with the release to Full Rip."""
+        if self._release is not None:
+            import dataclasses
+
+            self._release = dataclasses.replace(self._release, cover=cover)
+        self._log("Cover art: using your own image for this album.")
 
     def _clear_release_clicked(self) -> None:
         self.clear_release()

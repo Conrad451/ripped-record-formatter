@@ -208,9 +208,27 @@ Tags carry across. A field the FLAC does not have produces no frame at all, neve
 
 `TRACKTOTAL`/`DISCTOTAL` are also read as `TOTALTRACKS`/`TOTALDISCS`, which is how some other taggers spell them — the source folder is whatever you point at, not necessarily something this app wrote. A total with no corresponding number is dropped rather than written as `/5`.
 
-## Re-tagging with a tracklist
+## Re-tagging: the tagging stage, pointed at FLACs you already have
 
-The **Re-tag** tab has its own **Look up release…**, scoped to that tab. Re-tagging a folder is precisely the moment you want a tracklist, and until now the only way to get one was the standalone Metadata tab — which applied the release to whichever batch panel you happened to have visited last. The lookup now lands where you are standing.
+**Re-tag writes everything Full Rip writes.** It is the pipeline's tagging stage retargeted at an existing library, which is how a folder of pre-app rips becomes first-class rather than something the good tools cannot reach.
+
+Choose a folder and it loads — no separate Load step. If the folder sits under your FLAC root, Artist and Album are read back out of `{FLAC root}/{Artist}/{Album}` and offered, never forced, and never over something you typed.
+
+**Look up release…** is on the tab, and the selection feeds everything below it: titles, album artist, date, and the MusicBrainz IDs for each track.
+
+**Define sides…** splits a flat folder into sides using the same partition editor Full Rip uses. Track numbers then restart on each side, TRACKTOTAL is that side's count, and DISCNUMBER/DISCTOTAL follow — the Picard vinyl convention, identical to an album rip. Your filename convention setting governs the renames here too (`[A01]` per side, or `[01]` continuous), composed with the prefix strip so a file already called `[01] - Song` re-stamps once rather than twice.
+
+**The table is the preview of the write.** Every field that will land in the file is a column: number, title, artist, album, album artist, date, disc, and whether MusicBrainz IDs are going in. The ones you can type are editable; the ones that are derived (the number, the disc) or identifying (the IDs) are shown read-only, because they are answers to questions asked elsewhere — an ID changes by choosing a different release, not by typing over hex digits.
+
+**Apply to all** saves typing the same album artist fourteen times: right-click a cell in Artist, Album, Album Artist or Date and give every row that value. Deliberately not offered on Title or the number — those are per-track by definition.
+
+Provenance is never touched. `RRF_VERSION` and `RRF_RESTORATION` are read from the source and carried forward unchanged, so a re-tag can never erase or falsify how a file was made.
+
+## Cover art you supply yourself
+
+Plenty of records have nothing in the Cover Art Archive — private presses, reissues, anything obscure. Everywhere the app says it has no art, it now offers **Choose cover image…**: the Re-tag tab, Full Rip's release row, the Record tab's album row, and the lookup dialog. Pick a JPEG or PNG and it is embedded exactly like fetched art.
+
+Two sanity limits, both stated when they bite: **10 MB** and **5000×5000**. A cover is embedded in *every* track, so a large scan multiplies across the album, and nothing displays a cover bigger than that. Files over either limit are refused rather than silently resized — re-encoding your artwork behind your back is not the app's business.
 
 ## Roadmap & known limits
 

@@ -1182,14 +1182,14 @@ def test_retag_lookup_fills_the_table_and_threads_cover_art(qapp):
 
     from gui.main_window import MainWindow
     from gui.metadata_panel import MetadataPanel
-    from gui.track_model import Row
+    from gui.retag_table import RetagRow
 
     cover = _png_cover()
     w = MainWindow()
     try:
         retag = w.retag_panel
-        # apply_release retitles rows that exist; seed the table as "Load FLACs" would.
-        retag.model.set_rows([Row(title="track01", artist="", source_path=Path("a/01.flac"))])
+        # apply_release retitles rows that exist; seed the table as loading would.
+        retag.model.set_rows([RetagRow(title="track01", source_path=Path("a/01.flac"))])
         retag.artist_edit.setText("")
         retag.album_edit.setText("")
 
