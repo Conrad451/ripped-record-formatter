@@ -181,32 +181,21 @@ Written as FLAC Vorbis comments. **A field that is absent writes no tag at all**
 
 The two `RRF_*` fields are written only when the app *encodes* the audio (Full Rip, plain Convert) — re-tagging carries forward whatever the original encode stamped and never rewrites them, so a re-tag cannot erase or falsify provenance.
 
-## Export to MP3
+## Exporting a copy
 
-FLAC is the library; MP3 is a copy for a device. The **Convert** tab has an **Export to MP3** section that turns a folder of FLACs into a folder of tagged MP3s, and **Use the album just finished** points it at the album you have this moment ripped. Sources are never modified, moved or deleted.
+FLAC is your library. An export is a copy for somewhere the library cannot go — and that is a shorter list than it used to be, because a FLAC-streaming server reaches most devices directly now. So the menu is deliberately small:
 
-Three qualities, because the reason you want an MP3 varies: **V0** (VBR ~245 kbps, the default — transparent for practical purposes and smaller than 320), **320 kbps CBR** (for devices and car decks that get unhappy with VBR headers), and **V2** (VBR ~190 kbps, for when the device is small and the commute is long). Encoding is a direct ffmpeg subprocess per track rather than a decode-to-RAM round trip, so an album of 24-bit sides does not need an album of 24-bit sides' worth of memory.
+| Format | What it is | Tags | Use it for |
+| --- | --- | --- | --- |
+| **ALAC (Apple Lossless)** | `.m4a`, lossless | Full — MP4 atoms incl. cover art and MusicBrainz IDs | iTunes, Files, an Apple device or somebody else's Mac. Same audio as your FLAC. |
+| **WAV (16-bit / 44.1 kHz)** | `.wav`, uncompressed | **None** | CD burning, and hardware old enough to predate everything else. |
+| **MP3** | `.mp3`, lossy — V0 (default), 320 CBR, or V2 | Full — ID3v2.4 incl. cover art and MusicBrainz IDs | Phones and car stereos that want a small file. |
 
-Tags carry across. A field the FLAC does not have produces no frame at all, never an empty one:
+WAV carries no tags and no cover art, and the app says so where you choose it. WAV has nowhere honest to put them, and writing chunks that nothing reads would be ceremony rather than metadata.
 
-| FLAC (Vorbis comment) | MP3 (ID3v2.4) | Notes |
-| --- | --- | --- |
-| `TITLE` | `TIT2` | |
-| `ARTIST` | `TPE1` | |
-| `ALBUM` | `TALB` | |
-| `ALBUMARTIST` | `TPE2` | |
-| `DATE` | `TDRC` | Year as-is |
-| `TRACKNUMBER` + `TRACKTOTAL` | `TRCK` | Packed as `N/T` |
-| `DISCNUMBER` + `DISCTOTAL` | `TPOS` | Packed as `N/T` |
-| `MUSICBRAINZ_ALBUMID` | `TXXX:MusicBrainz Album Id` | Picard's spelling, so Picard and beets find them |
-| `MUSICBRAINZ_ARTISTID` | `TXXX:MusicBrainz Artist Id` | |
-| `MUSICBRAINZ_RECORDINGID` | `TXXX:MusicBrainz Recording Id` | |
-| `MUSICBRAINZ_TRACKID` | `TXXX:MusicBrainz Release Track Id` | |
-| `RRF_VERSION` | `TXXX:RRF_VERSION` | Provenance travels with the copy |
-| `RRF_RESTORATION` | `TXXX:RRF_RESTORATION` | |
-| Front cover picture | `APIC` type 3 | Description "front cover" |
+Sources are never modified, moved or deleted. The encoder is checked before anything is written, so a build that cannot produce your chosen format says so immediately rather than after eleven tracks — and it names what is missing instead of quietly substituting a different format. Every exported file is decoded before it is called a success.
 
-`TRACKTOTAL`/`DISCTOTAL` are also read as `TOTALTRACKS`/`TOTALDISCS`, which is how some other taggers spell them — the source folder is whatever you point at, not necessarily something this app wrote. A total with no corresponding number is dropped rather than written as `/5`.
+Exports land under `{FLAC root}\{Format}\{Artist}\{Album}`, keeping them apart from the library and from each other, and **Use the album just finished** points the export at whatever you last ripped, whichever format you pick.
 
 ## Re-tagging: the tagging stage, pointed at FLACs you already have
 

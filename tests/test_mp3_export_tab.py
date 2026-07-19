@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from core import mp3_export
+from core import audio_export, mp3_export
 from gui.mp3_export import Mp3ExportSection, derived_output_dir
 
 
@@ -82,7 +82,7 @@ def test_suggest_fills_the_output_field(qapp, tmp_path):
                        artist="Miles Davis", album="Kind of Blue")
     section.suggest_output()
     assert Path(section.output_edit.text()) == \
-        Path(r"D:\Music") / "MP3" / "Miles Davis" / "Kind of Blue"
+        Path(r"D:\Music") / "ALAC" / "Miles Davis" / "Kind of Blue"
 
 
 def test_suggest_says_so_when_not_derivable(qapp, tmp_path):
@@ -128,15 +128,17 @@ def test_collect_job_is_the_standard_four_tuple(qapp, tmp_path):
 
     operation, flacs, output_dir, kwargs = section.collect_job()
 
-    assert operation is mp3_export.export_mp3
+    assert operation is audio_export.export_audio
     assert [f.name for f in flacs] == [
         "[01] - Track 1.flac", "[02] - Track 2.flac"]
     assert output_dir == tmp_path / "out"
-    assert kwargs == {"quality": mp3_export.QUALITY_V0, "max_workers": 2}
+    # The job now names a profile; ALAC is the default and has no variant.
+    assert kwargs == {"profile": "alac", "variant": "", "max_workers": 2}
 
 
 def test_default_quality_is_v0_and_the_combo_carries_the_constant(qapp, tmp_path):
     section = _section(qapp, tmp_path)
+    section.format_combo.setCurrentIndex(section.format_combo.findData("mp3"))
     assert section.quality() == mp3_export.QUALITY_V0
     values = [section.quality_combo.itemData(i)
               for i in range(section.quality_combo.count())]
@@ -149,10 +151,14 @@ def test_chosen_quality_reaches_the_job(qapp, tmp_path):
     section = _section(qapp, tmp_path)
     section.source_edit.setText(str(folder))
     section.output_edit.setText(str(tmp_path / "out"))
+    # Quality belongs to the format, so pick MP3 first -- the regression this
+    # guards is that the MP3 family still carries its variant through.
+    section.format_combo.setCurrentIndex(section.format_combo.findData("mp3"))
     section.quality_combo.setCurrentIndex(1)      # 320 CBR
 
     _op, _flacs, _out, kwargs = section.collect_job()
-    assert kwargs["quality"] == mp3_export.QUALITY_320
+    assert kwargs["profile"] == "mp3"
+    assert kwargs["variant"] == mp3_export.QUALITY_320
 
 
 def test_no_flacs_is_refused_with_a_reason(qapp, tmp_path):
@@ -230,10 +236,10 @@ def test_export_runs_through_the_same_worker_plumbing(qapp, tmp_path, monkeypatc
 
         assert len(started) == 1
         operation, flacs, output_dir, kwargs = started[0]
-        assert operation is mp3_export.export_mp3
+        assert operation is audio_export.export_audio
         assert len(flacs) == 2
         assert output_dir == tmp_path / "out"
-        assert kwargs["quality"] == mp3_export.QUALITY_V0
+        assert kwargs["profile"] == "alac"
     finally:
         window.close()
 
