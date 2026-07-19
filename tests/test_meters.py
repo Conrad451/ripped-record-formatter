@@ -180,3 +180,107 @@ def test_the_bars_have_real_physical_presence(qapp):
     meters = LevelMeters(channels=2)
     for row in meters.rows:
         assert row.bar.minimumHeight() >= 24
+
+
+# --------------------------------------------------------------------------- #
+# 9.16 item 3: the gain fader as an instrument
+# --------------------------------------------------------------------------- #
+def test_the_fader_marks_the_target_on_the_level_axis_not_the_gain_axis(qapp):
+    """The one thing this widget must not do is lie.
+
+    The fader's axis is the Windows capture level, 0..100; the ribbon's axis is
+    dBFS. Which knob position yields -3 dBFS depends entirely on how hot the
+    source is, so the -3 mark belongs on the ribbon -- where it is a real
+    position on a real scale -- and nowhere near the gain track.
+    """
+    from gui.gain_fader import GainFader
+    from gui.level_scale import dbfs_fraction
+    from gui.meters import CLIP_ZONE_DBFS, clip_zone_fraction
+
+    fader = GainFader()
+    # The gain axis is a plain 0..100 with no dB semantics attached.
+    assert fader.slider.minimum() == 0
+    assert fader.slider.maximum() == 100
+    # The target lives on the level scale, from the one authority.
+    assert clip_zone_fraction() == pytest.approx(dbfs_fraction(CLIP_ZONE_DBFS))
+    assert clip_zone_fraction() == pytest.approx(0.95)
+
+
+def test_the_fader_ribbon_reads_levels_on_the_shared_scale(qapp):
+    """The ribbon, the bars and the history lanes must place a level alike."""
+    from gui.gain_fader import GainFader
+    from gui.level_scale import dbfs_fraction
+    from gui.meters import _fraction
+
+    fader = GainFader()
+    for db in (-3.0, -7.0, -20.0, -60.0):
+        fader.set_level(db)
+        assert fader.ribbon._dbfs == pytest.approx(db)
+        assert dbfs_fraction(db) == pytest.approx(_fraction(db))
+
+
+def test_the_fader_states_its_value_and_the_level_it_is_producing(qapp):
+    from gui.gain_fader import GainFader
+
+    fader = GainFader()
+    fader.set_value(62)
+    assert fader.value() == 62
+    assert fader.value_label.text() == "62"
+
+    fader.set_level(-7.04)
+    assert fader.peak_label.text() == "−7.0"       # one decimal, real minus
+
+    fader.clear_level()
+    assert fader.peak_label.text() == "—"
+
+
+def test_setting_the_fader_from_the_endpoint_does_not_echo_back(qapp):
+    """A value read *from* Windows must not be written straight back to it."""
+    from gui.gain_fader import GainFader
+
+    fader = GainFader()
+    seen = []
+    fader.valueChanged.connect(seen.append)
+
+    fader.set_value(40, silent=True)
+    assert seen == []
+    assert fader.value() == 40
+
+    fader.set_value(55)              # a user-driven move does signal
+    assert seen == [55]
+
+
+def test_the_scale_is_aligned_with_the_bars_it_annotates(qapp):
+    """A calibrated rule that does not line up with the bars is worse than no
+    rule: it puts every landmark a few pixels off the level it names.
+
+    This shipped wrong -- the scale was indented by a guess at the channel
+    label's width and came out 6px left and 12px wide. Both now live in one
+    grid column, and this is the assertion that keeps them there.
+    """
+    from gui.meters import LevelMeters
+
+    meters = LevelMeters(channels=2)
+    meters.resize(900, 120)
+    meters.show()
+    qapp.processEvents()
+
+    for row in meters.rows:
+        assert row.bar.x() == meters.scale.x()
+        assert row.bar.width() == meters.scale.width()
+    meters.close()
+
+
+def test_the_fader_ribbon_is_aligned_with_the_fader(qapp):
+    """Same rule for the gain fader: the level sits under the knob that moves
+    it, or the pairing is decorative."""
+    from gui.gain_fader import GainFader
+
+    fader = GainFader()
+    fader.resize(900, 60)
+    fader.show()
+    qapp.processEvents()
+
+    assert fader.ribbon.x() == fader.slider.x()
+    assert fader.ribbon.width() == fader.slider.width()
+    fader.close()

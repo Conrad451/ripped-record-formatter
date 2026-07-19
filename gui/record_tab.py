@@ -21,6 +21,7 @@ A, flip, record side B, and the album job is already mapped.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from pathlib import Path
 
@@ -36,7 +37,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
-    QSlider,
     QVBoxLayout,
     QWidget,
 )
@@ -53,11 +53,48 @@ from core.recorder import (
 from core.setup_check import INFO, OK, WARN, CheckResult, check_sample_rate, check_signal
 from core.timefmt import format_timestamp
 from core.tracks import safe_part
+from gui.gain_fader import GainFader
 from gui.level_history import LevelHistoryStrip
-from gui.meters import LevelMeters
+from gui.meters import LevelMeters, format_channel_peak
 from gui.release_preview import ReleasePreview
 
 log = logging.getLogger(__name__)
+
+
+class ElidedPathLabel(QLabel):
+    """A one-line path display that shortens in the middle to fit.
+
+    A NAS path is easily wider than the tab, and this label sits in a place with
+    no vertical budget to spend on wrapping. The two ends of a path are the
+    parts that identify it -- the drive and the file name -- so the middle is
+    what gets dropped. :meth:`full_text` stays authoritative regardless of the
+    widget's width, and is what the tooltip carries.
+    """
+
+    def __init__(self, text: str = "") -> None:
+        super().__init__(text)
+        self._full = text
+        self.setWordWrap(False)
+        self.setMinimumWidth(120)
+
+    def setFullText(self, text: str) -> None:
+        self._full = text
+        self._apply_elision()
+
+    def full_text(self) -> str:
+        return self._full
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._apply_elision()
+
+    def _apply_elision(self) -> None:
+        width = self.width()
+        if width <= 0:                     # not laid out yet: show it whole
+            super().setText(self._full)
+            return
+        super().setText(
+            self.fontMetrics().elidedText(self._full, Qt.ElideMiddle, width))
 
 
 def _is_rate_error(message: str) -> bool:
@@ -142,6 +179,9 @@ class RecordTab(QWidget):
     #: "Done recording -- process this album": the user says the album is
     #: finished. A bridge to the Full Rip tab, never a trigger for processing.
     processAlbumRequested = Signal()
+    #: One plain sentence for the window's status strip. Separate from
+    #: logMessage: the log is the history, this is the present tense.
+    statusMessage = Signal(str)
 
     def __init__(self, settings) -> None:
         super().__init__()
@@ -202,6 +242,25 @@ class RecordTab(QWidget):
         refresh = QPushButton("Refresh")
         refresh.clicked.connect(self.refresh_devices)
         device_row.addWidget(refresh)
+
+        # "Check my setup" is diagnostics, not a step. It used to sit as a
+        # full-width button in the middle of the tab, which put a troubleshooting
+        # tool directly in the path of the ordinary flow -- and the checks that
+        # actually matter (no signal, too hot, rate reassurance) run on their own
+        # anyway, on device selection and during a take. So it demotes to a link
+        # beside the device it inspects: findable when something is wrong,
+        # invisible when nothing is.
+        self.check_button = QPushButton("Check my setup")
+        self.check_button.setFlat(True)
+        self.check_button.setCursor(Qt.PointingHandCursor)
+        self.check_button.setStyleSheet(
+            "QPushButton { border: none; color: palette(link); "
+            "text-decoration: underline; padding: 0 6px; }")
+        self.check_button.setToolTip(
+            "Check the sample rate and listen for a few seconds, then say in "
+            "plain words what to fix. Advice only -- it never blocks recording.")
+        self.check_button.clicked.connect(self._run_setup_check)
+        device_row.addWidget(self.check_button)
         form.addRow("Device:", self._wrap(device_row))
 
         self.rate_combo = QComboBox()
@@ -248,26 +307,21 @@ class RecordTab(QWidget):
         # watching the very bars it moves. The slider drives the Windows capture
         # level for the selected device (see _sync_gain_slider); it hides itself
         # when that endpoint can't be reached.
-        meter_row = QHBoxLayout()
         self.meters = LevelMeters(channels=2)
         self.meters.resetRequested.connect(self._reset_levels)
-        meter_row.addWidget(self.meters, 1)
+        level_layout.addWidget(self.meters)
 
+        # The gain fader sits directly under the bars it moves, full width,
+        # carrying its own level ribbon: setting gain is a closed loop -- drag,
+        # watch, drag -- and for as long as the knob was a thin vertical slider
+        # off to one side, that loop spanned the gap between two widgets. See
+        # gui.gain_fader for why the -3 dBFS mark lives on the ribbon and not on
+        # the gain axis.
         self._gain: EndpointGain | None = None
-        gain_col = QVBoxLayout()
-        self.gain_label = QLabel("Input")
-        self.gain_label.setAlignment(Qt.AlignHCenter)
-        gain_col.addWidget(self.gain_label)
-        self.gain_slider = QSlider(Qt.Vertical)
-        self.gain_slider.setRange(0, 100)
-        self.gain_slider.setToolTip(
-            "Adjusts the Windows input level. If the signal distorts even at low "
-            "settings, turn down the source instead.")
-        self.gain_slider.valueChanged.connect(self._on_gain_changed)
-        gain_col.addWidget(self.gain_slider, 1, Qt.AlignHCenter)
-        self.gain_widgets = (self.gain_label, self.gain_slider)
-        meter_row.addLayout(gain_col)
-        level_layout.addLayout(meter_row)
+        self.gain_fader = GainFader()
+        self.gain_fader.valueChanged.connect(self._on_gain_changed)
+        level_layout.addWidget(self.gain_fader)
+        self.gain_widgets = (self.gain_fader,)
 
         # The bars say what the input is doing *now*; the strip says what it has
         # been doing for the last half minute -- which is the question you are
@@ -279,16 +333,6 @@ class RecordTab(QWidget):
                            "volume up until peaks stay just below −3 dBFS.")
         self.hint.setWordWrap(True)
         level_layout.addWidget(self.hint)
-
-        # "Check my setup" -- plain-language advice, never a gate. The button runs
-        # the full check (rate + a short listen); a mis-set rate is also flagged
-        # automatically when a device is chosen.
-        check_row = QHBoxLayout()
-        self.check_button = QPushButton("Check my setup")
-        self.check_button.clicked.connect(self._run_setup_check)
-        check_row.addWidget(self.check_button)
-        check_row.addStretch(1)
-        level_layout.addLayout(check_row)
 
         self.check_results = QLabel("")
         self.check_results.setWordWrap(True)
@@ -357,7 +401,9 @@ class RecordTab(QWidget):
         browse = QPushButton("Browse...")
         browse.clicked.connect(self._browse_folder)
         folder_row.addWidget(browse)
-        out_form.addRow("Folder:", self._wrap(folder_row))
+        # States its function, not its type: "Folder" names the widget, this
+        # names the job it does.
+        out_form.addRow("Recordings save to:", self._wrap(folder_row))
 
         self.file_edit = QLineEdit(cfg.record_next_file or "SideA.wav")
         self.file_edit.setToolTip("Auto-advances after each recording: "
@@ -365,7 +411,26 @@ class RecordTab(QWidget):
         self.file_edit.editingFinished.connect(
             lambda: self.settings.set(record_next_file=self.file_edit.text().strip()))
         out_form.addRow("Next file:", self.file_edit)
+
+        # Where the file actually lands, resolved and shown before the action
+        # that lands it -- the same doctrine as the frozen "Encoding to:" line.
+        # A stakeholder could not identify the output folder from their own
+        # screenshot of this tab: a folder box and a name box are two halves of
+        # a path the user is left to assemble in their head, and the answer to
+        # "where is my recording going" should not require mental string
+        # concatenation.
+        # One line, elided in the middle, with the whole path in the tooltip. A
+        # NAS path can be long enough to wrap to three lines, and the Record tab
+        # has no vertical budget to spend on a caption that grows with the
+        # user's folder names.
+        self.destination_label = ElidedPathLabel("—")
+        self.destination_label.setStyleSheet("QLabel { color: palette(mid); }")
+        out_form.addRow("", self.destination_label)
         root.addWidget(out_box)
+
+        self.folder_edit.textChanged.connect(self._refresh_destination)
+        self.file_edit.textChanged.connect(self._refresh_destination)
+        self._refresh_destination()
 
         transport = QHBoxLayout()
         self.record_button = QPushButton("Record")
@@ -543,9 +608,9 @@ class RecordTab(QWidget):
             self._gain.set(remembered)
         for w in self.gain_widgets:
             w.setVisible(True)
-        self.gain_slider.blockSignals(True)
-        self.gain_slider.setValue(round(level * 100))
-        self.gain_slider.blockSignals(False)
+        # Silent: this value came *from* the endpoint, so echoing it back would
+        # be a write we did not ask for.
+        self.gain_fader.set_value(round(level * 100), silent=True)
 
     def _on_gain_changed(self, value: int) -> None:
         """Slider moved: drive the Windows level and remember it for this device."""
@@ -723,9 +788,14 @@ class RecordTab(QWidget):
             self._check_clips = telemetry.clip_runs
         self.meters.update_from(telemetry)
         self.history_strip.update_from(telemetry)
+        # The fader's ribbon shows the loudest channel: while you are setting
+        # gain the question is whether *anything* is too hot, not which side.
+        peaks = [p for p in telemetry.peaks_dbfs if p is not None]
+        self.gain_fader.set_level(max(peaks) if peaks else float("-inf"))
         if self.recording:
             self.elapsed_label.setText(format_timestamp(telemetry.elapsed_s))
             self.size_label.setText(f"{telemetry.bytes_written / 1_048_576:.1f} MB")
+            self.statusMessage.emit(self.recording_status(telemetry))
 
     # -- setup check ---------------------------------------------------------
     def _run_setup_check(self) -> None:
@@ -884,6 +954,27 @@ class RecordTab(QWidget):
             name += ".wav"
         return Path(folder) / name
 
+    def _refresh_destination(self) -> None:
+        """Show the exact path the next recording will be written to.
+
+        Driven from :meth:`destination` rather than re-deriving the join, so
+        the line cannot disagree with the file that actually gets written --
+        including the ``.wav`` the field does not make you type.
+        """
+        dest = self.destination()
+        if dest is None:
+            self.destination_label.setFullText("— choose a folder and a file name")
+            self.destination_label.setToolTip("")
+            self.destination_label.setStyleSheet(
+                "QLabel { color: palette(mid); font-style: italic; }")
+            return
+
+        self.destination_label.setFullText(f"→ {dest}")
+        self.destination_label.setToolTip(str(dest))
+        # Not muted: this is the answer to "where is my recording going", which
+        # is a thing to read, not a caption.
+        self.destination_label.setStyleSheet("QLabel { font-family: monospace; }")
+
     def _start_recording(self) -> None:
         if self.recording:
             return
@@ -959,6 +1050,22 @@ class RecordTab(QWidget):
         self.settings.set(record_next_file=advanced)
 
         self._restart_monitor()
+
+    def recording_status(self, telemetry) -> str:
+        """"Recording Side C — 2:14, peaks −8.1" -- the live status line.
+
+        Names the side rather than the file, because the side is what the user
+        is holding. The peak is the number they are watching for, so it travels
+        with the elapsed time rather than living only on the meters.
+        """
+        side = Path(self.file_edit.text().strip() or "this side").stem
+        elapsed = format_timestamp(telemetry.elapsed_s)
+        peaks = [p for p in telemetry.peaks_dbfs if p is not None]
+        loudest = max(peaks) if peaks else None
+        if loudest is None or math.isinf(loudest) or math.isnan(loudest):
+            return f"Recording {side} — {elapsed}"
+        return (f"Recording {side} — {elapsed}, "
+                f"peaks {format_channel_peak(loudest)}")
 
     def _report(self, result) -> None:
         peak = ("—" if result.max_peak_dbfs in (None, float("-inf"))

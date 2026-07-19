@@ -65,14 +65,70 @@ def qapp():
     yield QApplication.instance() or QApplication([])
 
 
-def test_main_window_constructs_all_tabs(qapp):
+def test_the_tab_order_is_the_pipeline(qapp):
+    """Tab order is the user story: Record -> Full Rip -> the folder tools.
+
+    Record is first because that is where a record actually starts, and the app
+    should open at the beginning of the story rather than in the middle of it.
+    The standalone Metadata tab is gone: its only job was feeding "whichever
+    batch panel you visited last", which was a guess dressed up as a feature.
+    Re-tag now has its own scoped lookup and Full Rip always had one, so the
+    MetadataPanel is a modal everywhere and a tab nowhere.
+    """
     from gui.main_window import MainWindow
 
     w = MainWindow()
     labels = [w.tabs.tabText(i) for i in range(w.tabs.count())]
-    # Full Rip stays the landing tab: opening on Record would seize the audio
-    # device on every launch, for someone who may only want to re-tag.
-    assert labels == ["Full Rip", "Record", "Convert", "Re-tag", "Metadata", "Settings"]
+    assert labels == ["Record", "Full Rip", "Convert", "Re-tag", "Settings"]
+    assert "Metadata" not in labels
+
+
+def test_the_app_opens_on_the_record_tab_with_its_meters_live(qapp):
+    """Landing on Record is only half of it -- a Record tab whose meters are
+    dormant is exactly the "shown but asleep" state the reorder exists to fix.
+    currentChanged does not fire for index 0, so this catches the tab being
+    visible without ever having been activated.
+    """
+    from gui.main_window import MainWindow
+
+    w = MainWindow()
+    assert w.tabs.currentWidget() is w.record_tab
+    # Activation happens on show, not construction: a window nobody has seen
+    # has nothing to meter and must not reach for the audio device.
+    assert not w.record_tab._active
+    w.show()
+    qapp.processEvents()
+    assert w.record_tab._active, "the Record tab was shown but never activated"
+    w.close()
+
+
+def test_the_window_no_longer_owns_a_standalone_metadata_panel(qapp):
+    """The tab, the instance and the fan-out all go; the class stays.
+
+    MetadataPanel is still the reused lookup modal (Record, Re-tag, Full Rip),
+    so this asserts the *window* dropped its full-page copy -- not that the
+    class was deleted.
+    """
+    from gui.main_window import MainWindow
+
+    w = MainWindow()
+    assert not hasattr(w, "metadata_panel")
+    # ...and the "apply to whichever panel was visited last" fan-out with it.
+    assert not hasattr(w, "_last_batch_panel")
+    assert not hasattr(w, "_on_release_selected")
+
+
+def test_the_record_to_rip_bridge_targets_full_rip_by_identity(qapp):
+    """The bridge must survive a tab reorder.
+
+    It switches by widget, not by a hardcoded index -- which is the whole
+    reason moving Full Rip from position 0 to position 1 did not break it.
+    """
+    from gui.main_window import MainWindow
+
+    w = MainWindow()
+    w._on_process_album_requested()
+    assert w.tabs.currentWidget() is w.full_rip
 
 
 def test_full_rip_accept_gating_and_override(qapp):
@@ -556,6 +612,10 @@ def test_default_layout_gives_the_review_area_room(qapp):
 
     w = MainWindow()
     w.resize(1280, 956)                      # what a 1080p desktop gets
+    # Full Rip is tab 2 since the pipeline reorder, and Qt only lays out the
+    # *selected* tab -- without this both group boxes report an unlaid-out
+    # default and the comparison is meaningless rather than false.
+    w.tabs.setCurrentWidget(w.full_rip)
     w.show()
     qapp.processEvents()
     fr = w.full_rip
@@ -570,9 +630,14 @@ def test_default_layout_gives_the_review_area_room(qapp):
     assert fr.waveform.height() >= 190
     assert fr.waveform.height() > fr.table.height()
 
-    # The log is present but minimal -- it must not own the window.
+    # The log is collapsed by default now -- the status strip carries the state
+    # and this is the escape hatch. When it *is* opened it must still be
+    # minimal: present, and not owning the window.
+    assert w._main_splitter.sizes()[1] == 0, "the log should start collapsed"
+    w.set_log_visible(True)
+    qapp.processEvents()
     tabs_h, log_h = w._main_splitter.sizes()
-    assert log_h > 0                          # still visible
+    assert log_h > 0                          # visible once asked for
     assert log_h < tabs_h * 0.15              # ...and out of the way
     w.close()
 
@@ -608,6 +673,7 @@ def test_persisted_splitter_sizes_still_win_over_defaults(qapp):
 
     fresh = MainWindow()
     fresh.resize(1000, height)
+    fresh.set_log_visible(True)          # the pane under test must be open
     fresh.show()
     qapp.processEvents()
     default_log_fraction = fresh._main_splitter.sizes()[1] / sum(fresh._main_splitter.sizes())
@@ -618,6 +684,7 @@ def test_persisted_splitter_sizes_still_win_over_defaults(qapp):
 
     restored = MainWindow()
     restored.resize(1000, height)
+    restored.set_log_visible(True)
     restored.show()
     qapp.processEvents()
     top, bottom = restored._main_splitter.sizes()
@@ -963,10 +1030,10 @@ def test_the_merged_record_tab_carries_both_branches_controls(qapp):
 
     # capture-rate: the rate picker probes the device rather than assuming 44.1k.
     assert tab.rate_combo.isVisible()
-    # capture-rate: the gain slider sits beside the meters it moves. Existence,
+    # capture-rate: the gain fader sits under the meters it moves. Existence,
     # not visibility -- it deliberately hides itself when the Windows capture
     # endpoint can't be reached, which is the normal state on a CI box.
-    assert tab.gain_slider in tab.gain_widgets
+    assert tab.gain_fader in tab.gain_widgets
     # session-flow: the optional album row.
     assert tab.lookup_button.isVisible()
     # session-flow: the bridge, present but disarmed until something lands.
@@ -1194,6 +1261,11 @@ def test_the_record_tab_still_fits_an_800px_window(qapp):
     w.show()
     qapp.processEvents()
 
+    # Expanded deliberately: the budget question is whether the tab still
+    # leaves room for the log when someone opens it, not whether the collapsed
+    # default happens to fit.
+    w.set_log_visible(True)
+    qapp.processEvents()
     tabs_h, log_h = w._main_splitter.sizes()
     assert log_h > 0, "the log pane was squeezed out of existence"
     assert log_h < tabs_h * 0.15, "the log has taken over the window"

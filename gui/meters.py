@@ -15,6 +15,7 @@ import math
 from PySide6.QtCore import QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QLinearGradient, QPainter
 from PySide6.QtWidgets import (
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -245,30 +246,29 @@ class MeterScale(QWidget):
         painter.end()
 
 
-class ChannelRow(QWidget):
+class ChannelRow:
     """One channel: label, bar, live dBFS, and that channel's own max-hold.
 
     The numerics live *beside* the bar rather than under the pair of them,
     because the question being asked is per-channel -- a single shared "max"
     line cannot tell you which side is hot, which is the thing you need to know
     to do anything about it.
+
+    Deliberately **not** a QWidget: its four widgets are placed directly into
+    :class:`LevelMeters`' grid so that every bar and the scale beneath them
+    share one column. A row that owned its own layout could only be lined up
+    with the scale by guessing at the label's laid-out width, which was wrong by
+    6px and left the calibrated ticks not quite under the bars they annotate.
     """
 
     def __init__(self, name: str) -> None:
-        super().__init__()
         self._max_hold = float("-inf")
-
-        row = QHBoxLayout(self)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(6)
 
         self.name_label = QLabel(name)
         self.name_label.setStyleSheet("QLabel { font-weight: bold; }")
         self.name_label.setFixedWidth(12)
-        row.addWidget(self.name_label)
 
         self.bar = PeakBar()
-        row.addWidget(self.bar, 1)
 
         # Monospaced and fixed-width so the numbers do not jitter the layout as
         # they change -- a readout that shifts while you watch it is unreadable.
@@ -277,7 +277,6 @@ class ChannelRow(QWidget):
         self.peak_label.setFixedWidth(46)
         self.peak_label.setStyleSheet("QLabel { font-family: monospace; }")
         self.peak_label.setToolTip("This channel's level right now, in dBFS.")
-        row.addWidget(self.peak_label)
 
         self.hold_label = QLabel("—")
         self.hold_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -286,7 +285,10 @@ class ChannelRow(QWidget):
             "QLabel { font-family: monospace; font-weight: bold; }")
         self.hold_label.setToolTip(
             "The loudest this channel has been since the last reset.")
-        row.addWidget(self.hold_label)
+
+    def widgets(self):
+        """The four widgets, in column order, for the host grid to place."""
+        return (self.name_label, self.bar, self.peak_label, self.hold_label)
 
     def set_level(self, dbfs: float) -> None:
         self.bar.set_level(dbfs)
@@ -324,27 +326,24 @@ class LevelMeters(QWidget):
         self._bars: list[PeakBar] = []
         self._clip_runs = 0
 
-        root = QVBoxLayout(self)
+        root = QGridLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(2)
+        root.setHorizontalSpacing(6)
+        root.setVerticalSpacing(2)
+        root.setColumnStretch(1, 1)              # the bars take the slack
 
         self.rows: list[ChannelRow] = []
         for i in range(channels):
             row = ChannelRow("LR"[i] if i < 2 else str(i + 1))
             self.rows.append(row)
             self._bars.append(row.bar)
-            root.addWidget(row)
+            for column, widget in enumerate(row.widgets()):
+                root.addWidget(widget, i, column)
 
-        # The rule sits under the bars and has to line up with them, so it is
-        # indented by exactly the widths the bars are indented by.
-        scale_row = QHBoxLayout()
-        scale_row.setContentsMargins(0, 0, 0, 0)
-        scale_row.setSpacing(6)
-        scale_row.addSpacing(12)                 # the channel-name column
+        # The rule sits in the bars' own column, so it is aligned with them by
+        # construction rather than by arithmetic.
         self.scale = MeterScale()
-        scale_row.addWidget(self.scale, 1)
-        scale_row.addSpacing(46 + 6 + 52)        # the two readout columns
-        root.addLayout(scale_row)
+        root.addWidget(self.scale, channels, 1)
 
         readout = QHBoxLayout()
         # Kept for the overall session max across both channels: the per-channel
@@ -364,7 +363,7 @@ class LevelMeters(QWidget):
         self.reset_button.setToolTip("Clear the peak hold, max reading and clip latch.")
         self.reset_button.clicked.connect(self._on_reset_clicked)
         readout.addWidget(self.reset_button)
-        root.addLayout(readout)
+        root.addLayout(readout, channels + 1, 0, 1, 4)
 
     def _on_reset_clicked(self) -> None:
         self.reset()
