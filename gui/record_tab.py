@@ -873,7 +873,8 @@ class RecordTab(QWidget):
         dialog.resize(760, 640)
         layout = QVBoxLayout(dialog)
         # Pass settings through so the panel sees the user's MusicBrainz contact.
-        panel = MetadataPanel(settings=self.settings)
+        panel = MetadataPanel(settings=self.settings,
+                              store=getattr(self, 'store', None))
         panel.statusMessage.connect(self._log)
         panel.releaseSelected.connect(
             lambda detail: (self.apply_release(detail), dialog.accept()))

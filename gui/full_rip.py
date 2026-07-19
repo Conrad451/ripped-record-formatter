@@ -500,7 +500,8 @@ class FullRipTab(QWidget):
         # from it (and remembers this dialog's splitter). Without it, the lookup
         # opened from here would identify itself as having no contact even when
         # one is configured.
-        panel = MetadataPanel(settings=self.settings)
+        panel = MetadataPanel(settings=self.settings,
+                              store=getattr(self, 'store', None))
         panel.artist_edit.setText(self.artist_edit.text())
         panel.album_edit.setText(self.album_edit.text())
         panel.statusMessage.connect(self._log)

@@ -115,8 +115,11 @@ class MetadataPanel(QWidget):
     statusMessage = Signal(str)
 
     def __init__(self, provider: MetadataProvider | None = None, parent: QWidget | None = None,
-                 settings=None):
+                 settings=None, store=None):
         super().__init__(parent)
+        #: The state database, for the release cache. Optional: without one
+        #: every lookup is simply live, which is how it always worked.
+        self._store = store
         self.setWindowTitle("Album metadata lookup")
         self._provider = provider
         self._settings = settings
@@ -240,10 +243,19 @@ class MetadataPanel(QWidget):
                 if self._settings is not None
                 else ""
             )
-            self._provider = MusicBrainzProvider(
+            provider = MusicBrainzProvider(
                 contact=contact,
                 notice=self.statusMessage.emit,   # -> the host's log, once
             )
+            if self._store is not None:
+                # Wrapped, not replaced: a release already fetched is answered
+                # from disk, and anything the cache cannot do falls straight
+                # through to the live provider underneath.
+                from core.release_cache import CachingProvider
+
+                provider = CachingProvider(provider, self._store,
+                                           on_log=self.statusMessage.emit)
+            self._provider = provider
         return self._provider
 
     # -- status helper -------------------------------------------------------

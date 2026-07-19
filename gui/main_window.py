@@ -273,7 +273,8 @@ class BatchPanel(QWidget):
         # settings carries the user's MusicBrainz contact (and the panel's
         # splitter position); without it the lookup would identify itself as
         # having no contact even when one is configured.
-        panel = MetadataPanel(settings=self.settings)
+        panel = MetadataPanel(settings=self.settings,
+                              store=getattr(self, 'store', None))
         panel.artist_edit.setText(self.artist_edit.text())
         panel.album_edit.setText(self.album_edit.text())
         panel.statusMessage.connect(self.logMessage)
@@ -330,7 +331,11 @@ class MainWindow(QMainWindow):
         self.retag_panel = BatchPanel("retag", self.settings)
         self.full_rip = FullRipTab(self.settings)
         self.settings_panel = SettingsPanel(self.settings)
+        # The release cache reaches the lookup wherever it is opened from.
+        for surface in (self.convert_panel, self.retag_panel, self.full_rip):
+            surface.store = store
         self.record_tab = RecordTab(self.settings)
+        self.record_tab.store = store
         self.record_tab.logMessage.connect(self._log)
         self.record_tab.statusMessage.connect(self.set_status)
         # The payoff: a finished side walks straight into Full Rip's mapping table.
