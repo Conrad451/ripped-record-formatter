@@ -34,6 +34,8 @@ from PySide6.QtWidgets import (
 from core import config as core_config
 from core import converter
 from core.version import __version__
+from gui import status_strip
+from gui.status_strip import StatusStrip
 from gui.track_model import COL_ARTIST, Row, TrackTableModel, TrackTableView
 
 
@@ -324,6 +326,7 @@ class MainWindow(QMainWindow):
         self.settings_panel = SettingsPanel(self.settings)
         self.record_tab = RecordTab(self.settings)
         self.record_tab.logMessage.connect(self._log)
+        self.record_tab.statusMessage.connect(self.set_status)
         # The payoff: a finished side walks straight into Full Rip's mapping table.
         self.record_tab.recordingFinished.connect(self._on_recording_finished)
         self.record_tab.recordingStateChanged.connect(self._on_recording_state)
@@ -394,6 +397,17 @@ class MainWindow(QMainWindow):
         self._main_splitter.splitterMoved.connect(self._save_main_split)
         root.addWidget(self._main_splitter, 1)
 
+        # The console becomes an event surface: one plain sentence saying what
+        # is happening, with the full history one click away. Nothing is removed
+        # from logging -- every line still goes to self.log -- this is about
+        # presence, not content.
+        self.status_strip = StatusStrip()
+        self.status_strip.historyToggled.connect(self.set_log_visible)
+        root.addWidget(self.status_strip)
+
+        # Collapsed by default, and the user's choice is remembered.
+        self.set_log_visible(bool(self.settings.config.log_expanded))
+
         progress_row = QHBoxLayout()
         self.progress = QProgressBar()
         self.progress.setTextVisible(True)
@@ -425,6 +439,16 @@ class MainWindow(QMainWindow):
         the side landed (for its saved-summary line) and that *something* landed
         (which is what arms its "process this album" bridge).
         """
+        # The strip states the outcome, coloured if the capture had problems --
+        # a clipped or dropped side must not read the same as a clean one.
+        from core.timefmt import format_timestamp as _fmt
+        if result.warnings or result.clipped:
+            self.set_status(
+                f"Saved {result.path.name} — {_fmt(result.duration)}, "
+                "with warnings — see details", status_strip.WARN)
+        else:
+            self.set_status(f"Saved {result.path.name} — {_fmt(result.duration)}")
+
         path = result.path
         warnings = list(result.warnings)
         if getattr(result, "clipped", False):
@@ -473,6 +497,10 @@ class MainWindow(QMainWindow):
         self._recording = recording
         self.setStyleSheet(
             "QTabWidget::pane { border: 2px solid #c0392b; }" if recording else "")
+        if not recording:
+            # The per-frame "Recording ..." line stops arriving at Stop; without
+            # this the strip would sit on the last one forever.
+            self.status_strip.set_ready()
         self._refresh_record_state()
 
     def _on_monitoring_state(self, monitoring: bool) -> None:
@@ -508,6 +536,23 @@ class MainWindow(QMainWindow):
         # Meters run whenever the Record tab is the visible one -- so you can set
         # input gain before you ever press Record.
         self.record_tab.set_active(widget is self.record_tab)
+
+    def set_log_visible(self, visible: bool) -> None:
+        """Open or collapse the full log pane, and remember the choice.
+
+        The strip and the pane are two views of the same stream, so they are
+        kept in step here rather than each tracking its own idea of the state.
+        """
+        self.log.setVisible(bool(visible))
+        self.status_strip.set_history_visible(bool(visible))
+        self.settings.set(log_expanded=bool(visible))
+
+    def log_visible(self) -> bool:
+        return self.log.isVisible()
+
+    def set_status(self, message: str, level: str = status_strip.INFO) -> None:
+        """Say what is happening, in one line, on every tab."""
+        self.status_strip.set_status(message, level)
 
     def showEvent(self, event) -> None:
         """Activate the landing tab the first time the window is actually shown.
@@ -553,6 +598,8 @@ class MainWindow(QMainWindow):
         self.progress.setMaximum(len(tracks))
         self.progress.setValue(0)
         self._log(f"Starting: {len(tracks)} track(s) -> {output_dir}")
+        self._job_verb = "Encoding" if operation is converter.convert_wavs_to_flacs             else "Re-tagging"
+        self.set_status(f"{self._job_verb} — starting {len(tracks)} track(s)")
 
         from gui.worker import ConversionWorker
 
@@ -566,11 +613,22 @@ class MainWindow(QMainWindow):
     def _on_progress(self, current: int, total: int, name: str) -> None:
         self.progress.setMaximum(total)
         self.progress.setValue(current)
+        verb = getattr(self, "_job_verb", "Working")
+        self.set_status(f"{verb} — {current} of {total} tracks")
 
     def _on_finished(self, result) -> None:
         self._log(result.summary())
         for warning in result.warnings:
             self._log(f"  ! {warning}")
+        # A warning colours the line and stays there. The old behaviour was to
+        # write it into a collapsed console, where "it finished, with problems"
+        # and "it finished" looked identical.
+        if result.warnings:
+            n = len(result.warnings)
+            self.set_status(f"Finished with {n} warning(s) — see details",
+                            status_strip.WARN)
+        else:
+            self.set_status(result.summary())
         if self._last_output_dir is not None and Path(self._last_output_dir).is_dir():
             self.open_output_button.setEnabled(True)
         self._jobs_done()
@@ -583,6 +641,7 @@ class MainWindow(QMainWindow):
 
     def _on_error(self, message: str) -> None:
         self._log(f"ERROR: {message}")
+        self.set_status(message, status_strip.ERROR)
         self._jobs_done()
 
     def _jobs_done(self) -> None:

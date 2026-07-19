@@ -179,6 +179,10 @@ class Config:
     meta_split_top: int = 0
     meta_split_bottom: int = 0
 
+    log_expanded: bool = False
+    """Is the full log pane open? Collapsed by default: the status strip says
+    what is happening, and the history is there for when that is not enough."""
+
     # --- main window geometry (px; w/h of 0 = never saved, use default) ---
     window_x: int = 0
     window_y: int = 0

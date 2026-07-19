@@ -21,6 +21,7 @@ A, flip, record side B, and the album job is already mapped.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from pathlib import Path
 
@@ -54,7 +55,7 @@ from core.timefmt import format_timestamp
 from core.tracks import safe_part
 from gui.gain_fader import GainFader
 from gui.level_history import LevelHistoryStrip
-from gui.meters import LevelMeters
+from gui.meters import LevelMeters, format_channel_peak
 from gui.release_preview import ReleasePreview
 
 log = logging.getLogger(__name__)
@@ -178,6 +179,9 @@ class RecordTab(QWidget):
     #: "Done recording -- process this album": the user says the album is
     #: finished. A bridge to the Full Rip tab, never a trigger for processing.
     processAlbumRequested = Signal()
+    #: One plain sentence for the window's status strip. Separate from
+    #: logMessage: the log is the history, this is the present tense.
+    statusMessage = Signal(str)
 
     def __init__(self, settings) -> None:
         super().__init__()
@@ -791,6 +795,7 @@ class RecordTab(QWidget):
         if self.recording:
             self.elapsed_label.setText(format_timestamp(telemetry.elapsed_s))
             self.size_label.setText(f"{telemetry.bytes_written / 1_048_576:.1f} MB")
+            self.statusMessage.emit(self.recording_status(telemetry))
 
     # -- setup check ---------------------------------------------------------
     def _run_setup_check(self) -> None:
@@ -1045,6 +1050,22 @@ class RecordTab(QWidget):
         self.settings.set(record_next_file=advanced)
 
         self._restart_monitor()
+
+    def recording_status(self, telemetry) -> str:
+        """"Recording Side C — 2:14, peaks −8.1" -- the live status line.
+
+        Names the side rather than the file, because the side is what the user
+        is holding. The peak is the number they are watching for, so it travels
+        with the elapsed time rather than living only on the meters.
+        """
+        side = Path(self.file_edit.text().strip() or "this side").stem
+        elapsed = format_timestamp(telemetry.elapsed_s)
+        peaks = [p for p in telemetry.peaks_dbfs if p is not None]
+        loudest = max(peaks) if peaks else None
+        if loudest is None or math.isinf(loudest) or math.isnan(loudest):
+            return f"Recording {side} — {elapsed}"
+        return (f"Recording {side} — {elapsed}, "
+                f"peaks {format_channel_peak(loudest)}")
 
     def _report(self, result) -> None:
         peak = ("—" if result.max_peak_dbfs in (None, float("-inf"))

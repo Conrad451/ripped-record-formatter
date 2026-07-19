@@ -630,9 +630,14 @@ def test_default_layout_gives_the_review_area_room(qapp):
     assert fr.waveform.height() >= 190
     assert fr.waveform.height() > fr.table.height()
 
-    # The log is present but minimal -- it must not own the window.
+    # The log is collapsed by default now -- the status strip carries the state
+    # and this is the escape hatch. When it *is* opened it must still be
+    # minimal: present, and not owning the window.
+    assert w._main_splitter.sizes()[1] == 0, "the log should start collapsed"
+    w.set_log_visible(True)
+    qapp.processEvents()
     tabs_h, log_h = w._main_splitter.sizes()
-    assert log_h > 0                          # still visible
+    assert log_h > 0                          # visible once asked for
     assert log_h < tabs_h * 0.15              # ...and out of the way
     w.close()
 
@@ -668,6 +673,7 @@ def test_persisted_splitter_sizes_still_win_over_defaults(qapp):
 
     fresh = MainWindow()
     fresh.resize(1000, height)
+    fresh.set_log_visible(True)          # the pane under test must be open
     fresh.show()
     qapp.processEvents()
     default_log_fraction = fresh._main_splitter.sizes()[1] / sum(fresh._main_splitter.sizes())
@@ -678,6 +684,7 @@ def test_persisted_splitter_sizes_still_win_over_defaults(qapp):
 
     restored = MainWindow()
     restored.resize(1000, height)
+    restored.set_log_visible(True)
     restored.show()
     qapp.processEvents()
     top, bottom = restored._main_splitter.sizes()
@@ -1254,6 +1261,11 @@ def test_the_record_tab_still_fits_an_800px_window(qapp):
     w.show()
     qapp.processEvents()
 
+    # Expanded deliberately: the budget question is whether the tab still
+    # leaves room for the log when someone opens it, not whether the collapsed
+    # default happens to fit.
+    w.set_log_visible(True)
+    qapp.processEvents()
     tabs_h, log_h = w._main_splitter.sizes()
     assert log_h > 0, "the log pane was squeezed out of existence"
     assert log_h < tabs_h * 0.15, "the log has taken over the window"

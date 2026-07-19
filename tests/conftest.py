@@ -51,6 +51,28 @@ class _SilentStream:
 
 
 @pytest.fixture(autouse=True)
+def unremembered_ui_preferences():
+    """Remembered UI state must not leak from one test into the next.
+
+    The config file is isolated from the *user*, but it is still shared across
+    the session -- so a test that expands the log pane changes what "the
+    default" looks like for every test after it. Preferences whose whole job is
+    to persist are reset per test; the tests that care about persistence set
+    them explicitly and still see it work within their own run.
+    """
+    from core import config as core_config
+
+    saved = core_config.load()
+    previous = saved.log_expanded
+    saved.log_expanded = False
+    core_config.save(saved)
+    yield
+    restored = core_config.load()
+    restored.log_expanded = previous
+    core_config.save(restored)
+
+
+@pytest.fixture(autouse=True)
 def silent_audio_hardware(monkeypatch):
     """No test opens a real device unless it deliberately does.
 
