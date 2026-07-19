@@ -66,6 +66,7 @@ class AlbumSummaryCard(QFrame):
         self._on_dismiss = None
         self._on_rerun = None
         self._on_redo_side = None
+        self._on_open_collection = None
 
         # Rebuilt on every render(); exposed for tests and callers.
         self.title_label: QLabel | None = None
@@ -76,6 +77,7 @@ class AlbumSummaryCard(QFrame):
         #: One "Re-do this side..." button per side line, by side index.
         self.redo_buttons: dict[int, QPushButton] = {}
         self.warnings_button: QPushButton | None = None
+        self.collection_button: QPushButton | None = None
         self.warnings_list: QLabel | None = None
 
     # -- rendering ----------------------------------------------------------- #
@@ -90,6 +92,7 @@ class AlbumSummaryCard(QFrame):
         on_dismiss=None,
         on_rerun=None,
         on_redo_side=None,
+        on_open_collection=None,
     ) -> None:
         """Populate the card from ``summary``. Safe to call repeatedly.
 
@@ -101,6 +104,7 @@ class AlbumSummaryCard(QFrame):
         self._on_dismiss = on_dismiss
         self._on_rerun = on_rerun
         self._on_redo_side = on_redo_side
+        self._on_open_collection = on_open_collection
         _clear_layout(self._root)
         self.side_labels = []
         self.restoration_labels = []
@@ -230,6 +234,23 @@ class AlbumSummaryCard(QFrame):
 
         total = QLabel(f"{format_size(summary.total_bytes)} on disk")
         footer.addWidget(total, 0, Qt.AlignmentFlag.AlignRight)
+
+        # The ledger's other door, on the receipt where its newest entry was
+        # just born -- which is also where "have I done the rest of this box
+        # yet?" is most likely to occur to someone.
+        if self._on_open_collection is not None:
+            self.collection_button = QPushButton("View collection…")
+            self.collection_button.setFlat(True)
+            self.collection_button.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.collection_button.setStyleSheet(
+                "QPushButton { border: none; color: palette(link); "
+                "text-decoration: underline; padding: 0 6px; }")
+            self.collection_button.setToolTip(
+                "Which records you have ripped, and which you still mean to. "
+                "This one has just been added.")
+            self.collection_button.clicked.connect(
+                lambda: self._on_open_collection())
+            footer.addWidget(self.collection_button, 0, Qt.AlignmentFlag.AlignRight)
         return footer
 
     def _build_warnings(self, summary) -> None:

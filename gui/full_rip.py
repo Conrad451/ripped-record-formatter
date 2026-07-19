@@ -136,6 +136,8 @@ class FullRipTab(QWidget):
     #: One plain sentence for the window's status strip. Separate from
     #: logMessage: the log is the history, this is the present tense.
     statusMessage = Signal(str)
+    #: The receipt's door to the ledger. The window owns the dialog.
+    openCollectionRequested = Signal()
     #: The between-albums clean slate ran (9.7). Other tabs holding session state
     #: -- the Record tab's declared album -- clear themselves off this.
     identityReset = Signal()
@@ -1543,6 +1545,15 @@ class FullRipTab(QWidget):
             album.shutdown(wait=False)
         session_journal.finish(getattr(self, "store", None), self._session_id)
         self._session_id = None
+        if summary.done and self._redoing_side is None:
+            from core import collection
+
+            collection.register_ripped(
+                getattr(self, "store", None),
+                artist=self._album_meta.get("artist", ""),
+                title=self._album_meta.get("album", ""),
+                destination=self._album_output_root,
+                release_mbid=self._release.release_id if self._release else "")
 
         self._album_review_index = None
         self.cancel_album_btn.setEnabled(False)
@@ -1629,6 +1640,7 @@ class FullRipTab(QWidget):
             on_dismiss=self._dismiss_summary_card,
             on_rerun=self._run_album_again,
             on_redo_side=self._redo_side_from_card,
+            on_open_collection=self.openCollectionRequested.emit,
         )
         self.empty_state.setVisible(False)
         self.review_box.setVisible(False)

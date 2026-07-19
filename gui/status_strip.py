@@ -79,6 +79,16 @@ class StatusStrip(QWidget):
             "Show the full log. Everything is still recorded either way.")
         self.history_button.toggled.connect(self._on_history_toggled)
         row.addWidget(self.history_button)
+        self._row = row
+
+    def add_action(self, widget) -> None:
+        """Put a standing affordance in this row, before "Show details".
+
+        The strip is where ambient utilities live -- things that are always
+        available and never part of the current step. Kept to the left of the
+        history toggle so that toggle stays the rightmost, where it has been.
+        """
+        self._row.insertWidget(self._row.count() - 1, widget)
 
     # -- state --------------------------------------------------------------
     def set_status(self, message: str, level: str = INFO) -> None:

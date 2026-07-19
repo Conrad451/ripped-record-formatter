@@ -382,6 +382,7 @@ class MainWindow(QMainWindow):
 
         self.full_rip.logMessage.connect(self._log)
         self.full_rip.statusMessage.connect(self.set_status)
+        self.full_rip.openCollectionRequested.connect(self.open_collection)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         #: The Record tab is activated on first show, not here -- see showEvent.
         self._activated_landing_tab = False
@@ -424,6 +425,19 @@ class MainWindow(QMainWindow):
         # presence, not content.
         self.status_strip = StatusStrip()
         self.status_strip.historyToggled.connect(self.set_log_visible)
+        # The standing door to the ledger. This row is already where ambient
+        # utilities live, and a collection reachable only in the minutes after a
+        # rip finishes would be a notification rather than a ledger.
+        self.collection_button = QPushButton("Collection")
+        self.collection_button.setFlat(True)
+        self.collection_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.collection_button.setStyleSheet(
+            "QPushButton { border: none; color: palette(link); "
+            "text-decoration: underline; padding: 0 6px; }")
+        self.collection_button.setToolTip(
+            "Which records you have ripped, and which you still mean to.")
+        self.collection_button.clicked.connect(self.open_collection)
+        self.status_strip.add_action(self.collection_button)
         root.addWidget(self.status_strip)
 
         # Collapsed by default, and the user's choice is remembered.
@@ -597,6 +611,12 @@ class MainWindow(QMainWindow):
         self._pending_journal = None
         session_journal.close_all_open(self.store)
         self._log("Resume: discarded. Nothing on disk was touched.")
+
+    def open_collection(self) -> None:
+        """Both doors arrive here: the status row, and the album receipt."""
+        from gui.collection_view import CollectionDialog
+
+        CollectionDialog(self.store, self).exec()
 
     def set_log_visible(self, visible: bool) -> None:
         """Open or collapse the full log pane, and remember the choice.
