@@ -72,6 +72,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
 
+from core import proc
 from core.batch import run_batch
 
 # on_progress(current, total, name) -- current is 1-based and counts tracks that
@@ -223,13 +224,13 @@ def has_libmp3lame(ffmpeg: str | Path) -> bool:
     bundles from now. A build without it is a clear error, not a mystery.
     """
     try:
-        proc = subprocess.run(
+        completed = proc.run(
             [str(ffmpeg), "-hide_banner", "-encoders"],
             capture_output=True, text=True, check=False,
         )
     except OSError:
         return False
-    return "libmp3lame" in (proc.stdout or "") + (proc.stderr or "")
+    return "libmp3lame" in (completed.stdout or "") + (completed.stderr or "")
 
 
 def assert_libmp3lame(ffmpeg: str | Path) -> None:
@@ -440,15 +441,15 @@ def export_mp3(
         dest = out_dir / mp3_name(source)
         outcome = ExportOutcome(source=source, output_path=dest)
 
-        proc = subprocess.run(
+        completed = proc.run(
             encode_args(ffmpeg, source, dest, quality),
             capture_output=True, text=True, check=False,
         )
-        if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "").strip().splitlines()
             outcome.warnings.append(
                 f"Could not encode {source.name}: "
-                f"{detail[-1] if detail else f'ffmpeg exited {proc.returncode}'}"
+                f"{detail[-1] if detail else f'ffmpeg exited {completed.returncode}'}"
             )
             return outcome
 

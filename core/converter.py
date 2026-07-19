@@ -16,6 +16,7 @@ Fixes carried over from the original ``v2/wav_to_flac.py``:
 
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable
@@ -169,6 +170,33 @@ class BatchResult:
         return msg
 
 
+def _place_audio(source: Path, dest: Path) -> None:
+    """Put ``source``'s bytes at ``dest``, without decoding them.
+
+    Three cases, and the middle one is the reason this exists.
+
+    * **Same file.** Nothing to move; the tag write that follows edits it in
+      place, which is what re-tagging a folder in place should mean.
+    * **Same folder, new name.** The file is *renamed*, not copied. Copying left
+      the old generation sitting beside the new one -- 28 files in a folder that
+      holds 14 -- and a re-tag is supposed to update a library, not fork it.
+    * **Different folder.** Copied, leaving the source untouched, because the
+      user asked for the result somewhere else and did not ask to lose the
+      original.
+
+    ``copy2``/``replace`` preserve the bytes exactly; no decoder is involved.
+    """
+    if source.resolve() == dest.resolve():
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if source.parent.resolve() == dest.parent.resolve():
+        # Atomic within a filesystem: the destination either is the old file or
+        # is the new one, never a half-written third thing.
+        source.replace(dest)
+        return
+    shutil.copy2(source, dest)
+
+
 def _prepare_output_dir(output_dir: Path) -> Path:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -282,26 +310,37 @@ def retag_flacs(
     from the source and carried forward unchanged. A source with no RRF fields
     stays un-stamped.
     """
-    if configure:
-        from core.ffmpeg_locator import configure_pydub
-
-        configure_pydub()
-    from pydub import AudioSegment
-
+    # Deliberately no pydub, and no ffmpeg: re-tagging does not decode audio,
+    # so it does not need an audio library. ``configure`` is accepted for
+    # signature compatibility with convert_wavs_to_flacs and is now a no-op.
     out_dir = _prepare_output_dir(output_dir)
 
     def work(track):
         source = Path(track.track_wav_loc)
         dest = out_dir / track.filename()
-        # Read provenance from the source *before* export overwrites it (dest may
+        # Read provenance from the source *before* anything is written (dest may
         # resolve to the same path). Best-effort: a read failure just means no
         # RRF is carried, never a failed re-tag.
         try:
             preserved_rrf = _read_rrf(source)
         except Exception:
             preserved_rrf = {}
-        audio = AudioSegment.from_file(str(source), "flac")
-        audio.export(str(dest), format="flac", tags=track.tags())
+
+        # The audio is *copied*, never decoded and re-encoded.
+        #
+        # This used to run the file through AudioSegment.from_file() and
+        # .export(), which rebuilds the entire container: it re-compresses at
+        # pydub's default level, discards the source's own layout, and puts an
+        # audio codec in the path of an operation that has no business touching
+        # audio. A field incident produced FLACs that Windows Media Player would
+        # not open at all (0xC00D36C4) -- and even where the result was
+        # readable, the file was wholly rewritten, so every byte was exposed to
+        # whatever the encode path did.
+        #
+        # A re-tag changes metadata. Copying the bytes and rewriting the tag
+        # blocks makes the audio bit-identical by construction rather than by
+        # luck, and removes the encoder from the operation entirely.
+        _place_audio(source, dest)
         outcome = TrackOutcome(track=track, output_path=dest)
         try:
             _write_vorbis_tags(dest, {**track.vorbis_tags(), **preserved_rrf})

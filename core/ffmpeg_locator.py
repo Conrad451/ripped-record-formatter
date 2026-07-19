@@ -33,6 +33,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from core import proc
+
 try:
     import ffmpeg_downloader as ffdl
 except Exception:            # not shipped in the frozen bundle -- it is not needed
@@ -118,7 +120,7 @@ def download_ffmpeg() -> None:
     if ffdl is None:
         raise FFmpegNotAvailable(
             "ffmpeg is not bundled and ffmpeg-downloader is unavailable.")
-    subprocess.run(
+    proc.run(
         [sys.executable, "-m", "ffmpeg_downloader", "install", "-y"],
         check=True,
     )
@@ -181,6 +183,7 @@ def configure_pydub(auto_download: bool = True) -> Path:
     (used for encoding) and prepend the binary's directory to ``PATH`` for this
     process (pydub discovers ffprobe via a PATH lookup when probing media).
     """
+    proc.silence_pydub()   # pydub spawns ffmpeg itself; keep those quiet too
     from pydub import AudioSegment
 
     ffmpeg, ffprobe = ensure_ffmpeg(auto_download=auto_download)
