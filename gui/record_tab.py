@@ -902,14 +902,22 @@ class RecordTab(QWidget):
         self._folder_hand_edited = True
 
     def _folder_root(self) -> str:
-        """The trunk that derived folders hang off.
+        """The trunk that derived recording folders hang off.
 
-        The configured output root wins; failing that, whatever folder the tab is
-        already pointed at. Suggestions are never written back to settings, so
-        this stays a root rather than creeping down into the last album's folder.
+        The **WAV root**, not the FLAC root. This used to derive from
+        ``default_output_dir`` -- the finished-library root -- so a capture
+        offered to save itself into the tree of finished FLACs, and the
+        stakeholder was correcting the path by hand every session. The raw WAV
+        is the master and lives with masters; the finished library is a
+        different place with a different lifecycle, and only Full Rip writes
+        there.
+
+        Falls back to whatever folder the tab is already pointed at. Suggestions
+        are never written back to settings, so this stays a root rather than
+        creeping down into the last album's folder.
         """
         cfg = self.settings.config
-        return (cfg.default_output_dir or cfg.record_output_dir
+        return (cfg.default_source_dir or cfg.record_output_dir
                 or self.folder_edit.text().strip())
 
     def _suggest_folder(self) -> None:

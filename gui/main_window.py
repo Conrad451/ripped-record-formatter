@@ -299,8 +299,13 @@ class BatchPanel(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, store=None) -> None:
         super().__init__()
+        #: The state database, or None when running without one. Optional on
+        #: purpose: state is recoverable, so the window must come up and work
+        #: with no store at all -- that is the path tests take, and the path a
+        #: user takes if rrf.db cannot be opened.
+        self.store = store
         self.setWindowTitle(f"Ripped Record Formatter {__version__}")
         # Default geometry follows the screen rather than a hardcoded 920x760,
         # which squeezed the Full Rip tab (source group + metadata + waveform +

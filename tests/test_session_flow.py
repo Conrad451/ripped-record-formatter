@@ -321,13 +321,18 @@ def test_names_from_musicbrainz_are_made_safe_for_windows(qapp):
 # 1a / 1d -- folders are offered, never forced
 # --------------------------------------------------------------------------- #
 def test_the_folder_suggestion_follows_the_root_and_stays_editable(qapp, tmp_path):
-    """{root}/{Artist}/{Album}, prefilled and freely overtypeable."""
+    """{WAV root}/{Artist}/{Album}, prefilled and freely overtypeable.
+
+    Derives from the *WAV* root since v3.0.0. It used to follow the FLAC root,
+    so captures were offered a home inside the finished-library tree and the
+    stakeholder corrected the path by hand every session.
+    """
     from gui.main_window import MainWindow
 
     w = MainWindow()
     tab = w.record_tab
-    root = str(tmp_path / "Rips")
-    tab.settings.set(default_output_dir=root)
+    root = str(tmp_path / "WAVs")
+    tab.settings.set(default_source_dir=root)
 
     tab.apply_release(_release())
 
@@ -336,7 +341,7 @@ def test_the_folder_suggestion_follows_the_root_and_stays_editable(qapp, tmp_pat
     assert tab.folder_edit.isReadOnly() is False      # an offer, not a fact
 
     # And the trunk stays a trunk -- the derived path is not written back as one.
-    assert tab.settings.config.default_output_dir == root
+    assert tab.settings.config.default_source_dir == root
 
 
 def test_the_suggestion_never_overwrites_a_hand_entered_path(qapp, tmp_path):
@@ -529,3 +534,40 @@ def test_nothing_in_this_flow_ever_starts_processing(qapp, tmp_path, monkeypatch
 
     assert started == []                              # the user starts albums
     assert w.full_rip._album is None
+
+
+def test_captures_are_offered_the_wav_root_never_the_flac_library(qapp, tmp_path):
+    """The field finding, as a regression guard.
+
+    The raw WAV is the master and belongs with masters. The finished library is
+    a different place with a different lifecycle, and only Full Rip writes
+    there -- so a capture must never default into it.
+    """
+    from gui.main_window import MainWindow
+
+    tab = MainWindow().record_tab
+    wav_root = str(tmp_path / "WAVs")
+    flac_root = str(tmp_path / "Library")
+    tab.settings.set(default_source_dir=wav_root, default_output_dir=flac_root)
+
+    tab.apply_release(_release())
+
+    suggested = tab.folder_edit.text()
+    assert suggested.startswith(wav_root), suggested
+    assert flac_root not in suggested, "a capture was aimed at the finished library"
+
+
+def test_with_no_wav_root_the_suggestion_does_not_fall_back_to_the_library(
+        qapp, tmp_path):
+    """Better to suggest nothing than to suggest the wrong tree."""
+    from gui.main_window import MainWindow
+
+    tab = MainWindow().record_tab
+    flac_root = str(tmp_path / "Library")
+    tab.settings.set(default_source_dir="", default_output_dir=flac_root,
+                     record_output_dir="")
+    tab.folder_edit.setText("")
+
+    tab.apply_release(_release())
+
+    assert flac_root not in tab.folder_edit.text()

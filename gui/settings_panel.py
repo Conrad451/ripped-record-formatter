@@ -130,18 +130,23 @@ class SettingsPanel(QWidget):
         # ---------------- Default folders ----------------
         folders_box = QGroupBox("Default folders")
         folders = QFormLayout(folders_box)
-        folders.addRow("Default source folder:",
+        # Named for what lives in them, not for which field they populate. The
+        # two roots have genuinely different jobs -- one holds masters you keep
+        # forever, the other holds the library you play -- and calling them
+        # "source" and "output" made that a thing you had to already know.
+        folders.addRow("WAV root (recordings & masters):",
                        self._folder_row("default_source_dir", cfg.default_source_dir))
-        folders.addRow("When an album finishes, the source folder:",
+        folders.addRow("When an album finishes, the WAV root:",
                        self._policy_combo("source_post_album_policy", cfg.source_post_album_policy))
-        folders.addRow("Default output folder:",
+        folders.addRow("FLAC root (finished library):",
                        self._folder_row("default_output_dir", cfg.default_output_dir))
-        folders.addRow("When an album finishes, the output folder:",
+        folders.addRow("When an album finishes, the FLAC root:",
                        self._policy_combo("output_post_album_policy", cfg.output_post_album_policy))
         folders_hint = QLabel(
-            "The Artist/Album and the looked-up release are always cleared when an "
-            "album finishes -- no default is safe for identity. Only these folders "
-            "follow a policy.")
+            "Recordings are saved under the WAV root; finished FLACs go under the "
+            "FLAC root. The Artist/Album and the looked-up release are always "
+            "cleared when an album finishes -- no default is safe for identity. "
+            "Only these folders follow a policy.")
         folders_hint.setWordWrap(True)
         apply_muted(folders_hint)
         folders.addRow(folders_hint)
