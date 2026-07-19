@@ -49,3 +49,6 @@ SOURCE.txt
 
 # Release artifacts built by PyInstaller; attached to the GitHub release, never committed.
 *.zip
+# ...and the zip extracted in place, which is what verifying a release looks
+# like. Byte-reproducible from the zip beside it, so it is output, not source.
+RippedRecordFormatter-*-win64/
