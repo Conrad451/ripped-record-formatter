@@ -1023,10 +1023,10 @@ def test_the_merged_record_tab_carries_both_branches_controls(qapp):
 
     # capture-rate: the rate picker probes the device rather than assuming 44.1k.
     assert tab.rate_combo.isVisible()
-    # capture-rate: the gain slider sits beside the meters it moves. Existence,
+    # capture-rate: the gain fader sits under the meters it moves. Existence,
     # not visibility -- it deliberately hides itself when the Windows capture
     # endpoint can't be reached, which is the normal state on a CI box.
-    assert tab.gain_slider in tab.gain_widgets
+    assert tab.gain_fader in tab.gain_widgets
     # session-flow: the optional album row.
     assert tab.lookup_button.isVisible()
     # session-flow: the bridge, present but disarmed until something lands.

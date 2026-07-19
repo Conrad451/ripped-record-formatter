@@ -562,7 +562,7 @@ class _FakeEndpoint:
         self.level = value
 
 
-def test_gain_slider_round_trips_a_mocked_endpoint(qapp, no_hardware, monkeypatch):
+def test_gain_fader_round_trips_a_mocked_endpoint(qapp, no_hardware, monkeypatch):
     """The slider reflects the endpoint's level, drives it on move, and persists
     the setting per device name."""
     import gui.record_tab as tab_mod
@@ -578,16 +578,16 @@ def test_gain_slider_round_trips_a_mocked_endpoint(qapp, no_hardware, monkeypatc
     tab.device_combo.setCurrentIndex(_idx_by_name(tab.device_combo, "USB Microphone"))
     tab._on_device_changed()
 
-    assert tab.gain_slider.isVisibleTo(tab)
-    assert tab.gain_slider.value() == 50          # reads the endpoint's current level
+    assert tab.gain_fader.isVisibleTo(tab)
+    assert tab.gain_fader.value() == 50          # reads the endpoint's current level
 
-    tab.gain_slider.setValue(80)                  # move it
+    tab.gain_fader.slider.setValue(80)                  # move it
     assert abs(ep.level - 0.80) < 1e-9            # drove the Windows level
     name = tab.current_device().name
     assert abs(tab.settings.config.record_input_levels[name] - 0.80) < 1e-9  # remembered
 
 
-def test_gain_slider_restores_a_remembered_level(qapp, no_hardware, monkeypatch):
+def test_gain_fader_restores_a_remembered_level(qapp, no_hardware, monkeypatch):
     """A device with a saved level pushes it back to Windows on selection."""
     import gui.record_tab as tab_mod
     from core.input_gain import EndpointGain
@@ -602,11 +602,11 @@ def test_gain_slider_restores_a_remembered_level(qapp, no_hardware, monkeypatch)
     tab.device_combo.setCurrentIndex(_idx_by_name(tab.device_combo, "USB Microphone"))
     tab._on_device_changed()   # explicit: the combo may already sit on this device
 
-    assert tab.gain_slider.value() == 90          # slider shows the saved value
+    assert tab.gain_fader.value() == 90          # slider shows the saved value
     assert abs(ep.level - 0.90) < 1e-9            # and it was pushed to the endpoint
 
 
-def test_gain_slider_hidden_when_endpoint_inaccessible(qapp, no_hardware):
+def test_gain_fader_hidden_when_endpoint_inaccessible(qapp, no_hardware):
     """No reachable endpoint (the autouse stub returns None) -> slider hidden,
     no crash."""
     from gui.main_window import MainWindow
@@ -614,7 +614,7 @@ def test_gain_slider_hidden_when_endpoint_inaccessible(qapp, no_hardware):
     tab = MainWindow().record_tab
     tab.device_combo.setCurrentIndex(_idx_by_name(tab.device_combo, "USB Microphone"))
     tab._on_device_changed()
-    assert not tab.gain_slider.isVisibleTo(tab)
+    assert not tab.gain_fader.isVisibleTo(tab)
     assert tab._gain is None
 
 
@@ -746,3 +746,70 @@ def test_a_monitor_open_failure_is_plain_words_not_a_portaudio_error(
     assert "Refresh" in line                         # ...and what to do
     assert "PaErrorCode" not in line and "-9992" not in line
     assert not tab.monitor_check.isChecked()         # toggle reset, cleanly
+
+
+# --------------------------------------------------------------------------- #
+# 9.16 item 1: the capture destination is never ambiguous
+# --------------------------------------------------------------------------- #
+def test_the_resolved_destination_is_shown_before_recording(qapp, tmp_path):
+    """A stakeholder could not identify the output folder from a screenshot of
+    this very tab. A folder box and a name box are two halves of a path the
+    user was left to assemble mentally."""
+    from gui.main_window import MainWindow
+
+    tab = MainWindow().record_tab
+    tab.folder_edit.setText(str(tmp_path))
+    tab.file_edit.setText("SideB.wav")
+
+    # full_text() is authoritative -- the visible text is elided to the widget's
+    # width, and the tooltip carries the whole path.
+    shown = tab.destination_label.full_text()
+    assert shown.startswith("→ ")
+    assert str(tmp_path / "SideB.wav") in shown
+    # It cannot disagree with the file that actually gets written.
+    assert str(tab.destination()) in shown
+    assert tab.destination_label.toolTip() == str(tab.destination())
+
+
+def test_the_destination_follows_the_folder_the_name_and_the_album(qapp, tmp_path):
+    """Live, from every input that can move the path -- including the album
+    suggestion and the automatic side advance, which set the fields in code."""
+    from gui.main_window import MainWindow
+
+    tab = MainWindow().record_tab
+    tab.folder_edit.setText(str(tmp_path))
+    tab.file_edit.setText("SideA.wav")
+    assert "SideA.wav" in tab.destination_label.full_text()
+
+    tab.file_edit.setText("SideB.wav")               # the post-stop advance
+    assert "SideB.wav" in tab.destination_label.full_text()
+
+    other = tmp_path / "Elsewhere"
+    tab.folder_edit.setText(str(other))              # an album suggestion
+    assert str(other / "SideB.wav") in tab.destination_label.full_text()
+
+    # The extension the field does not make you type is resolved too.
+    tab.file_edit.setText("SideC")
+    assert "SideC.wav" in tab.destination_label.full_text()
+
+
+def test_the_destination_asks_for_what_is_missing(qapp):
+    from gui.main_window import MainWindow
+
+    tab = MainWindow().record_tab
+    tab.folder_edit.setText("")
+    assert "choose a folder" in tab.destination_label.full_text()
+
+
+def test_a_long_path_stays_one_line_and_keeps_both_ends(qapp):
+    """A NAS path is easily wider than the tab, and this row has no budget to
+    wrap into. The drive and the file name are what identify it."""
+    from gui.record_tab import ElidedPathLabel
+
+    label = ElidedPathLabel()
+    label.resize(160, 16)
+    label.setFullText(r"→ Z:\WAVs\Some Very Long Artist Name\A Long Album\SideC.wav")
+
+    assert label.full_text().endswith("SideC.wav")     # truth is preserved...
+    assert len(label.text()) < len(label.full_text())  # ...the rendering shortens
+    assert "\n" not in label.text()
