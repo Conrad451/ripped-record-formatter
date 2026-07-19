@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 
 from core import config as core_config
 from core import converter
+from core import mp3_export
 from core.version import __version__
 from gui import status_strip
 from gui.status_strip import StatusStrip
@@ -423,8 +424,8 @@ class MainWindow(QMainWindow):
         # Last, so the central widget's size hints are in place and cannot
         # argue with the frame we just restored.
         self._restore_geometry()
-        self._log("Ready. Full Rip a side, or Convert/Re-tag folders. "
-                  "Use Metadata to pull tracklists + cover art.")
+        self._log("Ready. Record a side, or open Full Rip if you already have "
+                  "the WAVs.")
 
     # --- metadata wiring ---------------------------------------------------
     def _on_recording_finished(self, result) -> None:
@@ -598,7 +599,15 @@ class MainWindow(QMainWindow):
         self.progress.setMaximum(len(tracks))
         self.progress.setValue(0)
         self._log(f"Starting: {len(tracks)} track(s) -> {output_dir}")
-        self._job_verb = "Encoding" if operation is converter.convert_wavs_to_flacs             else "Re-tagging"
+        # The strip echoes the button that was pressed. Saying "Encoding" to
+        # someone who clicked "Convert" makes the app sound like it went off and
+        # did something else.
+        if operation is converter.convert_wavs_to_flacs:
+            self._job_verb = "Converting"
+        elif operation is mp3_export.export_mp3:
+            self._job_verb = "Exporting to MP3"
+        else:
+            self._job_verb = "Re-tagging"
         self.set_status(f"{self._job_verb} — starting {len(tracks)} track(s)")
 
         from gui.worker import ConversionWorker

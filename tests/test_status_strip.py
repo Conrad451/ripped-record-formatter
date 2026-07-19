@@ -171,3 +171,37 @@ def test_a_job_error_colours_the_strip(qapp):
     assert "ffmpeg" in w.status_strip.status()
     # ...and the detail is still in the log for whoever wants it.
     assert "ffmpeg is not where we left it" in w.log.toPlainText()
+
+
+def test_the_greeting_does_not_name_a_tab_that_no_longer_exists(qapp):
+    """The app's first line to the user named the removed Metadata tab, and
+    described the app as three tools you pick between rather than one story."""
+    from gui.main_window import MainWindow
+
+    w = MainWindow()
+    first = w.log.toPlainText()
+
+    assert "Metadata" not in first
+    tabs = {w.tabs.tabText(i) for i in range(w.tabs.count())}
+    for word in ("Record", "Full Rip"):
+        assert word in tabs
+    assert "Record" in first          # points at the beginning of the pipeline
+    w.close()
+
+
+def test_the_status_verb_matches_the_button_that_was_pressed(qapp):
+    """Press "Convert", get told "Converting" -- not "Encoding".
+
+    A status line that uses a different word for the thing you just clicked
+    makes the app sound like it went off and did something else.
+    """
+    from core import converter, mp3_export
+    from gui.main_window import MainWindow
+
+    w = MainWindow()
+    for operation, expected in ((converter.convert_wavs_to_flacs, "Converting"),
+                                (mp3_export.export_mp3, "Exporting to MP3"),
+                                (converter.retag_flacs, "Re-tagging")):
+        w._run_job((operation, [], "/tmp/out", {}))
+        assert w.status_strip.status().startswith(expected), w.status_strip.status()
+    w.close()

@@ -214,7 +214,7 @@ class SettingsPanel(QWidget):
         edit.setPlaceholderText("(none)")
         edit.editingFinished.connect(
             lambda e=edit, f=field: self._save(**{f: e.text().strip()}))
-        browse = QPushButton("Browse…")
+        browse = QPushButton("Browse...")
         browse.clicked.connect(lambda _=False, e=edit, f=field: self._browse_folder(e, f))
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)

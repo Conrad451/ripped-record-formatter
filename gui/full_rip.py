@@ -412,7 +412,7 @@ class FullRipTab(QWidget):
         review.addWidget(self.gap_box)
 
         ctl = QHBoxLayout()
-        add_btn = QPushButton("Add split at center")
+        add_btn = QPushButton("Add split at centre")
         add_btn.clicked.connect(self.waveform.add_marker_at_center)
         ctl.addWidget(add_btn)
         self.override_check = QCheckBox("Split into fewer tracks anyway")
