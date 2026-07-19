@@ -29,6 +29,8 @@ from __future__ import annotations
 import re
 import threading
 import traceback
+import atexit
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -449,6 +451,35 @@ StateCallback = Callable[[SideJob], None]
 FinishedCallback = Callable[["AlbumSummary"], None]
 
 
+#: Every controller that has not been shut down. Weak, so it never keeps one
+#: alive; it exists purely so shutdown_all() can find pools nobody closed.
+_LIVE_CONTROLLERS: "weakref.WeakSet" = weakref.WeakSet()
+
+
+def shutdown_all(wait: bool = False) -> int:
+    """Shut down every controller still holding pools. Returns how many.
+
+    Registered with atexit, because the failure this prevents is *the process
+    not exiting*: non-daemon pool threads are joined by Python's own atexit
+    hook, so one controller nobody closed is enough to hang an application that
+    has already closed its last window. Idempotent and never raises -- it runs
+    during interpreter shutdown, where raising helps nobody.
+    """
+    closed = 0
+    for controller in list(_LIVE_CONTROLLERS):
+        try:
+            controller.shutdown(wait=wait)
+            closed += 1
+        except Exception:
+            continue
+    return closed
+
+
+# Registered before concurrent.futures' own hook would run for pools created
+# later, and harmless when everything was closed properly.
+atexit.register(shutdown_all)
+
+
 class AlbumController:
     """Pipelines a list of :class:`SideJob` s through analyse -> review -> encode."""
 
@@ -473,6 +504,14 @@ class AlbumController:
         self._side_cancel = {s.index: threading.Event() for s in sides}
         self._analysis_pool = ThreadPoolExecutor(max_workers=max(1, max_analysis_workers))
         self._encode_pool = ThreadPoolExecutor(max_workers=max(1, max_encode_workers))
+        # ThreadPoolExecutor threads are non-daemon, and Python joins every one
+        # of them from an atexit hook. A controller nobody shut down therefore
+        # keeps the *interpreter* alive -- which is why closing the window
+        # during an analysis left the process running with no window to show
+        # for it. Registered here so shutdown_all() can reach it whatever
+        # happens; a weak reference, so registration alone never keeps a
+        # finished controller alive.
+        _LIVE_CONTROLLERS.add(self)
         self._finished = False
 
     # -- completion ---------------------------------------------------------
@@ -747,5 +786,22 @@ class AlbumController:
                 self._set_state(side, SideState.CANCELLED)
 
     def shutdown(self, wait: bool = False) -> None:
+        """Stop the pools, and ask any running task to return.
+
+        ``cancel_futures`` only drops work that has not *started*: a task
+        already running cannot be interrupted from outside, and a running
+        analysis is exactly what used to keep non-daemon pool threads -- and so
+        the whole interpreter -- alive after the window had closed. So the
+        cancel flags the tasks poll are set here too.
+
+        Deliberately the flags only, not :meth:`cancel_all`: shutting the pools
+        down is a statement about the pools, and rewriting finished sides to
+        CANCELLED would make "we stopped listening" indistinguishable from "the
+        user cancelled it", including for anything reading state afterwards.
+        """
+        self._cancel_all.set()
+        for event in self._side_cancel.values():
+            event.set()
         self._analysis_pool.shutdown(wait=wait, cancel_futures=True)
         self._encode_pool.shutdown(wait=wait, cancel_futures=True)
+        _LIVE_CONTROLLERS.discard(self)

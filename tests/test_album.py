@@ -706,3 +706,80 @@ def test_measure_outputs_totals_bytes_and_duration(tmp_path):
 
     assert total_bytes == one_sec.stat().st_size + half_sec.stat().st_size
     assert abs(duration_s - 1.5) < 0.01
+
+
+# --------------------------------------------------------------------------- #
+# Teardown: a controller must never outlive the process that made it
+# --------------------------------------------------------------------------- #
+def test_a_controller_registers_itself_until_shut_down():
+    """The registry exists so nothing can be left holding pool threads.
+
+    ThreadPoolExecutor threads are non-daemon and Python joins every one from
+    its own atexit hook, so a single controller nobody closed is enough to keep
+    the interpreter alive after the last window has gone.
+    """
+    from core import album
+
+    ctrl = AlbumController([SideJob(0, "Side A", Path("a.wav"))],
+                           lambda s, c: "analysis", lambda s, c: None)
+    try:
+        assert ctrl in album._LIVE_CONTROLLERS
+    finally:
+        ctrl.shutdown(wait=True)
+    assert ctrl not in album._LIVE_CONTROLLERS
+
+
+def test_shutdown_all_closes_a_controller_nobody_closed():
+    from core import album
+
+    ctrl = AlbumController([SideJob(0, "Side A", Path("a.wav"))],
+                           lambda s, c: "analysis", lambda s, c: None)
+
+    assert album.shutdown_all(wait=True) >= 1
+    assert ctrl not in album._LIVE_CONTROLLERS
+    assert album.shutdown_all(wait=True) == 0        # idempotent
+
+
+def test_shutdown_does_not_rewrite_finished_sides_as_cancelled():
+    """Shutting the pools down is a statement about the pools.
+
+    Marking settled sides CANCELLED would make "we stopped listening"
+    indistinguishable from "the user cancelled it", for anything reading state
+    afterwards -- including a receipt.
+    """
+    ctrl = AlbumController([SideJob(0, "Side A", Path("a.wav"))],
+                           lambda s, c: "analysis", lambda s, c: None)
+    side = ctrl.sides[0]
+    ctrl.start()
+    assert _wait_until(lambda: side.state == SideState.READY)
+
+    ctrl.shutdown(wait=True)
+
+    assert side.state == SideState.READY
+
+
+def test_shutdown_asks_running_work_to_stop():
+    """cancel_futures only drops work that has not started; a running analysis
+    is what actually kept the process alive."""
+    import threading
+
+    started = threading.Event()
+    observed = {}
+
+    def analyze(side, should_cancel):
+        started.set()
+        for _ in range(200):
+            if should_cancel():
+                observed["cancelled"] = True
+                return "stopped"
+            time.sleep(0.01)
+        return "analysis"
+
+    ctrl = AlbumController([SideJob(0, "Side A", Path("a.wav"))],
+                           analyze, lambda s, c: None)
+    ctrl.start()
+    assert started.wait(3.0)
+
+    ctrl.shutdown(wait=True)
+
+    assert observed.get("cancelled"), "a running task was never asked to stop"

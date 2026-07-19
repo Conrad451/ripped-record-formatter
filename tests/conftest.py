@@ -98,3 +98,43 @@ def qapp_gui():
     from PySide6.QtWidgets import QApplication
 
     yield QApplication.instance() or QApplication([])
+
+
+@pytest.fixture(autouse=True)
+def no_leaked_album_controllers():
+    """Shut down any controller a test left holding thread pools.
+
+    ThreadPoolExecutor threads are non-daemon, and Python joins every one of
+    them from its own atexit hook -- so a controller nobody closed keeps the
+    *interpreter* alive after pytest has finished and exited 0. That is what
+    made the suite complete and then never release the shell.
+
+    Cleaned up per test rather than at session end so a leak is contained to the
+    test that caused it.
+    """
+    from core import album
+
+    yield
+    album.shutdown_all(wait=False)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Fail loudly if anything non-daemon outlives the run.
+
+    The class of bug this closes is invisible from inside the suite -- every
+    test passes, the process simply does not end. An assertion at the one moment
+    the answer is knowable keeps it dead.
+    """
+    import threading
+
+    from core import album
+
+    album.shutdown_all(wait=False)
+    lingering = [t for t in threading.enumerate()
+                 if t is not threading.main_thread() and not t.daemon and t.is_alive()]
+    if lingering:
+        names = ", ".join(sorted(t.name for t in lingering))
+        session.config.stash  # touch, keeps linters quiet about the unused arg
+        raise RuntimeError(
+            f"{len(lingering)} non-daemon thread(s) survived the session and "
+            f"will block interpreter exit: {names}")
