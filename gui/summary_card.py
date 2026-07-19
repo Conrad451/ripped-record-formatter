@@ -92,10 +92,14 @@ class AlbumSummaryCard(QFrame):
         self._on_rerun = on_rerun
         _clear_layout(self._root)
         self.side_labels = []
+        self.restoration_labels = []
 
         self._root.addLayout(self._build_header(summary, cover, artist, album))
         for side in summary.sides:
             self._root.addWidget(self._side_line(side))
+            restoration = self._restoration_line(side)
+            if restoration is not None:
+                self._root.addWidget(restoration)
         self._root.addLayout(self._build_footer(summary))
         self._build_warnings(summary)
 
@@ -146,6 +150,31 @@ class AlbumSummaryCard(QFrame):
         if color is not None:
             label.setStyleSheet(f"QLabel {{ color: {color}; font-weight: bold; }}")
         self.side_labels.append(label)
+        return label
+
+    def _restoration_line(self, side) -> QLabel | None:
+        """The declick receipt for a side, or ``None`` when there is none to give.
+
+        Deliberately worded in samples, because that is what ffmpeg's adeclick
+        actually reports -- "Detected clicks in 1015 of 132300 samples". It is
+        not a count of clicks and it is not a quality score: the same audio in
+        stereo reports double, since the total sums across channels. Stating the
+        denominator alongside keeps the figure honest, and keeps a big-looking
+        numerator from reading as a verdict on the record.
+
+        Hidden when the count is zero, absent, or unparsed -- a receipt for
+        nothing is noise, and "we could not read it" must never render as "0".
+        """
+        repaired = getattr(side, "declick_repaired_samples", None)
+        total = getattr(side, "declick_total_samples", None)
+        if not repaired or not total:
+            return None
+        pct = 100.0 * repaired / total
+        label = QLabel(
+            f"    Restoration: {repaired:,} of {total:,} samples declicked ({pct:.2f}%)"
+        )
+        label.setStyleSheet("QLabel { color: palette(mid); }")
+        self.restoration_labels.append(label)
         return label
 
     def _build_footer(self, summary) -> QHBoxLayout:

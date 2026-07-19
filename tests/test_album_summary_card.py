@@ -111,3 +111,47 @@ def test_dismiss_hides_card_and_calls_back(qapp):
     card.dismiss_button.click()
     assert called == [True]
     assert not card.isVisible()
+
+
+# --------------------------------------------------------------------------- #
+# Restoration receipt: shown per side, only when there is something to report
+# --------------------------------------------------------------------------- #
+def _declick_summary(*, repaired, total) -> AlbumSummary:
+    """Side A with a declick tally; Side B with none (declick was off there)."""
+    a = SideSummary(
+        index=0, label="Side A", state=SideState.DONE, track_count=2,
+        total_bytes=2_500_000, duration_s=185.0,
+        declick_repaired_samples=repaired, declick_total_samples=total,
+    )
+    b = SideSummary(index=1, label="Side B", state=SideState.DONE, track_count=3,
+                    total_bytes=3_000_000, duration_s=200.0)
+    return AlbumSummary(done=2, error=0, sides=(a, b))
+
+
+def test_restoration_line_renders_for_the_side_that_has_a_tally(qapp):
+    from gui.summary_card import AlbumSummaryCard
+
+    card = AlbumSummaryCard()
+    card.render(_declick_summary(repaired=1015, total=132300), artist="Miles Davis",
+                album="Kind of Blue", destination=Path("/tmp/out"))
+
+    texts = [label.text() for label in card.restoration_labels]
+    assert len(texts) == 1, texts          # Side B had no declick, so no line
+    assert "1,015" in texts[0] and "132,300" in texts[0]
+    assert "0.77%" in texts[0]
+    # The label must say samples. adeclick counts samples containing clicks, not
+    # clicks; calling 1,015 "clicks" would overstate it fivefold on this capture.
+    assert "samples" in texts[0]
+    assert "clicks repaired" not in texts[0]
+
+
+def test_no_restoration_line_when_nothing_was_repaired_or_declick_was_off(qapp):
+    """Zero, absent and unparsed all render as silence -- never as a '0' receipt."""
+    from gui.summary_card import AlbumSummaryCard
+
+    card = AlbumSummaryCard()
+    card.render(_declick_summary(repaired=0, total=132300), artist="A", album="B")
+    assert card.restoration_labels == []
+
+    card.render(_declick_summary(repaired=None, total=None), artist="A", album="B")
+    assert card.restoration_labels == []

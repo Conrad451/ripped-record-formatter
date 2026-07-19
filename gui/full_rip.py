@@ -1967,13 +1967,21 @@ class FullRipTab(QWidget):
         # is a placeholder; measure_outputs sizes the just-written FLACs.
         output_paths = tuple(o.output_path for o in batch.outcomes)
         total_bytes, duration_s = measure_outputs(output_paths)
+        restoration = getattr(side.analysis, "restoration", None)
         side.result = SideSummary(
             index=side.index, label=side.label, state=side.state,
             track_count=len(output_paths), output_paths=output_paths,
             total_bytes=total_bytes, duration_s=duration_s,
             warnings=tuple(batch.warnings),
             warned_tracks=sum(1 for o in batch.outcomes if o.warnings),
+            declick_repaired_samples=getattr(restoration, "declick_repaired_samples", None),
+            declick_total_samples=getattr(restoration, "declick_total_samples", None),
         )
+        if side.result.declick_repaired_samples:
+            pct = 100.0 * side.result.declick_repaired_samples / side.result.declick_total_samples
+            self._log(f"  {side.label}: declick repaired "
+                      f"{side.result.declick_repaired_samples:,} of "
+                      f"{side.result.declick_total_samples:,} samples ({pct:.2f}%).")
 
     def _cleanup_work_dir(self) -> None:
         if self._work_dir is not None:

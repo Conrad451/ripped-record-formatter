@@ -24,6 +24,7 @@ Qt thread boundary.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import tempfile
@@ -217,6 +218,22 @@ class NoiseReduction(Stage):
         _write(out_path, out.astype(np.float32, copy=False), samplerate, _INTERMEDIATE_SUBTYPE)
 
 
+#: adeclick's one statistic, as printed to stderr at the default log level:
+#:
+#:     [Parsed_adeclick_0 @ 0000...] Detected clicks in 1015 of 132300 samples (0.767196%).
+#:
+#: Note carefully what this counts: *samples in which clicks were detected*, not
+#: clicks. The two are not interchangeable and the gap is large -- a test signal
+#: with 200 injected impulses reports 1015 samples, and the identical audio in
+#: stereo reports 2030, because the total is summed across channels. Anything
+#: built on this number has to say "samples", or it is lying about the units.
+#: ``adeclip`` (a filter we do not run) prints the same line with "clips";
+#: accepted here so a future stage swap does not silently stop reporting.
+_ADECLICK_STATS = re.compile(
+    r"Detected\s+(?:clicks|clips)\s+in\s+(\d+)\s+of\s+(\d+)\s+samples", re.IGNORECASE
+)
+
+
 @dataclass
 class Declick(Stage):
     """Impulse-noise (click/pop) removal via ffmpeg's ``adeclick`` filter.
@@ -229,6 +246,14 @@ class Declick(Stage):
     """
 
     name: str = field(default="Declick", init=False)
+
+    #: Samples repaired / samples examined, read back from adeclick's own stderr
+    #: by the last :meth:`apply` call. ``None`` when the stage has not run, or
+    #: when this ffmpeg build printed no line we recognised -- an unparsed stat
+    #: is reported as unknown, never as zero, because "we could not tell" and
+    #: "there was nothing to repair" are different claims to make to a user.
+    repaired_samples: int | None = field(default=None, init=False, repr=False)
+    total_samples: int | None = field(default=None, init=False, repr=False)
 
     def apply(self, in_path: Path, out_path: Path) -> None:
         ffmpeg_path, _ = ensure_ffmpeg()
@@ -247,6 +272,22 @@ class Declick(Stage):
             raise RuntimeError(
                 f"ffmpeg adeclick failed (exit {result.returncode}):\n{result.stderr}"
             )
+        self.repaired_samples, self.total_samples = self._parse_stats(result.stderr)
+
+    @staticmethod
+    def _parse_stats(stderr: str) -> tuple[int | None, int | None]:
+        """Pull adeclick's repaired/examined sample counts out of its stderr.
+
+        Returns ``(None, None)`` when no recognised line is present, so a build
+        that words this differently degrades to silence rather than to a made-up
+        figure. The last match wins: one filter graph per run today, but a
+        future multi-input graph would print one line per instance.
+        """
+        matches = _ADECLICK_STATS.findall(stderr or "")
+        if not matches:
+            return None, None
+        repaired, total = matches[-1]
+        return int(repaired), int(total)
 
 
 # --------------------------------------------------------------------------- #
@@ -353,7 +394,28 @@ class RestorationResult:
     """Gain applied at the final write to tame an overshoot (<= 0 dB; 0 if none)."""
     source_clip_runs: int = 0
     """Full-scale runs found in the *source* -- a "clipped at rip" indicator."""
+    declick_repaired_samples: int | None = None
+    declick_total_samples: int | None = None
+    """adeclick's own tally: samples it repaired, out of samples it examined.
+
+    ``None`` when declick did not run, and also when it ran but this ffmpeg build
+    printed nothing we could read -- callers must treat absence as "unknown", not
+    as zero. These are *samples*, summed across channels, not a count of clicks;
+    see :data:`_ADECLICK_STATS` for why the distinction matters.
+    """
     warnings: list[str] = field(default_factory=list)
+
+    @property
+    def declick_percent(self) -> float | None:
+        """Repaired share as a percentage, or ``None`` when genuinely unknown.
+
+        A repaired count of zero is *known*, and returns ``0.0`` -- only a
+        missing count (declick off, or an unparsed stat) is ``None``. Callers
+        deciding whether to show a receipt should test the count, not this.
+        """
+        if self.declick_repaired_samples is None or not self.declick_total_samples:
+            return None
+        return 100.0 * self.declick_repaired_samples / self.declick_total_samples
 
 
 def restore(
@@ -428,6 +490,15 @@ def restore(
         output_path.parent.mkdir(parents=True, exist_ok=True)
         _write(output_path, data.astype(np.float32, copy=False), samplerate, source_subtype)
 
+        # Stage.apply returns None by contract, so the declick tally is read back
+        # off the instance that ran. No Declick in the list -> both stay None,
+        # which is exactly the "absent when declick was off" semantics.
+        declick_repaired = declick_total = None
+        for stage in stages:
+            if isinstance(stage, Declick):
+                declick_repaired = stage.repaired_samples
+                declick_total = stage.total_samples
+
         info = sf.info(str(output_path))
         return RestorationResult(
             output_path=output_path,
@@ -437,6 +508,8 @@ def restore(
             stages_applied=applied,
             peak_gain_db=peak_gain_db,
             source_clip_runs=source_clip_runs,
+            declick_repaired_samples=declick_repaired,
+            declick_total_samples=declick_total,
             warnings=warnings,
         )
     finally:
