@@ -20,6 +20,7 @@ rendered via :func:`core.timefmt.format_timestamp`.
 
 from __future__ import annotations
 
+import dataclasses
 import shutil
 import tempfile
 import threading
@@ -177,6 +178,10 @@ class FullRipTab(QWidget):
         self._album_output_root = ""
         self._album_meta: dict = {}
         self._album_review_index: int | None = None
+        #: Set while a scoped single-side re-do is running, so the finish
+        #: handler can report a side rather than pretending an album ran, and so
+        #: a second job can be refused with a line that names what is in the way.
+        self._redoing_side: int | None = None
         # clean-slate-between-albums
         self._recording_active = False       # a capture is under way (told by MainWindow)
         self._reset_deferred = False         # album concluded mid-recording; wait to clear
@@ -213,10 +218,15 @@ class FullRipTab(QWidget):
         self.cancel_album_btn = QPushButton("Cancel album")
         self.cancel_album_btn.setEnabled(False)
         self.cancel_album_btn.clicked.connect(self._cancel_album)
-        # A failed side used to cost the whole album. Retry re-runs just that one.
-        self.retry_side_btn = QPushButton("Retry side")
+        # One gesture for two situations: a side that failed, and a side that
+        # succeeded but came out wrong. Both mean "do this one again", and
+        # having them as separate affordances (one of them disabled all session,
+        # which reads as broken) was describing our internals rather than the
+        # user's intent.
+        self.retry_side_btn = QPushButton("Re-do side")
         self.retry_side_btn.setEnabled(False)
-        self.retry_side_btn.setToolTip("Re-run the selected failed side from scratch.")
+        self.retry_side_btn.setToolTip(
+            "Re-run the selected side from its source WAV, back through review.")
         self.retry_side_btn.clicked.connect(self._retry_selected_side)
         pick_row.addWidget(self.start_album_btn)
         pick_row.addWidget(self.retry_side_btn)
@@ -719,7 +729,7 @@ class FullRipTab(QWidget):
         self._clear_review()
         self.mapping_table.setFocus()
         self._log(f"Album: {label} unmapped - pick the right WAV for it, then "
-                  "press 'Retry side'.")
+                  "press 'Re-do side'.")
         self._update_retry_enabled()
 
     def _reselect_side(self) -> None:
@@ -1173,7 +1183,13 @@ class FullRipTab(QWidget):
         meaning.
         """
         if self._album is not None:
-            self._log("Album: already running.")
+            if self._redoing_side is not None:
+                self._log(
+                    f"Album: finish or cancel the Side "
+                    f"{side_letter(self._redoing_side)} re-do first — there is "
+                    "one review area, so one job at a time.")
+            else:
+                self._log("Album: already running.")
             return
         if not self._sides:
             self._log("Album: no sides. Look up a release or Define sides.")
@@ -1260,7 +1276,7 @@ class FullRipTab(QWidget):
             self.destination_label.setToolTip(
                 "Where this album's FLACs are being written.")
 
-    def _planned_filenames(self) -> list[str]:
+    def _planned_filenames(self, only_side: int | None = None) -> list[str]:
         """The FLAC names this job is about to write, before it writes any.
 
         Derived from the same :func:`track_filename` the encoder uses, so the
@@ -1275,6 +1291,8 @@ class FullRipTab(QWidget):
         for spec in self._sides:
             if not spec.track_indices:
                 continue
+            if only_side is not None and spec.index != only_side:
+                continue          # a per-side re-do only threatens its own files
             file_start = spec.track_indices[0] + 1
             for n, flat in enumerate(spec.track_indices):
                 title = (self._flat_titles[flat]
@@ -1289,7 +1307,7 @@ class FullRipTab(QWidget):
                 ))
         return names
 
-    def _confirm_overwrite(self, out_dir: Path) -> bool:
+    def _confirm_overwrite(self, out_dir: Path, *, only_side: int | None = None) -> bool:
         """Ask once, per job, before writing over files already in the destination.
 
         The Record tab refuses to overwrite a side outright; an album cannot, and
@@ -1297,7 +1315,8 @@ class FullRipTab(QWidget):
         user means to do. So: refuse *by default*, ask once, and name the number.
         """
         try:
-            existing = [n for n in self._planned_filenames() if (out_dir / n).exists()]
+            existing = [n for n in self._planned_filenames(only_side)
+                        if (out_dir / n).exists()]
         except OSError:
             return True                     # unreadable destination: the encode will say so
         if not existing:
@@ -1381,6 +1400,25 @@ class FullRipTab(QWidget):
         self.start_album_btn.setEnabled(not self._busy)
         self._update_retry_enabled()
 
+        redone, self._redoing_side = self._redoing_side, None
+        if redone is not None:
+            # A scoped re-do is not an album, and saying "album finished" after
+            # re-doing one side would be describing our machinery rather than
+            # what the user did.
+            letter = side_letter(redone)
+            self._log(f"Album: Side {letter} re-done. {summary.describe()}")
+            if summary.done:
+                self._log(f"  -> {self._album_output_root}")
+            # The receipt is rebuilt from the *previous* album's snapshot with
+            # this side's new figures merged in, so the card keeps describing the
+            # whole record rather than shrinking to the one side just re-done.
+            self._merge_redo_into_snapshot(redone, summary)
+            merged = self._rerun_snapshot.get("summary") if self._rerun_snapshot else None
+            if merged is not None:
+                self._show_summary_card(merged)
+            self._maybe_reset_after_album()
+            return
+
         self._log(summary.describe())
         if summary.done:
             self._log(f"  -> {self._album_output_root}")
@@ -1389,6 +1427,7 @@ class FullRipTab(QWidget):
         # on the card can restore it in one click, then render the card (it copies
         # what it needs, so clearing identity afterwards cannot disturb it).
         self._rerun_snapshot = self._snapshot_album()
+        self._rerun_snapshot["summary"] = summary
         if summary.total and self._album_review_index is None:
             self._show_summary_card(summary)
         elif self._album_review_index is None:
@@ -1397,12 +1436,36 @@ class FullRipTab(QWidget):
         # Clean slate for the next record -- unless a capture is under way, in
         # which case defer so a WAV about to land is not orphaned (9.2 decides
         # where it lands; the reset waits until it has -- see add_recorded_wav).
+        self._maybe_reset_after_album()
+
+    def _maybe_reset_after_album(self) -> None:
+        """Clean slate, unless a capture is in flight and would be orphaned."""
         if self._recording_active:
             self._reset_deferred = True
             self._log("Album: a recording is in progress -- keeping this mapping "
                       "until it lands, then clearing for the next record.")
         else:
             self._reset_identity()
+
+    def _merge_redo_into_snapshot(self, index: int, summary) -> None:
+        """Fold a re-done side's new receipt into the album's stored summary.
+
+        The card describes a record, not a job. After re-doing Side B, it should
+        still list Side A -- with the figures from when A was made, which have
+        not changed -- and Side B with its new track count, size and receipts.
+        Replacing the stored summary wholesale would shrink the receipt to the
+        one side and lose the other, which is the opposite of what a re-do is
+        for.
+        """
+        if self._rerun_snapshot is None:
+            return
+        previous = self._rerun_snapshot.get("summary")
+        fresh = next((s for s in summary.sides if s.index == index), None)
+        if previous is None or fresh is None:
+            self._rerun_snapshot["summary"] = summary
+            return
+        sides = tuple(fresh if s.index == index else s for s in previous.sides)
+        self._rerun_snapshot["summary"] = dataclasses.replace(previous, sides=sides)
 
     def _show_summary_card(self, summary) -> None:
         """Populate and reveal the finished-album card (hiding the other two)."""
@@ -1414,6 +1477,7 @@ class FullRipTab(QWidget):
             destination=Path(self._album_output_root) if self._album_output_root else None,
             on_dismiss=self._dismiss_summary_card,
             on_rerun=self._run_album_again,
+            on_redo_side=self._redo_side_from_card,
         )
         self.empty_state.setVisible(False)
         self.review_box.setVisible(False)
@@ -1497,6 +1561,159 @@ class FullRipTab(QWidget):
         else:
             self.output_edit.setText(target)
             self.settings.set(output_dir=target)
+
+    def _redo_side_from_card(self, index: int) -> None:
+        """Re-open one finished side from the receipt, back into review.
+
+        The stakeholder's case: Discovery ripped end to end, Side B accepted
+        with four tracks when the record has five. A split was missed and Accept
+        locked the door. Re-tag cannot split a FLAC, "Run this album again"
+        re-does the side that was already right, and Retry was scoped to sides
+        that had errored. There was no way to appeal a side that merely came out
+        wrong.
+
+        This is a *scoped* job: one AlbumController holding one side, built from
+        the finished album's snapshot. Deliberately not a resurrection of the
+        old job -- that album is finished, its other sides' files are untouched
+        on disk, and nothing here should block starting a different album later.
+        """
+        snap = self._rerun_snapshot
+        if snap is None:
+            self._log("Album: nothing to re-do — this session's album is gone.")
+            return
+        if self._album is not None:
+            self._log("Album: already running. Finish or cancel it first.")
+            return
+
+        side_meta = next((s for s in snap["sides"] if s.index == index), None)
+        wav = self._snapshot_wav_for_side(snap, index)
+        if side_meta is None or wav is None:
+            self._log(f"Album: cannot re-do side {index} — its source WAV is no "
+                      "longer mapped.")
+            return
+        if not Path(wav).exists():
+            self._log(f"Album: cannot re-do {side_letter(index)} — its source WAV "
+                      f"({Path(wav).name}) is not where it was. The raw WAVs are "
+                      "the master; re-do needs the original file.")
+            return
+        output = snap.get("output", "") or self._album_output_root
+        if not output:
+            self._log("Album: cannot re-do — the output folder for that album is "
+                      "not known any more.")
+            return
+
+        # Identity first: the encode reads self._release/_cover/_side_track_infos
+        # directly, and the clean slate cleared all of them when the album ended.
+        self._restore_identity_from(snap)
+        if not self._warn_if_identity_is_missing(snap, side_letter(index)):
+            return
+
+        label = f"Side {side_letter(index)}"
+        titles = ([snap["flat_titles"][i] for i in side_meta.track_indices]
+                  if snap["flat_titles"] else [])
+        durations = ([snap["flat_durations_ms"][i] for i in side_meta.track_indices]
+                     if snap["flat_durations_ms"] else [])
+
+        # Same one-ask overwrite doctrine as a full album, scoped to this side's
+        # files. A re-do exists precisely to replace them, so the question is
+        # "are you sure", asked once, not per file.
+        if not self._confirm_overwrite(Path(output), only_side=index):
+            return
+
+        self._cancel.clear()
+        self.summary_card.setVisible(False)
+        self._album_output_root = output
+        self._album_meta = {"artist": snap["artist"], "album": snap["album"]}
+        if self._album_work_dir is not None:
+            shutil.rmtree(self._album_work_dir, ignore_errors=True)
+        self._album_work_dir = Path(tempfile.mkdtemp(prefix="rrf_redo_"))
+
+        cfg = self.settings.config
+        job = SideJob(index=index, label=label, wav_path=Path(wav),
+                      titles=titles, durations_ms=durations)
+        self._redoing_side = index
+        self._album = AlbumController(
+            [job], self._album_analyze, self._album_encode,
+            on_state_change=lambda side: self._relay.changed.emit(side),
+            on_finished=lambda summary: self._relay.finished.emit(summary),
+            max_analysis_workers=1, max_encode_workers=1)
+        self.side_list.clear()
+        item = QListWidgetItem(f"{label} - {job.state.value}")
+        item.setData(Qt.ItemDataRole.UserRole, index)
+        self.side_list.addItem(item)
+        self.cancel_album_btn.setEnabled(True)
+        self.start_album_btn.setEnabled(False)
+        self._lock_destination(True)
+        self._album.start()
+        self._log(f"Album: re-doing {label} from {Path(wav).name}. The other "
+                  "sides' files are left alone.")
+        self._set_empty_state(f"Re-analyzing {label}…")
+
+    def _snapshot_wav_for_side(self, snap: dict, index: int):
+        """The WAV the snapshot mapped to ``index``, or None."""
+        for wav, mapped_index in zip(snap["wavs"], snap["mapping"]):
+            if mapped_index == index:
+                return wav
+        return None
+
+    def _restore_identity_from(self, snap: dict) -> None:
+        """Put back everything the encode path reads off ``self``."""
+        self._release = snap["release"]
+        self._cover = snap["cover"]
+        self._flat_titles = list(snap["flat_titles"])
+        self._flat_durations_ms = list(snap["flat_durations_ms"])
+        self._flat_track_infos = list(snap["flat_track_infos"])
+        self.artist_edit.setText(snap["artist"])
+        self.album_edit.setText(snap["album"])
+        if snap["release"] is not None:
+            self.release_preview.set_release(snap["release"])
+        self._set_sides(list(snap["sides"]))
+
+    def _warn_if_identity_is_missing(self, snap: dict, letter: str) -> bool:
+        """Refuse to silently produce untagged output. Returns whether to go on.
+
+        A re-do inherits the album's release from memory, which is fine while
+        the app has been running. When it has not -- the release was never
+        looked up, or the session has been restarted and this card was rebuilt
+        without one -- the audio and the destination are recoverable but the
+        tracklist and cover are not. Splitting correctly and then writing
+        "Track 1" is not an acceptable appeal: it trades a visible problem for
+        an invisible one.
+        """
+        if snap.get("release") is not None:
+            return True
+        self._log(f"Album: Side {letter} can be re-split, but this album's "
+                  "tracklist and cover art are not in memory any more — the "
+                  "re-done tracks would be saved without titles or cover.")
+        return self._offer_lookup_before_redo(letter)
+
+    def _offer_lookup_before_redo(self, letter: str) -> bool:
+        """Ask, in plain words, with the fix attached rather than described."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Look up this release first?")
+        box.setText(
+            f"Side {letter} can be re-split, but this album's tracklist and "
+            "cover art are no longer in memory.")
+        box.setInformativeText(
+            "Re-doing it now would save the tracks without titles, track "
+            "numbers or cover art.\n\nLook the release up again first?")
+        lookup = box.addButton("Look up release…", QMessageBox.ButtonRole.AcceptRole)
+        anyway = box.addButton("Re-do without tags", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(lookup)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is lookup:
+            self._open_lookup()
+            self._log("Album: look up the release, then press Re-do this side again.")
+            return False
+        if clicked is anyway:
+            self._log("Album: re-doing without tags, as asked — the tracks will "
+                      "be split correctly but saved untitled.")
+            return True
+        return False
 
     def _run_album_again(self) -> None:
         """Restore the just-concluded album's identity + exact mapping and arm Start.
@@ -1698,28 +1915,43 @@ class FullRipTab(QWidget):
         return self._album_side(item.data(Qt.ItemDataRole.UserRole))
 
     def _update_retry_enabled(self) -> None:
+        """Live whenever re-doing the selected side is meaningful.
+
+        Which is any settled state: finished, failed, or flagged. A control that
+        stays disabled for an entire session reads as broken rather than as
+        inapplicable, and "the side is finished" was never a reason you cannot
+        do it again.
+        """
         side = self._selected_side()
-        retryable = side is not None and side.wav_path is not None and side.state in (
-            SideState.ERROR, SideState.NEEDS_ATTENTION)
-        self.retry_side_btn.setEnabled(retryable)
+        redoable = side is not None and side.wav_path is not None and side.state in (
+            SideState.ERROR, SideState.NEEDS_ATTENTION, SideState.DONE)
+        self.retry_side_btn.setEnabled(redoable)
         if side is not None and side.state == SideState.NEEDS_ATTENTION:
             self.retry_side_btn.setToolTip(
-                "Retry re-analyzes with the current mapping — if nothing changed, "
+                "Re-analyzes with the current mapping — if nothing changed, "
                 "the result won't either.")
+        elif side is not None and side.state == SideState.DONE:
+            self.retry_side_btn.setToolTip(
+                "Re-run this finished side from its source WAV and review the "
+                "splits again. Its current files are replaced when you accept.")
         else:
-            self.retry_side_btn.setToolTip("Re-run the selected failed side from scratch.")
+            self.retry_side_btn.setToolTip(
+                "Re-run the selected side from its source WAV, back through review.")
 
     def _retry_selected_side(self) -> None:
         side = self._selected_side()
         if side is None or self._album is None:
             return
         label = side.label
+        was_done = side.state == SideState.DONE
         if self._album.retry_side(side.index):
-            self._log(f"Album: retrying {label} from scratch.")
+            self._log(f"Album: re-doing {label} from its source WAV."
+                      + (" Its current files stay until you accept the new ones."
+                         if was_done else ""))
             if self._album_review_index is None:
                 self._set_empty_state(self._pending_review_message())
         else:
-            self._log(f"Album: {label} cannot be retried ({side.state.value}).")
+            self._log(f"Album: {label} cannot be re-done ({side.state.value}).")
         self._update_retry_enabled()
 
     def _load_side_for_review(self, side) -> None:
