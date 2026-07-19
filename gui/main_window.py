@@ -370,6 +370,7 @@ class MainWindow(QMainWindow):
         self.convert_panel.add_export_section(self.mp3_section)
 
         self.full_rip.logMessage.connect(self._log)
+        self.full_rip.statusMessage.connect(self.set_status)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         #: The Record tab is activated on first show, not here -- see showEvent.
         self._activated_landing_tab = False

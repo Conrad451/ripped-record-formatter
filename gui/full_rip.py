@@ -97,6 +97,11 @@ class _StateRelay(QObject):
     #: like `changed`, because the last side to finish announces it from whichever
     #: pool thread it happened to be on -- and the handler touches widgets.
     finished = Signal(object)
+    #: (side index, stage name, stage number, total stages) during analysis.
+    #: Restoration already reports this per stage; nothing was listening, so a
+    #: side sat on "analyzing" for the whole of a slow restore with no way to
+    #: tell progress from a hang.
+    stage = Signal(int, str, int, int)
 
 
 # --------------------------------------------------------------------------- #
@@ -127,6 +132,9 @@ class _Signals(QObject):
 # --------------------------------------------------------------------------- #
 class FullRipTab(QWidget):
     logMessage = Signal(str)
+    #: One plain sentence for the window's status strip. Separate from
+    #: logMessage: the log is the history, this is the present tense.
+    statusMessage = Signal(str)
     #: The between-albums clean slate ran (9.7). Other tabs holding session state
     #: -- the Record tab's declared album -- clear themselves off this.
     identityReset = Signal()
@@ -182,6 +190,8 @@ class FullRipTab(QWidget):
         #: handler can report a side rather than pretending an album ran, and so
         #: a second job can be refused with a line that names what is in the way.
         self._redoing_side: int | None = None
+        #: side index -> "noise reduction — 2/4", while that side is analysing.
+        self._side_stage: dict[int, str] = {}
         # clean-slate-between-albums
         self._recording_active = False       # a capture is under way (told by MainWindow)
         self._reset_deferred = False         # album concluded mid-recording; wait to clear
@@ -189,6 +199,7 @@ class FullRipTab(QWidget):
         self._relay = _StateRelay()
         self._relay.changed.connect(self._on_side_state)
         self._relay.finished.connect(self._on_album_finished)
+        self._relay.stage.connect(self._on_side_stage)
 
         root = QVBoxLayout(self)
 
@@ -1343,11 +1354,38 @@ class FullRipTab(QWidget):
             self.cancel_album_btn.setEnabled(False)
             self._log("Album: cancelling all sides...")
 
+    def _side_row_text(self, side) -> str:
+        """The side-list row. Determinate while a stage is running.
+
+        "Side B - analyzing" is true but useless on a long restore: it looks
+        identical to a hang. Restoration already reports which stage it is on
+        and how many there are, so the row says so.
+        """
+        stage = self._side_stage.get(side.index)
+        if stage and side.state == SideState.ANALYZING:
+            return f"{side.label} - {stage}"
+        return f"{side.label} - {side.state.value}"
+
+    def _on_side_stage(self, index: int, name: str, number: int, total: int) -> None:
+        """A restoration stage started on ``index``. GUI thread, via the relay."""
+        self._side_stage[index] = f"{name} — {number}/{total}"
+        side = self._album_side(index)
+        if side is None:
+            return
+        for i in range(self.side_list.count()):
+            item = self.side_list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) == index:
+                item.setText(self._side_row_text(side))
+                break
+        # The strip mirrors whichever side is actually working, so the one-line
+        # status is never staler than the list it summarises.
+        self.statusMessage.emit(f"Analyzing {side.label} — {name} {number}/{total}")
+
     def _on_side_state(self, side) -> None:
         for i in range(self.side_list.count()):
             item = self.side_list.item(i)
             if item.data(Qt.ItemDataRole.UserRole) == side.index:
-                item.setText(f"{side.label} - {side.state.value}")
+                item.setText(self._side_row_text(side))
                 if side.state == SideState.ERROR and side.error:
                     phase = side.failed_phase or "processing"
                     item.setToolTip(f"{side.label} failed during {phase}:\n{side.error}")
@@ -1356,6 +1394,8 @@ class FullRipTab(QWidget):
                 else:
                     item.setToolTip(f"{side.label} - {side.state.value}")
                 break
+        if side.state != SideState.ANALYZING:
+            self._side_stage.pop(side.index, None)
         self._update_retry_enabled()
         if side.state == SideState.READY:
             self._log(f"Album: {side.label} ready for review.")
@@ -2116,7 +2156,13 @@ class FullRipTab(QWidget):
         shutil.rmtree(side_dir, ignore_errors=True)
         side_dir.mkdir(parents=True, exist_ok=True)
         restored = side_dir / "restored.wav"
-        result = restore(side.wav_path, restored, stages, policy=policy, should_cancel=should_cancel)
+        # Runs on an analysis pool thread: emit through the relay rather than
+        # touching widgets, exactly as the state callbacks do.
+        def on_stage(name: str, number: int, total: int) -> None:
+            self._relay.stage.emit(side.index, name, number, total)
+
+        result = restore(side.wav_path, restored, stages, policy=policy,
+                         on_progress=on_stage, should_cancel=should_cancel)
 
         if side.durations_ms and all(side.durations_ms):
             proposal = propose_splits_anchored(restored, side.durations_ms, params=params,

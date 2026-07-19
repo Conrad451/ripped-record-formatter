@@ -401,3 +401,116 @@ def test_a_re_do_is_reported_as_a_side_not_an_album(qapp, tmp_path, monkeypatch)
     assert "left alone" in started[0]
     if fr._album is not None:
         fr._album.cancel_all()
+
+
+# --------------------------------------------------------------------------- #
+# What a restart costs (item 4, answered by demonstration)
+# --------------------------------------------------------------------------- #
+def test_after_a_restart_there_is_no_receipt_to_appeal_from(qapp, tmp_path, monkeypatch):
+    """The honest answer, pinned rather than asserted in prose.
+
+    Nothing about a finished album is written to disk: the snapshot is instance
+    state and core.config has no field for it. So after a restart the *entry
+    point itself* is gone -- there is no card, because there is no record that
+    an album was ever finished. A post-restart re-do does not recover partial
+    identity; it is not reachable at all.
+
+    What does survive is what always survived: the WAVs on disk and the folder
+    settings. The way back is to re-scan the folder and run the album again,
+    which is the pre-existing path and re-does every side.
+
+    Persisting this is the SQLite task's job. This test is here so that when it
+    lands, the change in behaviour is visible as this test having to change.
+    """
+    from gui.main_window import MainWindow
+
+    fr, _out, _wavs = _tab(qapp, tmp_path, monkeypatch)
+    _run_to_completion(qapp, fr)
+    assert fr._rerun_snapshot is not None          # this session remembers
+
+    restarted = MainWindow().full_rip              # a brand-new process would look like this
+
+    assert restarted._rerun_snapshot is None, "album state survived a restart"
+    assert restarted.summary_card.isHidden(), "a receipt appeared without an album"
+    assert restarted.summary_card.redo_buttons == {}
+
+    logged: list[str] = []
+    restarted.logMessage.connect(logged.append)
+    restarted._redo_side_from_card(1)              # the only way to ask, post-restart
+
+    assert restarted._album is None
+    assert any("nothing to re-do" in m for m in logged), logged
+
+
+def test_the_settings_that_do_survive_a_restart(qapp, tmp_path, monkeypatch):
+    """Bounding the claim: folders persist, identity does not."""
+    from core import config as core_config
+
+    fr, out, _wavs = _tab(qapp, tmp_path, monkeypatch)
+    _run_to_completion(qapp, fr)
+
+    saved = core_config.load()
+    assert not hasattr(saved, "last_album_summary")
+    assert not hasattr(saved, "rerun_snapshot")
+    # The output folder is remembered, which is why a re-scan lands in the right
+    # place -- but a folder is not an identity.
+    assert hasattr(saved, "output_dir")
+
+
+# --------------------------------------------------------------------------- #
+# Determinate stage progress (Rider B)
+# --------------------------------------------------------------------------- #
+def test_a_side_reports_which_restoration_stage_it_is_on(qapp, tmp_path, monkeypatch):
+    """"analyzing" for two minutes looks identical to a hang. Restoration
+    already reports the stage and the total; nothing was listening."""
+    fr, _out, _wavs = _tab(qapp, tmp_path, monkeypatch)
+    fr._start_album()
+    assert fr._album is not None
+
+    statuses: list[str] = []
+    fr.statusMessage.connect(statuses.append)
+
+    # Checked before pumping the loop: the stubbed analysis finishes instantly,
+    # and a side leaving ANALYZING correctly clears its stage.
+    fr._on_side_stage(1, "noise reduction", 2, 4)
+
+    assert fr._side_stage[1] == "noise reduction — 2/4"
+    assert statuses, "the status strip did not mirror the active side"
+    assert "noise reduction 2/4" in statuses[-1]
+    assert "Side B" in statuses[-1]
+    fr._album.cancel_all()
+
+
+def test_the_row_shows_the_stage_only_while_analysing(qapp, tmp_path, monkeypatch):
+    """Once a side settles, the stage is history and the state is the news."""
+    from types import SimpleNamespace
+
+    fr, _out, _wavs = _tab(qapp, tmp_path, monkeypatch)
+    fr._side_stage[1] = "declick — 4/4"
+
+    analysing = SimpleNamespace(index=1, label="Side B", state=SideState.ANALYZING)
+    assert fr._side_row_text(analysing) == "Side B - declick — 4/4"
+
+    ready = SimpleNamespace(index=1, label="Side B", state=SideState.READY)
+    assert fr._side_row_text(ready) == "Side B - ready"
+
+
+def test_leaving_analysis_clears_the_stage(qapp, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    fr, _out, _wavs = _tab(qapp, tmp_path, monkeypatch)
+    fr._side_stage[0] = "rumble — 1/4"
+    fr._on_side_state(SimpleNamespace(
+        index=0, label="Side A", state=SideState.READY, error=None, attention=None,
+        failed_phase=None))
+
+    assert 0 not in fr._side_stage
+
+
+def test_restoration_actually_reports_per_stage():
+    """The callback the GUI now consumes, at its source."""
+    import inspect
+
+    from core.restoration import restore
+
+    assert "on_progress" in inspect.signature(restore).parameters
