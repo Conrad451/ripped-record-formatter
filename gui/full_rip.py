@@ -193,6 +193,8 @@ class FullRipTab(QWidget):
         #: handler can report a side rather than pretending an album ran, and so
         #: a second job can be refused with a line that names what is in the way.
         self._redoing_side: int | None = None
+        #: The existing album a side is being swapped into, if any.
+        self._replace_album = None
         #: Journal row for the live job, so a crash leaves a note behind.
         self._session_id = None
         #: side index -> "noise reduction — 2/4", while that side is analysing.
@@ -226,8 +228,17 @@ class FullRipTab(QWidget):
         folder_btn.clicked.connect(self._album_select_folder)
         wavs_btn = QPushButton("Add single WAV...")
         wavs_btn.clicked.connect(self._album_add_wavs)
+        # The way back into an album that is already finished and on disk. Sits
+        # with the other entry points because that is what it is -- a different
+        # answer to "what am I working on", not a mode.
+        self.replace_side_btn = QPushButton("Replace a side of an existing album…")
+        self.replace_side_btn.setToolTip(
+            "Re-do one side of an album you already have, leaving the rest of "
+            "its files alone.")
+        self.replace_side_btn.clicked.connect(self._begin_replace_side)
         pick_row.addWidget(folder_btn)
         pick_row.addWidget(wavs_btn)
+        pick_row.addWidget(self.replace_side_btn)
         pick_row.addStretch(1)
         self.start_album_btn = QPushButton("Start album")
         self.start_album_btn.clicked.connect(self._start_album)
@@ -970,6 +981,50 @@ class FullRipTab(QWidget):
             self._pinned_map = {}          # a new source folder is a fresh slate
             self._rebuild_mapping_table()
             self._log(f"Source: {len(self._album_wavs)} WAV(s) found in {folder}")
+
+    def _begin_replace_side(self) -> None:
+        """Pick an album already on disk and set up to replace one of its sides.
+
+        Reads the folder by its own numbering rather than by anything we
+        remember about it, so an album this app never saw is as operable as one
+        it made. A folder that is not in the app's format gets the plain
+        redirect rather than a refusal: Re-tag puts it into that shape, and it
+        is one tab away.
+        """
+        from core import album_folder
+
+        start = self._browse_start or str(Path.home())
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Which album has the side you want to replace?", start)
+        if not chosen:
+            return
+
+        album = album_folder.read(chosen)
+        if not album.conforms:
+            self._log(f"Replace a side: {album.problem}")
+            self._set_empty_state(album.problem)
+            return
+
+        self._replace_album = album
+        self._log(f"Replace a side: {album.path.name} — {album.count} tracks. "
+                  "Look up the release, define the sides as the record is "
+                  "actually cut, then choose the side to replace.")
+        self._set_empty_state(
+            f"Replacing a side of {album.path.name}. "
+            f"{album.count} tracks found — look up the release and define the "
+            "sides to continue.")
+
+    def replace_side_positions(self, side_index: int) -> list[int]:
+        """Album positions on ``side_index`` of the pressing being replaced.
+
+        Read off the sides the user defined rather than off the release's own
+        media, because MusicBrainz shape is advisory: an 8-side 45rpm deluxe
+        pressing is very often catalogued as a 2-disc CD, and the object on the
+        turntable is the authority.
+        """
+        if side_index < 0 or side_index >= len(self._sides):
+            return []
+        return [index + 1 for index in self._sides[side_index].track_indices]
 
     def _album_add_wavs(self) -> None:
         """Secondary affordance -- a single WAV is just a one-row mapping table."""

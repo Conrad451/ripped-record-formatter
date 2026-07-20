@@ -289,3 +289,89 @@ def test_a_file_that_cannot_be_removed_is_a_warning_not_a_disaster(ffmpeg, album
 
     assert not result.ok
     assert result.warnings and "Could not remove" in result.warnings[0]
+
+
+# --------------------------------------------------------------------------- #
+# The entry point, in the tab
+# --------------------------------------------------------------------------- #
+def test_the_entry_point_sits_with_the_other_sources(qapp_gui):
+    """It answers "what am I working on", like the other two -- not a mode."""
+    from gui.main_window import MainWindow
+
+    window = MainWindow()
+    try:
+        assert window.full_rip.replace_side_btn is not None
+        assert "Replace a side" in window.full_rip.replace_side_btn.text()
+    finally:
+        window.close()
+
+
+def test_choosing_a_conforming_album_arms_the_replacement(qapp_gui, album,
+                                                          monkeypatch):
+    from PySide6.QtWidgets import QFileDialog
+
+    from gui.main_window import MainWindow
+
+    window = MainWindow()
+    try:
+        full_rip = window.full_rip
+        logged: list[str] = []
+        full_rip.logMessage.connect(logged.append)
+        monkeypatch.setattr(QFileDialog, "getExistingDirectory",
+                            staticmethod(lambda *a, **k: str(album)))
+
+        full_rip._begin_replace_side()
+
+        assert full_rip._replace_album is not None
+        assert full_rip._replace_album.count == 18
+        assert any("18 tracks" in m for m in logged), logged
+    finally:
+        window.close()
+
+
+def test_a_non_conforming_album_gets_the_redirect(qapp_gui, ffmpeg, tmp_path,
+                                                  monkeypatch):
+    from PySide6.QtWidgets import QFileDialog
+
+    from gui.main_window import MainWindow
+
+    folder = tmp_path / "legacy"
+    folder.mkdir()
+    _flac(ffmpeg, folder / "Some Song.flac")
+
+    window = MainWindow()
+    try:
+        full_rip = window.full_rip
+        logged: list[str] = []
+        full_rip.logMessage.connect(logged.append)
+        monkeypatch.setattr(QFileDialog, "getExistingDirectory",
+                            staticmethod(lambda *a, **k: str(folder)))
+
+        full_rip._begin_replace_side()
+
+        assert full_rip._replace_album is None
+        assert any("Re-tag it first" in m for m in logged), logged
+    finally:
+        window.close()
+
+
+def test_side_positions_come_from_the_defined_sides_not_the_release(qapp_gui):
+    """MusicBrainz shape is advisory: an 8-side 45rpm deluxe pressing is very
+    often catalogued as a 2-disc CD, and the object on the turntable wins."""
+    from core.side_partition import Side
+    from gui.main_window import MainWindow
+
+    window = MainWindow()
+    try:
+        full_rip = window.full_rip
+        # 18 tracks cut as an 8-side 45, which no CD-shaped release describes.
+        sides = [Side(index=0, track_indices=(0, 1), total_ms=0),
+                 Side(index=1, track_indices=(2, 3), total_ms=0),
+                 Side(index=6, track_indices=(12, 13), total_ms=0)]
+        full_rip._sides = sides
+
+        assert full_rip.replace_side_positions(0) == [1, 2]
+        assert full_rip.replace_side_positions(2) == [13, 14]   # the garbled side
+        assert full_rip.replace_side_positions(99) == []
+    finally:
+        window.close()
